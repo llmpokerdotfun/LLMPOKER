@@ -506,6 +506,11 @@ export function summarizeHandResult(result) {
     deckRoot: null,
     audited: false,
     fromLive: true,
+    // Carried so a money render site can ask the *table* how many decimals its
+    // amounts have (whole play chips on a free table, the settlement token's on a
+    // wager table) without a second fetch. `HandSummary.config` is optional on
+    // the wire; a row built from a live delta is the one place it is free.
+    config: table?.config ?? null,
   };
 }
 

@@ -33,10 +33,10 @@ import {
   formatInt,
   formatMinimumTokens,
   formatRelative,
-  formatTokens,
   formatWinRateFromCounts,
   minimumToChips,
   parseChips,
+  tableMoney,
   toTimestampMs,
 } from '../format.js';
 import { getState, onHandComplete, startLive, subscribe } from '../live.js';
@@ -327,10 +327,6 @@ function renderHeroStats() {
   const running = state.tables.filter((table) => table.status === 'RUNNING').length;
   const seated = state.tables.reduce((sum, table) => sum + table.seats.filter((s) => s.agentId !== null).length, 0);
   const caps = state.tables.reduce((sum, table) => sum + table.seats.length, 0);
-  const pots = state.tables.reduce((sum, table) => {
-    const pot = parseChips(table.totalPot);
-    return pot === null ? sum : sum + pot;
-  }, 0n);
   const free = state.tables.filter((table) => table.mode === 'FREE').length;
   const wager = state.tables.filter((table) => table.mode === 'WAGER').length;
 
@@ -344,7 +340,7 @@ function renderHeroStats() {
       stat('running', formatInt(running)),
       stat('seats filled', `${formatInt(seated)}/${formatInt(caps)}`),
       stat('hands played', view.health ? formatInt(view.health.hands) : '\u2014'),
-      stat('chips in pots', moneyEl(pots, { maxFractionDigits: 6 })),
+      stat('chips in pots', chipsInPots(state.tables)),
     ),
   );
 
@@ -379,6 +375,45 @@ function stat(label, value) {
     h('span', { class: 'stat-label', text: label }),
     h('span', { class: 'stat-value' }, value),
   );
+}
+
+/**
+ * Chips currently in pots, **per unit**. Free play chips and a wager table's
+ * tokens are never added together (they are not the same thing), and each total
+ * is rendered with the decimals its own table defines: play chips are whole
+ * (`3`), tokens keep their token formatting (`1.5`).
+ *
+ * @param {TableSnapshot[]} tables
+ * @returns {HTMLElement}
+ */
+function chipsInPots(tables) {
+  const totals = potTotals(tables);
+  if (totals.size === 0) return h('span', { class: 'muted', text: '\u2014' });
+  const parts = [];
+  for (const entry of totals.values()) {
+    parts.push(moneyEl(entry.total, { maxFractionDigits: 6, decimals: entry.decimals }));
+  }
+  return h('span', null, parts.flatMap((node, index) => (index === 0 ? [node] : [' + ', node])));
+}
+
+/**
+ * @param {TableSnapshot[]} tables
+ * @returns {Map<string, {decimals: number, total: bigint}>}
+ */
+function potTotals(tables) {
+  /** @type {Map<string, {decimals: number, total: bigint}>} */
+  const totals = new Map();
+  for (const table of tables) {
+    const pot = parseChips(table.totalPot);
+    if (pot === null) continue;
+    const money = tableMoney(table);
+    // Free chips and a token table are different units; keep them apart.
+    const key = money.decimals === 0 ? 'play chips' : `token:${money.decimals}`;
+    const existing = totals.get(key);
+    if (existing) existing.total += pot;
+    else totals.set(key, { decimals: money.decimals, total: pot });
+  }
+  return totals;
 }
 
 function renderLive() {
@@ -608,7 +643,7 @@ function contractsTable(contracts) {
         `${formatInt(deployed)} of ${formatInt(CONTRACT_ROWS.length)} contract addresses are published. ` +
         'A null address means the contract is not deployed yet — nothing to stake, and this page will not show a placeholder.',
     }),
-    h('div', { class: 'table-wrap' }, table),
+    h('div', { class: 'table-wrap', tabindex: '0' }, table),
   );
 }
 
@@ -935,7 +970,11 @@ function renderTables() {
     }`,
     tables.length === 0
       ? h('p', { class: 'muted', text: state.snapshotLoaded ? 'No tables are open right now.' : 'Waiting for the monitor feed…' })
-      : h('div', { class: 'tile-grid' }, tables.slice(0, PREVIEW_TABLES).map(tableTile)),
+      : h(
+          'div',
+          { class: 'tile-grid' },
+          tables.slice(0, PREVIEW_TABLES).map((table) => tableTile(table)),
+        ),
     h(
       'p',
       { class: 'note' },
@@ -952,6 +991,7 @@ function renderTables() {
  */
 function tableTile(table) {
   const occupied = table.seats.filter((seat) => seat.agentId !== null).length;
+  const money = tableMoney(table);
   return h(
     'article',
     { class: 'tile' },
@@ -970,7 +1010,7 @@ function tableTile(table) {
       h('dt', { text: 'seats' }),
       h('dd', { text: `${occupied}/${table.seats.length}` }),
       h('dt', { text: 'pot' }),
-      h('dd', null, moneyEl(table.totalPot, { maxFractionDigits: 4 })),
+      h('dd', null, money.el(table.totalPot, { maxFractionDigits: 6 })),
       h('dt', { text: 'hand' }),
       h('dd', { text: table.handId ? `#${formatInt(table.handNumber)}` : '\u2014' }),
     ),
@@ -1023,78 +1063,164 @@ function renderAgents() {
   dom.agents.appendChild(body);
 }
 
+/** The two leaderboards are separate: free chips are never compared with wager. */
+const LEADER_MODES = /** @type {('FREE'|'WAGER')[]} */ (['FREE', 'WAGER']);
+
+/** Id of the leaderboard tabpanel, linked from each tab's `aria-controls`. */
+const LEADER_PANEL_ID = 'leaderboard-panel';
+
 /**
  * Free and wager results are separate leaderboards (one request per mode), and
  * free chips are never compared against wagered tokens.
  *
+ * The tablist implements the ARIA tabs pattern: roving tabindex plus arrow-key
+ * navigation. Selecting a mode mutates the existing buttons instead of
+ * rebuilding them, so focus stays on the tab the user moved to rather than
+ * being dropped when the subtree is replaced.
+ *
  * @returns {void}
  */
 function renderLeaderboard() {
-  const mode = view.leaderMode;
-  const tabs = h(
+  /**
+   * @param {'FREE'|'WAGER'} candidate
+   * @returns {string}
+   */
+  const tabId = (candidate) => `leaderboard-tab-${candidate.toLowerCase()}`;
+  const mount = h('div', {
+    role: 'tabpanel',
+    id: LEADER_PANEL_ID,
+    'aria-labelledby': tabId(view.leaderMode),
+  });
+
+  /** @type {HTMLElement} */
+  let tabs;
+
+  /**
+   * Paints the panel body for whichever mode is selected.
+   *
+   * @returns {void}
+   */
+  function paint() {
+    const mode = view.leaderMode;
+    const rows = view.leaders[mode];
+    const error = view.leaderErrors[mode];
+    /** @type {HTMLElement} */
+    let content;
+    if (error) {
+      content = errorBanner(error, `the ${mode} leaderboard`);
+    } else if (!rows) {
+      content = h('p', { class: 'muted', text: 'Loading…' });
+    } else if (rows.length === 0) {
+      content = h('p', { class: 'muted', text: `No ${mode} results yet.` });
+    } else {
+      const { table, tbody } = tableShell([
+        { label: '#', className: 'num' },
+        { label: 'agent' },
+        { label: 'hands', className: 'num' },
+        { label: 'won', className: 'num' },
+        { label: 'win rate', className: 'num' },
+        { label: 'net profit' },
+      ]);
+      rows.slice(0, PREVIEW_LEADERS).forEach((row, index) => {
+        tbody.appendChild(
+          h(
+            'tr',
+            null,
+            h('td', { class: 'num', text: String(index + 1) }),
+            h('td', { text: row.name ?? row.agentId, title: row.agentId }),
+            h('td', { class: 'num', text: formatInt(row.handsPlayed) }),
+            h('td', { class: 'num', text: formatInt(row.handsWon) }),
+            h('td', { class: 'num', text: formatWinRateFromCounts(row.handsWon, row.handsPlayed) }),
+            h('td', null, tableMoney(mode).el(row.netProfit, { maxFractionDigits: 6, signed: true })),
+          ),
+        );
+      });
+      content = h('div', { class: 'table-wrap', tabindex: '0' }, table);
+    }
+    clearNode(mount);
+    mount.appendChild(content);
+  }
+
+  /**
+   * Activates a mode: roving tabindex and `aria-selected` are updated on the
+   * existing buttons, then the panel is repainted.
+   *
+   * @param {'FREE'|'WAGER'} candidate
+   * @param {boolean} moveFocus
+   * @returns {void}
+   */
+  const select = (candidate, moveFocus) => {
+    view.leaderMode = candidate;
+    const buttons = /** @type {HTMLButtonElement[]} */ ([...tabs.querySelectorAll('[role="tab"]')]);
+    /** @type {HTMLButtonElement|null} */
+    let target = null;
+    for (const button of buttons) {
+      const selected = button.dataset.mode === candidate;
+      button.setAttribute('aria-selected', selected ? 'true' : 'false');
+      button.setAttribute('tabindex', selected ? '0' : '-1');
+      if (selected) target = button;
+    }
+    mount.setAttribute('aria-labelledby', tabId(candidate));
+    paint();
+    if (moveFocus && target) target.focus();
+  };
+
+  /**
+   * Arrow keys move the selection and Home/End jump to the ends, as the ARIA
+   * tabs pattern requires (WCAG 2.1.1 Keyboard).
+   *
+   * @param {KeyboardEvent} event
+   * @returns {void}
+   */
+  const onKeydown = (event) => {
+    const forward = event.key === 'ArrowRight' || event.key === 'ArrowDown';
+    const backward = event.key === 'ArrowLeft' || event.key === 'ArrowUp';
+    const first = event.key === 'Home';
+    const last = event.key === 'End';
+    if (!forward && !backward && !first && !last) return;
+    const index = LEADER_MODES.indexOf(view.leaderMode);
+    if (index < 0) return;
+    event.preventDefault();
+    const next = first
+      ? 0
+      : last
+        ? LEADER_MODES.length - 1
+        : forward
+          ? (index + 1) % LEADER_MODES.length
+          : (index - 1 + LEADER_MODES.length) % LEADER_MODES.length;
+    const candidate = LEADER_MODES[next];
+    if (candidate) select(candidate, true);
+  };
+
+  tabs = h(
     'div',
-    { class: 'tabs', role: 'tablist', 'aria-label': 'Leaderboard mode' },
-    (/** @type {('FREE'|'WAGER')[]} */ (['FREE', 'WAGER'])).map((candidate) =>
+    { class: 'tabs', role: 'tablist', 'aria-label': 'Leaderboard mode', onkeydown: onKeydown },
+    LEADER_MODES.map((candidate) =>
       h('button', {
         class: 'tab',
         type: 'button',
         role: 'tab',
-        'aria-selected': candidate === mode ? 'true' : 'false',
+        id: tabId(candidate),
+        'aria-selected': candidate === view.leaderMode ? 'true' : 'false',
+        'aria-controls': LEADER_PANEL_ID,
+        tabindex: candidate === view.leaderMode ? '0' : '-1',
         dataset: { mode: candidate },
         text: candidate === 'FREE' ? 'Free mode' : 'Wager mode',
-        onclick: () => {
-          view.leaderMode = candidate;
-          renderLeaderboard();
-        },
+        onclick: () => select(candidate, false),
       }),
     ),
   );
-
-  const rows = view.leaders[mode];
-  const error = view.leaderErrors[mode];
-  /** @type {HTMLElement} */
-  let content;
-  if (error) {
-    content = errorBanner(error, `the ${mode} leaderboard`);
-  } else if (!rows) {
-    content = h('p', { class: 'muted', text: 'Loading…' });
-  } else if (rows.length === 0) {
-    content = h('p', { class: 'muted', text: `No ${mode} results yet.` });
-  } else {
-    const { table, tbody } = tableShell([
-      { label: '#', className: 'num' },
-      { label: 'agent' },
-      { label: 'hands', className: 'num' },
-      { label: 'won', className: 'num' },
-      { label: 'win rate', className: 'num' },
-      { label: 'net profit' },
-    ]);
-    rows.slice(0, PREVIEW_LEADERS).forEach((row, index) => {
-      tbody.appendChild(
-        h(
-          'tr',
-          null,
-          h('td', { class: 'num', text: String(index + 1) }),
-          h('td', { text: row.name ?? row.agentId, title: row.agentId }),
-          h('td', { class: 'num', text: formatInt(row.handsPlayed) }),
-          h('td', { class: 'num', text: formatInt(row.handsWon) }),
-          h('td', { class: 'num', text: formatWinRateFromCounts(row.handsWon, row.handsPlayed) }),
-          h('td', null, moneyEl(row.netProfit, { maxFractionDigits: 6, signed: true })),
-        ),
-      );
-    });
-    content = h('div', { class: 'table-wrap' }, table);
-  }
 
   const body = panel(
     'Leaderboards',
     `free and wager are kept apart — GET /api/v1/leaderboards?mode=FREE|WAGER · top ${PREVIEW_LEADERS}`,
     tabs,
-    h('div', { role: 'tabpanel' }, content),
+    mount,
     h('p', { class: 'note' }, h('a', { class: 'link', href: '/agents', text: 'Every agent, live — stacks, escrow, seat and status →' })),
   );
   clearNode(dom.leaders);
   dom.leaders.appendChild(body);
+  paint();
 }
 
 function renderHands() {
@@ -1128,7 +1254,7 @@ function renderHands() {
           h('td', { class: 'nowrap', text: `#${formatInt(hand.handNumber)}` }),
           h('td', null, modeTag(hand.mode)),
           h('td', null, cardRow(hand.board)),
-          h('td', null, moneyEl(hand.totalPot, { maxFractionDigits: 4 })),
+          h('td', null, tableMoney(hand).el(hand.totalPot, { maxFractionDigits: 4 })),
           h('td', { text: winnersText(hand) }),
           h(
             'td',
@@ -1151,7 +1277,7 @@ function renderHands() {
   const body = panel(
     'Latest hands',
     `${subtitle} · GET /api/v1/hands?limit=${DASHBOARD_HANDS}&offset=0`,
-    h('div', { class: 'table-wrap' }, table),
+    h('div', { class: 'table-wrap', tabindex: '0' }, table),
     h(
       'p',
       { class: 'note' },
@@ -1169,7 +1295,8 @@ function renderHands() {
 function winnersText(hand) {
   const winners = Array.isArray(hand.winners) ? hand.winners : [];
   if (winners.length === 0) return '\u2014';
-  return winners.map((w) => `${w.name ?? `seat ${w.seat}`} (${formatTokens(w.amount, { maxFractionDigits: 4 })})`).join(', ');
+  const money = tableMoney(hand);
+  return winners.map((w) => `${w.name ?? `seat ${w.seat}`} (${money.format(w.amount, { maxFractionDigits: 4 })})`).join(', ');
 }
 
 main();

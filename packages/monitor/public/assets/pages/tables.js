@@ -5,9 +5,15 @@
  *
  * The 1 Hz countdown is driven by `[data-deadline]` nodes handled by
  * `ui.startClock()`, so only the clock text node is touched every second.
+ *
+ * Money rule: every amount below is rendered through `tableMoney(table)`, the
+ * accessor in `format.js` that resolves a table's own decimals — free tables are
+ * whole play chips (`3`, `413`), wager tables keep their settlement token's
+ * decimals (`1.5 LLMPOKER`, `2.5 USDG`). No site here divides a play-chip pot by
+ * 1e18, and totals over mixed modes are never added together.
  */
 
-import { formatBps, formatDateTime, formatInt, formatRelative, formatTokens, parseChips, shortHex } from '../format.js';
+import { formatBps, formatDateTime, formatInt, formatRelative, parseChips, shortHex, tableMoney } from '../format.js';
 import { getActionRequest, getRevealedPositions, getState, startLive, subscribe } from '../live.js';
 import {
   badge,
@@ -133,10 +139,6 @@ function renderSummary(tables) {
   const caps = tables.reduce((sum, t) => sum + t.seats.length, 0);
   const free = tables.filter((t) => t.mode === 'FREE').length;
   const wager = tables.filter((t) => t.mode === 'WAGER').length;
-  const pots = tables.reduce((sum, table) => {
-    const pot = parseChips(table.totalPot);
-    return pot === null ? sum : sum + pot;
-  }, 0n);
 
   clearNode(dom.summary);
   dom.summary.appendChild(
@@ -148,9 +150,37 @@ function renderSummary(tables) {
       stat('open', formatInt(open)),
       stat('seats filled', `${formatInt(seated)}/${formatInt(caps)}`),
       stat('free / wager', `${formatInt(free)} / ${formatInt(wager)}`),
-      stat('chips in pots', moneyEl(pots, { maxFractionDigits: 6 })),
+      stat('chips in pots', chipsInPots(tables)),
     ),
   );
+}
+
+/**
+ * Play chips and wager tokens are different units, so they are summed and shown
+ * separately (`14 play chips + 1.5`) rather than added into one meaningless
+ * number. Each total carries its own table's decimals.
+ *
+ * @param {TableSnapshot[]} tables
+ * @returns {HTMLElement}
+ */
+function chipsInPots(tables) {
+  /** @type {Map<string, {decimals: number, total: bigint}>} */
+  const totals = new Map();
+  for (const table of tables) {
+    const pot = parseChips(table.totalPot);
+    if (pot === null) continue;
+    const money = tableMoney(table);
+    const key = money.decimals === 0 ? 'play chips' : `token:${money.decimals}`;
+    const existing = totals.get(key);
+    if (existing) existing.total += pot;
+    else totals.set(key, { decimals: money.decimals, total: pot });
+  }
+  if (totals.size === 0) return h('span', { class: 'muted', text: '\u2014' });
+  const parts = [];
+  for (const entry of totals.values()) {
+    parts.push(moneyEl(entry.total, { maxFractionDigits: 6, decimals: entry.decimals }));
+  }
+  return h('span', null, parts.flatMap((node, index) => (index === 0 ? [node] : [' + ', node])));
 }
 
 /**
@@ -195,6 +225,7 @@ function tableCard(table) {
   const deadline = request?.deadlineTs ?? table.actionDeadlineTs;
   const street = table.street ?? '—';
   const href = `/tables#${encodeURIComponent(table.id)}`;
+  const money = tableMoney(table);
 
   return h(
     'section',
@@ -219,6 +250,9 @@ function tableCard(table) {
         ' · hand ',
         table.handId ? h('code', { class: 'hash', text: table.handId, title: table.handId }) : '—',
         ` · #${formatInt(table.handNumber)}`,
+        ' · blinds ',
+        `${money.format(table.config?.smallBlind ?? null)} / ${money.format(table.config?.bigBlind ?? null)}`,
+        money.decimals === 0 ? ' chips' : '',
         ' · updated ',
         h('span', { dataset: { relative: String(table.updatedAt ?? '') }, text: formatRelative(table.updatedAt) }),
       ),
@@ -249,11 +283,11 @@ function tableCard(table) {
           'div',
           { class: 'pot-box' },
           h('span', { class: 'clock-label', text: 'total pot' }),
-          h('span', { class: 'stat-value' }, moneyEl(table.totalPot, { maxFractionDigits: 6 })),
+          h('span', { class: 'stat-value' }, money.el(table.totalPot, { maxFractionDigits: 6 })),
           h('span', { class: 'clock-label', text: 'current bet' }),
-          h('span', { class: 'stat-value' }, moneyEl(table.currentBet, { maxFractionDigits: 6 })),
+          h('span', { class: 'stat-value' }, money.el(table.currentBet, { maxFractionDigits: 6 })),
           h('span', { class: 'clock-label', text: 'min raise to' }),
-          h('span', { class: 'stat-value' }, moneyEl(table.minRaiseTo, { maxFractionDigits: 6 })),
+          h('span', { class: 'stat-value' }, money.el(table.minRaiseTo, { maxFractionDigits: 6 })),
         ),
         h(
           'div',
@@ -278,14 +312,14 @@ function tableCard(table) {
           table.handId ? h('span', null, handLink(table.handId, { tableId: table.id }, 'open hand proof →')) : null,
         ),
       ),
-      request ? actionRequestStrip(request) : null,
+      request ? actionRequestStrip(request, money) : null,
       h(
         'div',
         { class: 'seats-grid' },
         table.seats.map((seat) => seatCard(seat, table)),
       ),
-      potsBlock(table),
-      configBlock(table),
+      potsBlock(table, money),
+      configBlock(table, money),
     ),
   );
 }
@@ -324,23 +358,24 @@ function revealCount(table) {
  * delivered an `ACTION_REQUIRED` for this table.
  *
  * @param {ActionRequest} request
+ * @param {import('../format.js').TableMoney} money the owning table's formatter
  * @returns {HTMLElement}
  */
-function actionRequestStrip(request) {
+function actionRequestStrip(request, money) {
   const legal = request.legal;
   const chips = [];
   if (legal.canFold) chips.push(badge('FOLD', 'muted'));
   if (legal.canCheck) chips.push(badge('CHECK', 'info'));
-  if (legal.canCall) chips.push(badge(`CALL ${formatTokens(legal.toCall, { maxFractionDigits: 4 })}`, 'info'));
-  if (legal.canBet) chips.push(badge(`BET ${formatTokens(legal.minRaiseTo, { maxFractionDigits: 4 })}+`, 'active'));
-  if (legal.canRaise) chips.push(badge(`RAISE to ${formatTokens(legal.minRaiseTo, { maxFractionDigits: 4 })}–${formatTokens(legal.maxRaiseTo, { maxFractionDigits: 4 })}`, 'active'));
+  if (legal.canCall) chips.push(badge(`CALL ${money.format(legal.toCall, { maxFractionDigits: 4 })}`, 'info'));
+  if (legal.canBet) chips.push(badge(`BET ${money.format(legal.minRaiseTo, { maxFractionDigits: 4 })}+`, 'active'));
+  if (legal.canRaise) chips.push(badge(`RAISE to ${money.format(legal.minRaiseTo, { maxFractionDigits: 4 })}–${money.format(legal.maxRaiseTo, { maxFractionDigits: 4 })}`, 'active'));
   if (legal.canAllIn) chips.push(badge('ALL_IN', 'warn'));
   return h(
     'div',
     { class: 'on-the-clock' },
     h('span', { class: 'on-the-clock-label', text: `ON THE CLOCK — seat ${request.seat} (hand ${request.handId})` }),
     h('span', { class: 'chip-row' }, chips),
-    h('span', { class: 'muted small', text: `pot ${formatTokens(request.pot)} · stack ${formatTokens(request.stack)}` }),
+    h('span', { class: 'muted small', text: `pot ${money.format(request.pot)} · stack ${money.format(request.stack)}` }),
   );
 }
 
@@ -355,6 +390,7 @@ function seatCard(seat, table) {
   const classes = ['seat', `seat-${String(seat.status).toLowerCase()}`];
   if (toAct) classes.push('seat-toact');
   if (seat.agentId === null) classes.push('seat-empty');
+  const money = tableMoney(table);
 
   // FR-6: `holeCards` is `null` while a card is hidden, and the snapshot never
   // carries a value the hand has not made public. An un-revealed seat renders
@@ -387,16 +423,16 @@ function seatCard(seat, table) {
       'dl',
       { class: 'kv-inline' },
       h('dt', { text: 'stack' }),
-      h('dd', null, moneyEl(seat.stack, { maxFractionDigits: 6 })),
+      h('dd', null, money.el(seat.stack, { maxFractionDigits: 6 })),
       h('dt', { text: 'committed' }),
-      h('dd', null, moneyEl(seat.committed, { maxFractionDigits: 6 })),
+      h('dd', null, money.el(seat.committed, { maxFractionDigits: 6 })),
       h('dt', { text: 'hand total' }),
-      h('dd', null, moneyEl(seat.totalCommitted, { maxFractionDigits: 6 })),
+      h('dd', null, money.el(seat.totalCommitted, { maxFractionDigits: 6 })),
       seat.escrow !== null && seat.escrow !== undefined
         ? h('dt', { text: 'escrow' })
         : null,
       seat.escrow !== null && seat.escrow !== undefined
-        ? h('dd', null, moneyEl(seat.escrow, { maxFractionDigits: 6 }))
+        ? h('dd', null, money.el(seat.escrow, { maxFractionDigits: 6 }))
         : null,
     ),
   );
@@ -404,9 +440,10 @@ function seatCard(seat, table) {
 
 /**
  * @param {TableSnapshot} table
+ * @param {import('../format.js').TableMoney} money
  * @returns {HTMLElement}
  */
-function potsBlock(table) {
+function potsBlock(table, money) {
   const pots = Array.isArray(table.pots) ? table.pots : [];
   if (pots.length === 0) {
     return h('p', { class: 'note', text: 'No pots are posted on this table yet.' });
@@ -422,20 +459,26 @@ function potsBlock(table) {
         'tr',
         null,
         h('td', { text: pot.index === 0 ? 'main' : `side ${pot.index}` }),
-        h('td', null, moneyEl(pot.amount, { maxFractionDigits: 6 })),
+        h('td', null, money.el(pot.amount, { maxFractionDigits: 6 })),
         h('td', { text: Array.isArray(pot.eligibleSeats) ? pot.eligibleSeats.join(', ') : '—' }),
       ),
     );
   }
-  return h('div', { class: 'table-wrap' }, node);
+  return h('div', { class: 'table-wrap', tabindex: '0' }, node);
 }
 
 /**
+ * The table config panel: stakes, ante, buy-in and rake cap are **that table's
+ * amounts**, so they go through the same formatter (a free table's blinds are
+ * whole play chips, `1 / 2`, not `0.000…`).
+ *
  * @param {TableSnapshot} table
+ * @param {import('../format.js').TableMoney} money
  * @returns {HTMLElement}
  */
-function configBlock(table) {
+function configBlock(table, money) {
   const config = table.config;
+  const unit = money.decimals === 0 ? 'play chips' : 'tokens';
   return h(
     'details',
     { class: 'config-block' },
@@ -446,13 +489,13 @@ function configBlock(table) {
       h('dt', { text: 'mode' }),
       h('dd', null, modeTag(table.mode), config.escrowRequired ? badge('escrow required', 'wager') : null),
       h('dt', { text: 'stakes SB/BB' }),
-      h('dd', { text: `${formatTokens(config.smallBlind)} / ${formatTokens(config.bigBlind)} tokens` }),
+      h('dd', { text: `${money.format(config.smallBlind)} / ${money.format(config.bigBlind)} ${unit}` }),
       h('dt', { text: 'ante' }),
-      h('dd', { text: `${formatTokens(config.ante)} tokens` }),
+      h('dd', { text: `${money.format(config.ante)} ${unit}` }),
       h('dt', { text: 'buy-in' }),
-      h('dd', { text: `${formatTokens(config.minBuyIn)} – ${formatTokens(config.maxBuyIn)} tokens` }),
+      h('dd', { text: `${money.format(config.minBuyIn)} – ${money.format(config.maxBuyIn)} ${unit}` }),
       h('dt', { text: 'rake' }),
-      h('dd', { text: `${formatBps(config.rakeBps)} of pot, cap ${formatTokens(config.rakeCap)}${config.rakeOnlyWithFlop ? ', only with a flop' : ''}` }),
+      h('dd', { text: `${formatBps(config.rakeBps)} of pot, cap ${money.format(config.rakeCap)}${config.rakeOnlyWithFlop ? ', only with a flop' : ''}` }),
       h('dt', { text: 'think budget' }),
       h('dd', { text: `${formatInt(config.thinkBudgetMs / 1000)}s per decision (FR-3.5)` }),
       h('dt', { text: 'burn cards' }),

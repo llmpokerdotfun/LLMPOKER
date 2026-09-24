@@ -10,10 +10,10 @@
  * server's `/api/v1/verify/hands/:id` result, flagging any disagreement.
  */
 
-import { getHand, getHands, getHandVerification } from '../api.js';
+import { getHand, getHands, getHandVerification, getHealth } from '../api.js';
 import { HANDS_PAGE_SIZE } from '../constants.js';
-import { formatDateTime, formatInt, formatRelative, formatTokens, shortHex } from '../format.js';
-import { agentName, getState, onHandComplete, startLive } from '../live.js';
+import { formatDateTime, formatInt, formatRelative, shortHex, tableMoney } from '../format.js';
+import { agentName, getState, getTable, onHandComplete, startLive } from '../live.js';
 import { renderProofPanel, verifyLocally } from '../proof.js';
 import {
   badge,
@@ -25,7 +25,6 @@ import {
   h,
   handLink,
   modeTag,
-  moneyEl,
   panel,
   renderChrome,
   requireElement,
@@ -71,11 +70,105 @@ let renderToken = 0;
 /** @type {number|null} */
 let handsRefreshTimer = null;
 
+/**
+ * Per-table money formatters, keyed by table id.
+ *
+ * A `HandSummary` row carries `mode` but **not** the table's `config`, so the
+ * currencies' decimals are learned once per table — from the live table snapshot
+ * or, for an offline table, from one `/api/v1/hands/:id` fetch (the detail view
+ * carries `config`). The format of a row is asynchronous only because of that
+ * lookup; the *rendering* of each amount is the same synchronous `tableMoney()`.
+ *
+ * @type {Map<string, ReturnType<typeof tableMoney>>}
+ */
+const handMoneyCache = new Map();
+/** @type {{tokenomics?: import('../types.js').Tokenomics|null}|null} */
+let handMoneyContext = null;
+
+/** @returns {Promise<void>} */
+async function loadHandMoneyContext() {
+  if (handMoneyContext) return;
+  try {
+    const health = await getHealth();
+    handMoneyContext = { tokenomics: health?.tokenomics ?? null };
+  } catch {
+    // An unreachable /health is not fatal: a WAGER table then falls back to the
+    // documented token decimals, and a FREE table is always whole play chips.
+    handMoneyContext = { tokenomics: null };
+  }
+  handMoneyCache.clear();
+}
+
+/**
+ * The money formatter for a hand's table: the table's own decimals.
+ *
+ * @param {string} tableId
+ * @param {import('../types.js').TableConfig|null} [config] the hand history's own copy, when the caller has it
+ * @param {import('../types.js').Mode} [mode]
+ * @returns {ReturnType<typeof tableMoney>}
+ */
+function moneyForTable(tableId, config = null, mode) {
+  if (config === null) {
+    const cached = handMoneyCache.get(tableId);
+    if (cached) return cached;
+  }
+  const money = tableMoney(config ?? mode ?? null, handMoneyContext ? { context: handMoneyContext } : {});
+  if (config !== null) handMoneyCache.set(tableId, money);
+  return money;
+}
+
+/**
+ * Resolves the formatter for a hand row. Uses the config the row carries (a
+ * `HandHistory` does), then the live table snapshot, then one cached fetch of the
+ * hand detail for an offline table, then the row's own `mode` as a last resort.
+ * Never blocks a render: the fetch only warms the cache for the next pass.
+ *
+ * @param {import('../types.js').HandSummary|import('../types.js').HandHistory} hand
+ * @returns {ReturnType<typeof tableMoney>}
+ */
+function handMoney(hand) {
+  const record = /** @type {Record<string, any>} */ (hand);
+  const tableId = typeof record.tableId === 'string' ? record.tableId : '';
+  const config = record.config ?? null;
+  if (config) return moneyForTable(tableId, config, record.mode);
+  const live = tableId === '' ? null : getTable(tableId);
+  if (live?.config) return moneyForTable(tableId, live.config, record.mode);
+  void warmHandConfig(record.handId ?? '');
+  return moneyForTable(tableId, null, record.mode);
+}
+
+/**
+ * @param {string} handId
+ * @returns {Promise<void>}
+ */
+async function warmHandConfig(handId) {
+  if (typeof handId !== 'string' || handId === '') return;
+  await loadHandMoneyContext();
+  try {
+    const history = await getHand(handId);
+    if (history?.config && typeof history.tableId === 'string') {
+      moneyForTable(history.tableId, history.config, history.result?.mode);
+    }
+  } catch {
+    // The list stays renderable with the documented fallback decimals; nothing
+    // here is worth a banner of its own.
+  }
+}
+
 function main() {
   renderChrome('/hands');
 
   renderFilters();
   renderRoute();
+
+  // `/api/v1/health` carries `tokenomics.wagerCurrencies`, which is what tells a
+  // USDG wager table's amounts apart from LLMPOKER's. It is only needed to settle
+  // the decimals of a table whose config this page has not seen yet, so it never
+  // delays a render: it warms the cache and re-renders the detail view only (the
+  // list is left alone so a reader's place and focus are not disturbed).
+  void loadHandMoneyContext().then(() => {
+    if (currentRoute().id) renderRoute();
+  });
 
   startLive();
   onHandComplete(onLiveHand);
@@ -223,6 +316,7 @@ async function renderList(route) {
     tbody.appendChild(emptyRow(14, 'No hands match these filters.'));
   }
   for (const hand of hands) {
+    const money = handMoney(hand);
     tbody.appendChild(
       h(
         'tr',
@@ -238,10 +332,10 @@ async function renderList(route) {
         h('td', null, modeTag(hand.mode)),
         h('td', { text: hand.streetReached ?? '—' }),
         h('td', null, cardRow(hand.board)),
-        h('td', null, moneyEl(hand.totalPot, { maxFractionDigits: 6 })),
-        h('td', null, moneyEl(hand.totalRake, { maxFractionDigits: 6 })),
+        h('td', null, money.el(hand.totalPot, { maxFractionDigits: 6 })),
+        h('td', null, money.el(hand.totalRake, { maxFractionDigits: 6 })),
         h('td', { class: 'num', text: formatInt(hand.playerCount) }),
-        h('td', { text: winnersText(hand) }),
+        h('td', { text: winnersText(hand, money) }),
         h(
           'td',
           null,
@@ -301,7 +395,7 @@ async function renderList(route) {
         h('strong', { text: 'proof' }),
         ' to recompute the shuffle in this browser and compare it with the server verdict.',
       ),
-      h('div', { class: 'table-wrap' }, table),
+      h('div', { class: 'table-wrap', tabindex: '0' }, table),
       pager,
     ),
   );
@@ -336,12 +430,13 @@ function auditCell(hand) {
 
 /**
  * @param {HandSummary} hand
+ * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {string}
  */
-function winnersText(hand) {
+function winnersText(hand, money) {
   const winners = Array.isArray(hand.winners) ? hand.winners : [];
   if (winners.length === 0) return '—';
-  return winners.map((w) => `${w.name ?? `seat ${w.seat}`} (${formatTokens(w.amount, { maxFractionDigits: 4 })})`).join(', ');
+  return winners.map((w) => `${w.name ?? `seat ${w.seat}`} (${money.format(w.amount, { maxFractionDigits: 4 })})`).join(', ');
 }
 
 /**
@@ -387,10 +482,15 @@ async function renderDetail(route) {
   const serverError = verifyResult.status === 'rejected' ? /** @type {Error} */ (verifyResult.reason) : null;
 
   const proofContainer = h('section', { class: 'panel proof-panel' });
+  // The hand history carries the table's own `config`, so every amount on this
+  // page is read with the decimals that hand's table actually used.
+  const money = tableMoney(history, handMoneyContext ? { context: handMoneyContext } : {});
+  handMoneyCache.set(history.result.tableId, money);
   clearNode(dom.view);
   showBanner(dom.banner, null);
-  dom.view.appendChild(handHeader(history, route));
-  dom.view.appendChild(handBody(history));
+  dom.view.appendChild(handHeader(history, route, money));
+  dom.view.appendChild(handBody(history, money));
+  dom.view.appendChild(proofContainer);
   dom.view.appendChild(proofContainer);
 
   // In-browser recomputation happens after first paint so the hand is visible
@@ -415,21 +515,22 @@ async function renderDetail(route) {
 /**
  * @param {HandHistory} history
  * @param {Route} route
+ * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {HTMLElement}
  */
-function handHeader(history, route) {
+function handHeader(history, route, money) {
   const result = history.result;
   return panel(
     `Hand ${result.handId}`,
-    `${result.mode} · table ${result.tableId} · hand #${formatInt(result.handNumber)} · street reached ${result.streetReached}`,
+    `${result.mode} · table ${result.tableId} · hand #${formatInt(result.handNumber)} · street reached ${result.streetReached} · amounts in ${money.decimals === 0 ? 'whole play chips' : `a ${money.decimals}-decimal token`}`,
     h(
       'div',
       { class: 'stat-grid' },
       stat('hand id', h('code', { class: 'hash', text: result.handId, title: result.handId })),
       stat('mode', modeTag(result.mode)),
       stat('board', cardRow(result.board)),
-      stat('total pot', moneyEl(result.totalPot, { maxFractionDigits: 6 })),
-      stat('total rake', moneyEl(result.totalRake, { maxFractionDigits: 6 })),
+      stat('total pot', money.el(result.totalPot, { maxFractionDigits: 6 })),
+      stat('total rake', money.el(result.totalRake, { maxFractionDigits: 6 })),
       stat('button seat', `seat ${formatInt(result.buttonSeat)}`),
       stat('started', formatDateTime(result.startedAt)),
       stat('ended', formatDateTime(result.endedAt)),
@@ -477,18 +578,19 @@ function stat(label, value) {
 
 /**
  * @param {HandHistory} history
+ * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {HTMLElement}
  */
-function handBody(history) {
+function handBody(history, money) {
   const result = history.result;
   const proof = history.proof;
   return h(
     'div',
     { class: 'detail-stack' },
-    seatsSection(history),
+    seatsSection(history, money),
     showdownSection(history),
-    actionsSection(history),
-    potsSection(history),
+    actionsSection(history, money),
+    potsSection(history, money),
     h(
       'section',
       { class: 'panel' },
@@ -581,9 +683,10 @@ function revealSummary(proof) {
 
 /**
  * @param {HandHistory} history
+ * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {HTMLElement}
  */
-function seatsSection(history) {
+function seatsSection(history, money) {
   const result = history.result;
   const { table, tbody } = tableShell([
     { label: 'seat', className: 'num' },
@@ -602,9 +705,9 @@ function seatsSection(history) {
         h('td', { class: 'num', text: String(seat.seat) }),
         h('td', { text: seat.agentId ? agentName(seat.agentId) : '—', title: seat.agentId ?? '' }),
         h('td', null, cardRow(seat.holeCards)),
-        h('td', null, moneyEl(seat.startingStack, { maxFractionDigits: 6 })),
-        h('td', null, moneyEl(seat.endingStack, { maxFractionDigits: 6 })),
-        h('td', null, moneyEl(seat.net, { maxFractionDigits: 6, signed: true })),
+        h('td', null, money.el(seat.startingStack, { maxFractionDigits: 6 })),
+        h('td', null, money.el(seat.endingStack, { maxFractionDigits: 6 })),
+        h('td', null, money.el(seat.net, { maxFractionDigits: 6, signed: true })),
         h(
           'td',
           null,
@@ -620,7 +723,7 @@ function seatsSection(history) {
   return panel(
     'Seats',
     'starting stack / ending stack / net, with the hole cards recorded in the history',
-    h('div', { class: 'table-wrap' }, table),
+    h('div', { class: 'table-wrap', tabindex: '0' }, table),
   );
 }
 
@@ -658,14 +761,15 @@ function showdownSection(history) {
       ),
     );
   }
-  return panel('Showdown', 'what each seat tabled at the end of the hand', h('div', { class: 'table-wrap' }, table));
+  return panel('Showdown', 'what each seat tabled at the end of the hand', h('div', { class: 'table-wrap', tabindex: '0' }, table));
 }
 
 /**
  * @param {HandHistory} history
+ * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {HTMLElement}
  */
-function actionsSection(history) {
+function actionsSection(history, money) {
   const actions = history.result.actions ?? [];
   const container = h('section', { class: 'panel' });
   container.appendChild(
@@ -698,14 +802,14 @@ function actionsSection(history) {
     ]);
     for (const action of list) {
       const seatInfo = history.result.seats.find((s) => s.seat === action.seat);
-      tbody.appendChild(actionRow(action, seatInfo?.agentId ?? null));
+      tbody.appendChild(actionRow(action, seatInfo?.agentId ?? null, money));
     }
     body.appendChild(
       h(
         'div',
         { class: 'street-group' },
         h('h3', { class: 'subblock-title', text: `${street} (${list.length})` }),
-        h('div', { class: 'table-wrap' }, table),
+        h('div', { class: 'table-wrap', tabindex: '0' }, table),
       ),
     );
   }
@@ -716,9 +820,10 @@ function actionsSection(history) {
 /**
  * @param {ActionRecord} action
  * @param {string|null} agentId
+ * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {HTMLElement}
  */
-function actionRow(action, agentId) {
+function actionRow(action, agentId, money) {
   return h(
     'tr',
     { class: action.origin === 'AGENT' ? null : 'row-warn' },
@@ -726,9 +831,9 @@ function actionRow(action, agentId) {
     h('td', { class: 'num', text: String(action.seat) }),
     h('td', { text: agentId ? agentName(agentId) : '—' }),
     h('td', null, badge(action.action, action.action === 'FOLD' ? 'muted' : 'info')),
-    h('td', null, moneyEl(action.amount, { maxFractionDigits: 6 })),
-    h('td', null, moneyEl(action.paid, { maxFractionDigits: 6 })),
-    h('td', null, moneyEl(action.potAfter, { maxFractionDigits: 6 })),
+    h('td', null, money.el(action.amount, { maxFractionDigits: 6 })),
+    h('td', null, money.el(action.paid, { maxFractionDigits: 6 })),
+    h('td', null, money.el(action.potAfter, { maxFractionDigits: 6 })),
     h('td', null, statusBadge(action.origin), action.origin === 'AGENT' ? null : h('span', { class: 'muted small', text: ' auto-applied' })),
     h('td', { class: 'muted nowrap', text: formatDateTime(action.at) }),
   );
@@ -736,9 +841,10 @@ function actionRow(action, agentId) {
 
 /**
  * @param {HandHistory} history
+ * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {HTMLElement}
  */
-function potsSection(history) {
+function potsSection(history, money) {
   const result = history.result;
   const pots = result.pots ?? [];
   const { table, tbody } = tableShell([
@@ -757,8 +863,8 @@ function potsSection(history) {
         'tr',
         null,
         h('td', { text: pot.potIndex === 0 ? 'main' : `side ${pot.potIndex}` }),
-        h('td', null, moneyEl(pot.amount, { maxFractionDigits: 6 })),
-        h('td', null, moneyEl(pot.rake, { maxFractionDigits: 6 })),
+        h('td', null, money.el(pot.amount, { maxFractionDigits: 6 })),
+        h('td', null, money.el(pot.rake, { maxFractionDigits: 6 })),
         h(
           'td',
           null,
@@ -768,7 +874,7 @@ function potsSection(history) {
               'span',
               { class: 'winner' },
               `${seatInfo?.agentId ? agentName(seatInfo.agentId) : `seat ${winner.seat}`} `,
-              moneyEl(winner.amount, { maxFractionDigits: 6 }),
+              money.el(winner.amount, { maxFractionDigits: 6 }),
               ' ',
             );
           }),
@@ -780,14 +886,14 @@ function potsSection(history) {
   return panel(
     'Pots and awards',
     'rake is deducted per pot at settlement (FR-8.1, FR-8.2); the odd chip rule is in FR-3.4',
-    h('div', { class: 'table-wrap' }, table),
+    h('div', { class: 'table-wrap', tabindex: '0' }, table),
     h(
       'p',
       { class: 'note' },
       'total pot ',
-      moneyEl(result.totalPot, { maxFractionDigits: 6 }),
+      money.el(result.totalPot, { maxFractionDigits: 6 }),
       ' · total rake ',
-      moneyEl(result.totalRake, { maxFractionDigits: 6 }),
+      money.el(result.totalRake, { maxFractionDigits: 6 }),
       ' · ',
       result.zeroSumVerified ? badge('zero-sum verified', 'verified') : badge('zero-sum NOT verified', 'failed'),
     ),

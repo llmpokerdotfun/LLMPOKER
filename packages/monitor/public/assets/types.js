@@ -283,6 +283,11 @@
  * @property {string|null} deckRoot FR-6.2: the committed deck root for this hand
  * @property {boolean} audited FR-6.4: the end-of-hand audit passed
  * @property {boolean} [fromLive] Locally derived from a WS delta, not from `/api/v1/hands`.
+ * @property {TableConfig|null} [config] The row's table config, when the caller has it. The
+ *   authoritative `/api/v1/hands` summary does not carry it; a row built from a live delta and
+ *   the `HandHistory` detail do. Money render sites read it through
+ *   `format.tableMoney()` so a free row's pot is whole play chips and a wager row keeps its
+ *   settlement currency's decimals.
  */
 
 /**
@@ -520,6 +525,10 @@
  * @property {number} wagerTables
  * @property {number} agents
  * @property {number} hands
+ * @property {'ONCHAIN'|'LOCAL'|null} [rngAnchor] how the in-flight RNG is anchored (`LOCAL` = the free-mode simulator, FR-4.4)
+ * @property {'ONCHAIN'|'LOCAL'|null} [settlement] the settlement adapter in use
+ * @property {boolean} [wagerEnabled] false when no chain adapter is configured — wager tables are then refused, not downgraded
+ * @property {boolean} [walletServices] whether the gate/staking chain services are configured
  * @property {ChainMetadata|null} [chain] absent on an older server — treat as unknown
  * @property {ContractAddresses|null} [contracts] every address may be `null` (not deployed yet)
  * @property {Tokenomics|null} [tokenomics]

@@ -13,8 +13,13 @@
   --border-soft: #1e2739;
   --text: #e7edf7;
   --text-dim: #a9b4c7;
-  --muted: #7d8798;
+  /* --muted must clear 4.5:1 against the lightest surface it sits on
+     (--panel-3 #202a3d); #7d8798 only reached 3.96:1 there. */
+  --muted: #8e9aae;
   --accent: #4c8dff;
+  /* Link *text* needs a lighter blue than --accent: #4c8dff is 4.49:1 on
+     --panel-3, just under the 4.5:1 threshold for normal-size text. */
+  --accent-text: #6ba2ff;
   --accent-soft: #1d2f52;
   --green: #3fb950;
   --green-soft: #14291b;
@@ -48,7 +53,7 @@ body {
 }
 
 a {
-  color: var(--accent);
+  color: var(--accent-text);
   text-decoration: none;
 }
 
@@ -77,10 +82,16 @@ h4 {
   line-height: 1.25;
 }
 
+/* Off-screen until focused. Uses the clip technique rather than a negative
+   `left`, because a physical -9999px offset becomes +9999px of horizontal
+   overflow under `dir="rtl"` (WCAG 1.4.10 / 1.3.4 reflow). */
 .skip-link {
   position: absolute;
-  left: -9999px;
-  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
   padding: 8px 12px;
   background: var(--accent);
   color: #04101f;
@@ -88,8 +99,12 @@ h4 {
 }
 
 .skip-link:focus {
-  left: 8px;
-  top: 8px;
+  width: auto;
+  height: auto;
+  overflow: visible;
+  clip-path: none;
+  inset-block-start: 8px;
+  inset-inline-start: 8px;
 }
 
 .muted {
@@ -117,14 +132,20 @@ h4 {
   color: var(--amber);
 }
 
+/* Links that sit inside running text must not be signalled by colour alone
+   (WCAG 1.4.1). #6ba2ff is only ~1.2:1 against the --text-dim prose around
+   them, so these are permanently underlined rather than underlined on hover. */
 .link,
 .plain-link {
-  color: var(--accent);
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
 
 .plain-link:hover,
 .link:hover {
-  text-decoration: underline;
+  text-decoration-thickness: 2px;
 }
 
 .row-dim {
@@ -929,8 +950,18 @@ a:focus-visible {
   min-width: 0;
 }
 
+/* An empty seat should still read as recessed, but a blanket opacity crushed
+   its status badge to 2.26:1 (--muted flattened over the panel background).
+   Recess it with a dashed edge and a see-through surface instead, which keeps
+   the badge text at full contrast. */
 .seat-empty {
-  opacity: 0.6;
+  border-style: dashed;
+  border-color: var(--border-soft);
+  background: transparent;
+}
+
+.seat-empty .badge {
+  background: transparent;
 }
 
 .seat-toact {
@@ -1249,6 +1280,159 @@ a:focus-visible {
   color: var(--text-dim);
   font-size: 0.85rem;
   max-width: 130ch;
+}
+
+/* ------------------------------------------------------ documentation hub  */
+
+.docs-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.docs-sidebar,
+.docs-main {
+  min-width: 0;
+}
+
+.docs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.docs-list-item {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #0e1524;
+  padding: 8px 10px;
+}
+
+.docs-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 0.86rem;
+  flex-wrap: wrap;
+}
+
+.docs-link[aria-current='true'] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.docs-link-label {
+  overflow-wrap: anywhere;
+}
+
+.docs-toc {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #0e1524;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+
+.docs-toc-title {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.docs-toc-list {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  /* WCAG 2.2 AA 2.5.8 (target-size): each entry is a block-level link with
+     padding and a 24px minimum height, and neighbouring targets are >= 24px
+     apart (24px + 6px gap), so a heading is not a 17px-tall tap target. */
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.docs-toc-item {
+  font-size: 0.84rem;
+  line-height: 1.35;
+  display: block;
+}
+
+/* The anchor is the target, so it carries the padding and the minimum size.
+   `display: block` rather than flex: as a flex container the label kept its
+   automatic minimum width and a long heading overflowed the 320px sidebar into
+   the main pane (verify_overflow: 67-87% overlap with the raw-file link at
+   320/414/1280px). Block layout wraps instead. */
+.docs-toc-item .link {
+  display: block;
+  box-sizing: border-box;
+  min-height: 24px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  overflow-wrap: anywhere;
+}
+
+.docs-toc-item .link:hover {
+  background: var(--panel-3);
+}
+
+.docs-toc-level-1 .link { padding-left: 8px; }
+.docs-toc-level-2 .link { padding-left: 20px; }
+.docs-toc-level-3 .link { padding-left: 32px; }
+.docs-toc-level-4 .link { padding-left: 44px; }
+.docs-toc-level-5 .link { padding-left: 56px; }
+.docs-toc-level-6 .link { padding-left: 68px; }
+
+.docs-text {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #0e1524;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.docs-doc-head {
+  margin-bottom: 8px;
+}
+
+/* ------------------------------------------------------------- link list   */
+
+/* A plain wrapper: pages put their own list inside it, so it must not be a list
+   itself (a <ul> whose child is a <ul> is a `list` violation). */
+.link-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+  font-size: 0.9rem;
+}
+
+@media (max-width: 900px) {
+  .docs-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .docs-text {
+    max-height: none;
+  }
 }
 
 /* ---------------------------------------------------------- responsive   */

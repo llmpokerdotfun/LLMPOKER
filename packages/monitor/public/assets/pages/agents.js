@@ -3,11 +3,21 @@
  * rate, mode, seat, free chips, escrow, net wager profit) plus the public
  * shared-wallet flag from FR-10.2.
  *
- * Chips are decimal strings; every amount is formatted with BigInt (never
- * `Number(chips)`).
+ * Chips are decimal strings; every amount is formatted with `BigInt` (never
+ * `Number(chips)`) **and with the decimals of the ledger it belongs to**:
+ *
+ *  * a seat `stack` is the seat's table's money — whole play chips on a free
+ *    table (`413`), the settlement token's decimals on a wager table (`1.5`);
+ *  * `freeChips` is always whole play chips, because free chips have no token
+ *    decimals at all (FR-4.2) — so `10000`, never `0.00000000000001`;
+ *  * `escrow` and `netWagerProfit` are wager ledgers: the agent's own table's
+ *    decimals when it is seated, otherwise the chain token's.
+ *
+ * The rule itself lives in `format.decimalsForTable()` / `tableMoney()`; this
+ * page only asks for it.
  */
 
-import { formatInt, formatRelative, formatWinRateFromCounts, shortHex } from '../format.js';
+import { formatInt, formatRelative, formatWinRateFromCounts, shortHex, tableMoney } from '../format.js';
 import { getState, modeForAgent, startLive, subscribe } from '../live.js';
 import {
   banner,
@@ -15,7 +25,6 @@ import {
   emptyRow,
   h,
   modeTag,
-  moneyEl,
   panel,
   renderChrome,
   requireElement,
@@ -208,6 +217,13 @@ function renderList(agents, live) {
   } else {
     for (const agent of agents) {
       const stack = agent.stack;
+      const seatedTable = agent.seatedAt ? getState().tables.find((t) => t.id === agent.seatedAt?.tableId) ?? null : null;
+      // A seated stack is the seat's table's money: whole play chips on a free
+      // table, the settlement token's decimals on a wager table.
+      const seatMoney = tableMoney(seatedTable ?? null);
+      // Escrow and net wager profit are wager ledgers: the table the agent is
+      // sitting at when there is one, otherwise the chain token's decimals.
+      const wagerMoney = seatedTable === null ? tableMoney('WAGER') : seatMoney;
       tbody.appendChild(
         h(
           'tr',
@@ -237,12 +253,13 @@ function renderList(agents, live) {
                 )
               : h('span', { class: 'muted', text: 'not seated' }),
           ),
-          h('td', null, stack === null || stack === undefined ? h('span', { class: 'muted', text: '—' }) : moneyEl(stack, { maxFractionDigits: 6 })),
+          h('td', null, stack === null || stack === undefined ? h('span', { class: 'muted', text: '—' }) : seatMoney.el(stack, { maxFractionDigits: 6 })),
           h('td', { class: 'num', text: formatInt(agent.handsPlayed) }),
           h('td', { class: 'num', text: formatWinRateFromCounts(agent.handsWon, agent.handsPlayed) }),
-          h('td', null, moneyEl(agent.freeChips, { maxFractionDigits: 4 })),
-          h('td', null, moneyEl(agent.escrow, { maxFractionDigits: 6 })),
-          h('td', null, moneyEl(agent.netWagerProfit, { maxFractionDigits: 6, signed: true })),
+          // Play chips are whole chips; they are never a token amount.
+          h('td', null, tableMoney('FREE').el(agent.freeChips, { maxFractionDigits: 4 })),
+          h('td', null, wagerMoney.el(agent.escrow, { maxFractionDigits: 6 })),
+          h('td', null, wagerMoney.el(agent.netWagerProfit, { maxFractionDigits: 6, signed: true })),
           h(
             'td',
             { class: 'nowrap' },
@@ -258,16 +275,16 @@ function renderList(agents, live) {
 
   const body = panel(
     'Live agents',
-    `${formatInt(agents.length)} shown · statuses: ${STATUS_ORDER.join(', ')} · stack/escrow/net are token amounts with 18 decimals`,
+    `${formatInt(agents.length)} shown · statuses: ${STATUS_ORDER.join(', ')} · stacks and play chips are whole chips on a free table and token amounts (6 or 18 decimals) on a wager table`,
     h(
       'p',
       { class: 'note' },
       'A ',
       h('span', { class: 'flag flag-shared', text: 'shared wallet' }),
       ' flag means one wallet backs several agent ids — that is public, not prohibited (FR-10.2). ',
-      'Net wager P/L is cumulative escrow profit/loss; free chips have no token value (FR-4.2).',
+      'Net wager P/L is cumulative escrow profit/loss; free chips have no token value and are rendered as whole chips (FR-4.2).',
     ),
-    h('div', { class: 'table-wrap' }, table),
+    h('div', { class: 'table-wrap', tabindex: '0' }, table),
   );
   clearNode(dom.list);
   dom.list.appendChild(body);

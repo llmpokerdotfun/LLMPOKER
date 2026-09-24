@@ -18,6 +18,8 @@ import {
   formatCountdown,
   formatRelative,
   formatTokens,
+  setMoneyContext,
+  setMoneyElement,
 } from './format.js';
 import { NO_WALLET_MESSAGE, connect, restore, shortAddress, subscribeWallet, walletState } from './wallet.js';
 
@@ -306,18 +308,23 @@ export function faceDownCards(count) {
 }
 
 /**
- * Renders a chip amount as tokens. Always BigInt-exact; `title` carries the raw
- * base-unit string so no precision is ever hidden from a verifier.
+ * Renders a chip amount. Always BigInt-exact; `title` carries the raw base-unit
+ * string plus the decimals the amount was read with, so no precision — and no
+ * unit — is ever hidden from a verifier.
+ *
+ * `decimals` must come from `format.decimalsForTable()` / `tableMoney()`: a free
+ * table's amounts are whole play chips (`0`), a wager table's are the settlement
+ * token's (`6` for USDG, `18` for LLMPOKER). Passing nothing means "18", which is
+ * only right for a genuine token balance.
  *
  * @param {unknown} chips
  * @param {{maxFractionDigits?: number, signed?: boolean, className?: string, decimals?: number}} [options]
- *   `decimals` overrides the default 18 for a token that reports its own
- *   decimals (gate/staking responses); it is never used to round the value.
+ *   `decimals` selects the unit; it is never used to round the value.
  * @returns {HTMLElement}
  */
 export function moneyEl(chips, options = {}) {
-  const decimals = typeof options.decimals === 'number' ? options.decimals : undefined;
-  const exact = chipsToTokenString(chips, decimals ?? CHIP_DECIMALS);
+  const decimals = typeof options.decimals === 'number' ? options.decimals : CHIP_DECIMALS;
+  const exact = chipsToTokenString(chips, decimals);
   const shown = formatTokens(chips, { maxFractionDigits: options.maxFractionDigits, decimals });
   const value = options.signed && shown !== EM_DASH && !shown.startsWith('-') ? `+${shown}` : shown;
   const classes = ['money'];
@@ -326,7 +333,7 @@ export function moneyEl(chips, options = {}) {
   return h('span', {
     class: classes.join(' '),
     text: value,
-    title: `${exact} chips (base units, ${decimals ?? CHIP_DECIMALS} decimals)`,
+    title: `${exact} ${decimals === 0 ? 'play chips' : 'tokens'} (base units, ${decimals} decimals)`,
   });
 }
 
@@ -399,10 +406,12 @@ export function errorBanner(err, context) {
 /** @type {{href: string, label: string}[]} */
 const NAV = [
   { href: '/', label: 'Home' },
-  { href: '/stake', label: 'Stake' },
-  { href: '/agents', label: 'Agents' },
   { href: '/tables', label: 'Tables' },
+  { href: '/agents', label: 'Agents' },
   { href: '/hands', label: 'Hands' },
+  { href: '/stake', label: 'Stake' },
+  { href: '/docs', label: 'Docs' },
+  { href: '/about', label: 'About' },
 ];
 
 /**
@@ -536,13 +545,39 @@ export function mountWalletButton() {
 }
 
 /**
+ * The site's top-level destinations, in header order. Exported so a page that
+ * wants to link its siblings (e.g. the documentation hub) does not repeat them.
+ *
+ * @returns {{href: string, label: string}[]}
+ */
+export function navItems() {
+  return NAV.map((item) => ({ ...item }));
+}
+
+/**
+ * The chrome every page renders: the wallet control, the header nav (which links
+ * `/docs` and `/about`) and the footer (which links them too). Every page calls
+ * this, so those two links exist on **every** page by construction.
+ *
+ * @param {string} activePath one of `/`, `/tables`, `/agents`, `/hands`, `/stake`, `/docs`, `/about`
+ * @returns {void}
+ */
+export function renderPageChrome(activePath) {
+  renderChrome(activePath);
+}
+
+/**
  * Renders the shared header nav and footer into `#site-header` / `#site-footer`,
  * including the connect-wallet control.
  *
- * @param {string} activePath one of `/`, `/stake`, `/agents`, `/tables`, `/hands`
+ * @param {string} activePath one of `/`, `/tables`, `/agents`, `/hands`, `/stake`, `/docs`, `/about`
+ * @param {{tokenomics?: import('./types.js').Tokenomics|null}|null} [health]
+ *   when `/api/v1/health` has already answered, its `tokenomics` teaches every
+ *   later `tableMoney()` call the wager currencies' decimals (see `format.js`).
  * @returns {void}
  */
-export function renderChrome(activePath) {
+export function renderChrome(activePath, health) {
+  if (health) setMoneyContext({ tokenomics: health.tokenomics ?? null });
   const header = document.getElementById('site-header');
   if (header) {
     clearNode(header);
@@ -612,6 +647,10 @@ export function renderChrome(activePath) {
           h('a', { href: '/hands', text: '/hands' }),
           ' \u00b7 ',
           h('a', { href: '/stake', text: '/stake' }),
+          ' \u00b7 ',
+          h('a', { href: '/docs', text: '/docs' }),
+          ' \u00b7 ',
+          h('a', { href: '/about', text: '/about' }),
           ' \u00b7 ',
           h('a', { href: '/llm.txt', text: '/llm.txt' }),
           ' (the machine-readable agent contract; ',
@@ -825,3 +864,7 @@ function parseTimestamp(raw) {
   const value = Number(trimmed);
   return Number.isFinite(value) ? value : NaN;
 }
+
+// `moneyEl` is this module's money renderer, so it is also the one
+// `format.tableMoney().el()` uses — one rendering path, not two.
+setMoneyElement(moneyEl);

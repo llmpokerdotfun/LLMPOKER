@@ -202,6 +202,223 @@ export function formatMinimumTokens(value, decimals = CHIP_DECIMALS) {
   return formatTokens(chips, { decimals, maxFractionDigits: 0 });
 }
 
+// ---------------------------------------------------------------------------
+// Money: "how many decimals does this amount have?" (single source of truth)
+// ---------------------------------------------------------------------------
+
+/**
+ * The whole money rule of the monitor, in one place.
+ *
+ * **Free-mode chips are whole play chips**, one base unit each: the API returns
+ * `totalPot: "3"`, `stack: "413"`, `autoTopUp: "10000"`. A wager table settles in
+ * a real ERC-20 whose decimals are its own (`USDG` = 6 here, `LLMPOKER` = 18), so
+ * the same `"3"` on a wager table would mean `0.000003`. Dividing a free pot by
+ * 1e18 renders it as `0.000000000000000003` — which is the bug this function
+ * exists to make impossible: **every money render site asks this helper instead
+ * of assuming a decimals count.**
+ *
+ * The rule, by table:
+ *
+ * | table | decimals |
+ * |---|---|
+ * | `mode === 'FREE'` (and everything derived from it: stacks, committed, pot, bets, play chips, the free leaderboard) | `0` |
+ * | `mode === 'WAGER'` with `settlementCurrency === 'USDG'` | `tokenomics.wagerCurrencies[USDG].decimals`, else `6` |
+ * | `mode === 'WAGER'` with `settlementCurrency === 'TOKEN'` / `null` | `tokenomics.tokenDecimals`, else `18` |
+ *
+ * The context is read as a priority chain:
+ *  1. an explicit `decimals` option (a response that reports its own, e.g. `/health`);
+ *  2. the per-page {@link setMoneyContext} (set from `/api/v1/health` by `renderChrome`);
+ *  3. the module default ({@link CHIP_DECIMALS}).
+ *
+ * @param {unknown} table a `TableConfig` / `TableSnapshot` / `HandSummary` / `HandHistory`, a bare `Mode` string, or nothing at all
+ * @param {{decimals?: number|null, tokenomics?: TokenomicsLike|null, context?: MoneyContext|null}} [options]
+ * @returns {number} a plain integer `0..36`; never `NaN`, never negative
+ */
+export function decimalsForTable(table, options = {}) {
+  if (typeof options.decimals === 'number' && Number.isInteger(options.decimals) && options.decimals >= 0 && options.decimals <= 36) {
+    return options.decimals;
+  }
+
+  const source = tableOrSnapshot(table);
+  const context = normalizeContext(options.context ?? options.tokenomics ?? moneyContext ?? null);
+  const tokenomics = context === null ? null : context.tokenomics;
+
+  // A free table's amounts are whole play chips. This is the whole of the fix:
+  // 0 decimals, and free chips can never be read as a token amount.
+  if (source.mode === 'FREE') return 0;
+
+  if (source.mode === 'WAGER') {
+    const currency = typeof source.currency === 'string' ? source.currency.trim().toUpperCase() : '';
+    if (currency === 'USDG') return currencyDecimals(tokenomics, 'USDG', 6);
+    // TOKEN (LLMPOKER) — the documented default when the config names no currency.
+    return integerOr(tokenomics?.tokenDecimals, CHIP_DECIMALS);
+  }
+
+  // No table at all: the context's own decimals, then the chain's token.
+  return integerOr(tokenomics?.tokenDecimals, CHIP_DECIMALS);
+}
+
+/**
+ * A formatter for one table's amounts, taken from the table (or hand) itself.
+ * Every render site should use this: `tableMoney(table).el(chips)` cannot forget
+ * the rule, because the amount's context travels with it.
+ *
+ * `el()` defers to `ui.moneyEl` — the single DOM money renderer — through a late
+ * binding (no static import, so `format.js` stays free of DOM *and* free of a
+ * cycle with `ui.js`); a Node test can call `format()`/`text()` and never needs a
+ * `document`.
+ *
+ * @param {unknown} table a `TableConfig` / `TableSnapshot` / `HandSummary` / `HandHistory`, a bare `Mode` string, or nothing
+ * @param {{decimals?: number|null, tokenomics?: TokenomicsLike|null, context?: MoneyContext|null}} [options]
+ * @returns {TableMoney}
+ */
+export function tableMoney(table, options = {}) {
+  const decimals = decimalsForTable(table, options);
+  return {
+    decimals,
+    isFree: decimals === 0 && modeOf(table) === 'FREE',
+    format: (chips, formatOptions) => formatTokens(chips, { ...formatOptions, decimals }),
+    text: (chips) => chipsToTokenString(chips, decimals),
+    el: (chips, elementOptions) => moneyElement(chips, { ...elementOptions, decimals }),
+  };
+}
+
+/**
+ * Overridable so a Node test of the pure modules does not need a DOM. `ui.js`
+ * (which owns `moneyEl`) or a test can replace it with a plain string renderer.
+ *
+ * @type {(chips: unknown, options: {decimals: number, maxFractionDigits?: number, signed?: boolean, className?: string}) => any}
+ */
+let moneyElement = (chips, options) => formatTokens(chips, options);
+
+/**
+ * The tokenomics/context the decimals rule reads. Set once per page from
+ * `/api/v1/health` by `ui.renderChrome()`, so a `WAGER` table's currency decimals
+ * are known even on a page that never fetches `/health` itself.
+ *
+ * @param {{tokenomics?: TokenomicsLike|null}|null} context
+ * @returns {void}
+ */
+export function setMoneyContext(context) {
+  moneyContext = normalizeContext(context);
+}
+
+/** @type {MoneyContext|null} */
+let moneyContext = null;
+
+/**
+ * @typedef {Object} TokenomicsLike
+ * @property {number} [tokenDecimals]
+ * @property {{symbol?: string, decimals?: number}[]} [wagerCurrencies]
+ */
+
+/**
+ * @typedef {Object} MoneyContext
+ * @property {TokenomicsLike|null|undefined} [tokenomics]
+ */
+
+/**
+ * @typedef {Object} TableMoney
+ * @property {number} decimals
+ * @property {boolean} isFree true when the amounts are whole play chips
+ * @property {(chips: unknown, options?: {maxFractionDigits?: number, group?: boolean, signed?: boolean}) => string} format
+ * @property {(chips: unknown, options?: {maxFractionDigits?: number, group?: boolean}) => string} text
+ * @property {(chips: unknown, options?: {maxFractionDigits?: number, signed?: boolean, className?: string}) => HTMLElement} el
+ */
+
+/**
+ * @param {unknown} value
+ * @returns {{mode: string|null, currency: string|null}}
+ */
+function tableOrSnapshot(value) {
+  if (typeof value === 'string') return { mode: value.toUpperCase(), currency: null };
+  if (!value || typeof value !== 'object') return { mode: null, currency: null };
+  const record = /** @type {Record<string, any>} */ (value);
+  // A `HandHistory` carries its own table config, and a `HandSummary` is a row.
+  const config = record.config && typeof record.config === 'object' ? record.config : record;
+  const mode = typeof config.mode === 'string' ? config.mode.toUpperCase() : typeof record.mode === 'string' ? record.mode.toUpperCase() : null;
+  const currency =
+    typeof config.settlementCurrency === 'string'
+      ? config.settlementCurrency
+      : typeof record.settlementCurrency === 'string'
+        ? record.settlementCurrency
+        : null;
+  return { mode, currency };
+}
+
+/**
+ * @param {unknown} table
+ * @returns {string|null}
+ */
+function modeOf(table) {
+  return tableOrSnapshot(table).mode;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {MoneyContext|null}
+ */
+function normalizeContext(value) {
+  if (!value || typeof value !== 'object') return null;
+  const record = /** @type {Record<string, any>} */ (value);
+  const tokenomics = record.tokenomics && typeof record.tokenomics === 'object' ? record.tokenomics : record;
+  return { tokenomics: /** @type {TokenomicsLike} */ (tokenomics) };
+}
+
+/**
+ * @param {TokenomicsLike|null|undefined} tokenomics
+ * @param {string} symbol
+ * @param {number} fallback
+ * @returns {number}
+ */
+function currencyDecimals(tokenomics, symbol, fallback) {
+  const list = tokenomics && Array.isArray(tokenomics.wagerCurrencies) ? tokenomics.wagerCurrencies : [];
+  const entry = list.find((candidate) => candidate && typeof candidate.symbol === 'string' && candidate.symbol.trim().toUpperCase() === symbol);
+  return integerOr(entry?.decimals, fallback);
+}
+
+/**
+ * @param {unknown} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function integerOr(value, fallback) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 36 ? value : fallback;
+}
+
+/**
+ * Wires the real DOM money renderer in. Called once by `ui.js`, whose
+ * `moneyEl()` is the monitor's only money element builder — so `tableMoney().el()`
+ * and a direct `moneyEl()` call can never drift apart in styling or in the
+ * `title` that carries the raw base-unit string.
+ *
+ * @param {(chips: unknown, options: {decimals: number, maxFractionDigits?: number, signed?: boolean, className?: string}) => any} renderer
+ * @returns {void}
+ */
+export function setMoneyElement(renderer) {
+  if (typeof renderer === 'function') moneyElement = renderer;
+}
+
+/**
+ * `12345` -> `"12.1 kB"`, `1234567` -> `"1.2 MB"`. Used for the size note on a
+ * fetched document; a byte count is a wire fact, not an estimate.
+ *
+ * @param {unknown} bytes
+ * @returns {string}
+ */
+export function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return EM_DASH;
+  if (bytes < 1024) return `${Math.trunc(bytes)} B`;
+  const units = ['kB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
 /**
  * Reads a Unix timestamp and normalises it to **milliseconds**.
  *

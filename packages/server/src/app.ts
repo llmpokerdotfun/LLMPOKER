@@ -794,6 +794,8 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
   app.get('/tables', page('tables.html'));
   app.get('/hands', page('hands.html'));
   app.get('/stake', page('stake.html'));
+  app.get('/docs', page('docs.html'));
+  app.get('/about', page('about.html'));
   app.get('/assets/*', async (request, reply) => {
     const wildcard = (request.params as Record<string, string>)['*'] ?? '';
     return serveStatic(reply, join(config.monitorDir, 'assets'), wildcard);

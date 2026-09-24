@@ -28,7 +28,7 @@
  */
 
 import { VENDOR_SHARED_URL } from './constants.js';
-import { formatDateTime, cardToString, shortHex } from './format.js';
+import { formatDateTime, cardToString, shortHex, tableMoney } from './format.js';
 import {
   badge,
   banner,
@@ -37,7 +37,6 @@ import {
   emptyRow,
   h,
   kvGrid,
-  moneyEl,
   rngPhaseBadge,
   tableShell,
 } from './ui.js';
@@ -392,7 +391,7 @@ export function renderProofPanel(container, ctx) {
   container.appendChild(phase1Section(proof));
   container.appendChild(phase2Section(proof));
   container.appendChild(phase3Section(proof, client));
-  container.appendChild(phase4Section(proof, client));
+  container.appendChild(phase4Section(proof, client, history));
   container.appendChild(proofMeta(proof));
   container.appendChild(renderComparison(proof, server, client, serverError));
   container.appendChild(renderChecksBlock(proof, client));
@@ -649,7 +648,7 @@ function phase3Section(proof, client) {
     { class: 'proof-subblock' },
     h('h3', { class: 'subblock-title', text: 'Phase 3 — cards made public (FR-6.3)' }),
     summary,
-    h('div', { class: 'table-wrap' }, table),
+    h('div', { class: 'table-wrap', tabindex: '0' }, table),
     h('p', {
       class: 'note',
       text:
@@ -704,11 +703,13 @@ function revealRow(reveal, client) {
  *
  * @param {RngProof} proof
  * @param {ClientVerification} client
+ * @param {HandHistory} history the hand, whose `config` says how to read the slashed bond
  * @returns {HTMLElement}
  */
-function phase4Section(proof, client) {
+function phase4Section(proof, client, history) {
   const audited = proof.phase === 'AUDITED';
   const deck = Array.isArray(proof.deck) ? proof.deck : [];
+  const money = tableMoney(history);
 
   if (!audited) {
     return h(
@@ -733,7 +734,7 @@ function phase4Section(proof, client) {
       kvGrid([
         { label: 'deck ordering', value: h('span', { class: 'muted', text: `not yet published (${deck.length} of ${DECK_POSITIONS} cards)` }) },
         { label: 'audited', value: badge('pending', 'pending', 'proof.audited is false while the hand is live') },
-        { label: 'slashed bond', value: slashedNode(proof) },
+        { label: 'slashed bond', value: slashedNode(proof, money) },
       ]),
     );
   }
@@ -757,7 +758,7 @@ function phase4Section(proof, client) {
       { label: 'entropy', value: hashNode(proof.entropy), title: proof.entropy ?? 'not published' },
       { label: 'audit block', value: blockNode(proof.auditBlock, proof.auditTxHash) },
       { label: 'audited', value: badge('true', 'verified', 'proof.audited is true in the AUDITED phase') },
-      { label: 'slashed bond', value: slashedNode(proof) },
+      { label: 'slashed bond', value: slashedNode(proof, money) },
       {
         label: 'rebuilt root = committed root',
         value: rebuilt
@@ -778,18 +779,20 @@ function phase4Section(proof, client) {
 
 /**
  * FR-6.5: the bond slashed when the audit proved a cheat. Rendered with the
- * BigInt-exact money helper — a chip amount is never coerced to a float.
+ * BigInt-exact money helper — a chip amount is never coerced to a float — and
+ * with the hand's own table's decimals, since a free-mode bond is play chips.
  *
  * @param {RngProof} proof
+ * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {HTMLElement}
  */
-function slashedNode(proof) {
+function slashedNode(proof, money) {
   const slashed = typeof proof.slashed === 'string' && /[1-9]/.test(proof.slashed);
   if (!slashed) return badge('none', 'verified', 'no bond was slashed for this hand');
   return h(
     'span',
     null,
-    moneyEl(proof.slashed, { maxFractionDigits: 6 }),
+    money.el(proof.slashed, { maxFractionDigits: 6 }),
     ' ',
     badge('slashed', 'failed', 'the audit proved a cheat, so the operator bond was slashed (FR-6.5)'),
   );
@@ -954,7 +957,7 @@ function renderComparison(proof, server, client, serverError) {
     'div',
     { class: 'proof-subblock' },
     h('h3', { class: 'subblock-title', text: 'Independent recomputations' }),
-    h('div', { class: 'table-wrap' }, table),
+    h('div', { class: 'table-wrap', tabindex: '0' }, table),
     live
       ? h('p', {
           class: 'note',
@@ -1049,7 +1052,7 @@ function checksTable(title, verification, phase) {
       'div',
       { class: 'check-group' },
       h('h4', { class: 'check-title' }, title, ' ', h('span', { class: 'muted', text: '(no data)' })),
-      h('div', { class: 'table-wrap' }, table),
+      h('div', { class: 'table-wrap', tabindex: '0' }, table),
     );
   }
 
@@ -1090,7 +1093,7 @@ function checksTable(title, verification, phase) {
           ? badge('all passed', 'verified')
           : badge('expected while live', 'pending', 'the only failing checks are audit-gated'),
     ),
-    h('div', { class: 'table-wrap' }, table),
+    h('div', { class: 'table-wrap', tabindex: '0' }, table),
   );
 }
 
