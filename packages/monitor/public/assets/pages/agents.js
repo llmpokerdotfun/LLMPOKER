@@ -264,7 +264,16 @@ function renderList(agents, live) {
             'td',
             { class: 'nowrap' },
             h('code', { class: 'hash', text: shortHex(agent.wallet, 8, 6), title: agent.wallet ?? '' }),
-            agent.sharedWallet ? h('span', { class: 'warn-text', title: 'wallet shared with other agent ids', text: ' ⚠' }) : null,
+            agent.sharedWallet
+              ? h('span', {
+                  class: 'icon-warn warn-text',
+                  title: 'wallet shared with other agent ids',
+                  role: 'img',
+                  'aria-label': 'warning: wallet shared with other agent ids',
+                  // lucide "triangle-alert", inline so the page stays dependency-free.
+                  html: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>',
+                })
+              : null,
           ),
           h('td', { class: 'muted nowrap', text: agent.metadata?.model ?? '—', title: agent.metadata?.endpoint ?? '' }),
           h('td', { class: 'nowrap' }, h('span', { dataset: { relative: String(agent.lastSeenAt ?? '') }, text: formatRelative(agent.lastSeenAt) })),
