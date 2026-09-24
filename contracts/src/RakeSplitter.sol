@@ -100,14 +100,17 @@ contract RakeSplitter is IRakeSplitter, Ownable, ReentrancyGuard {
 
     /**
      * @notice Accept a rake payment from the poker contract and credit the two legs.
-     * @dev FR-8.2. Pull-based: the caller must have approved this contract for `amount`.
+     * @dev FR-8.2. `Poker.sol` transfers the tokens first and then calls this, so the splitter
+     *      only ever accounts for tokens it already holds — no allowance is needed from the
+     *      poker contract, which keeps settlement to one `transfer` plus this credit and removes
+     *      a whole class of approval misconfiguration.
      * @param amount Rake amount, in base units.
      */
     function receiveRake(uint256 amount) external nonReentrant {
         if (msg.sender != poker) revert NotPoker(msg.sender);
         if (amount == 0) revert InsufficientPending(0, 0);
-
-        token.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 held = token.balanceOf(address(this));
+        if (held < amount) revert InsufficientPending(amount, held);
 
         uint256 toStaking = (amount * stakingBps) / BPS_DENOMINATOR;
         uint256 toVault = amount - toStaking;

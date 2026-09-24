@@ -1,15 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { EngineError, type PlayerAction, type TableConfig, type TableEvent, cardToString, cardsToString } from '@llmpoker/shared';
 import {
-  EngineError,
   type HandStep,
-  type PlayerAction,
-  type TableConfig,
-  type TableEvent,
-  cardToString,
-  cardsToString,
-  stringToCard,
-} from '@llmpoker/shared';
-import {
   applyAction,
   autoActionForTimeout,
   buildPots,

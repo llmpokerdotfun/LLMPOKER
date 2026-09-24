@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { EngineError, type HandResult } from '@llmpoker/shared';
-import { applyAction, createHand, legalActions, replayHand, totalPot } from '../src/hand.js';
+import { EngineError, type HandResult, type PlayerAction } from '@llmpoker/shared';
+import { type HandStep, applyAction, createHand, legalActions, replayHand, totalPot } from '../src/hand.js';
 import { Lcg, deckFor, stripTimes, testConfig, wagerConfig } from './helpers.js';
-import type { HandStep, PlayerAction } from '@llmpoker/shared';
 
 /**
  * Property/fuzz suite (NFR-5). Every hand is generated from a seeded LCG, so a

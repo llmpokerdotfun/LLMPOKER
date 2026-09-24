@@ -6,7 +6,6 @@ import {
   ACTION_ENUM,
   EIP712_DOMAIN_TYPE,
   actionFromEnum,
-  actionToEnum,
   agentActionDigest,
   bytesToHex,
   commitmentFor,

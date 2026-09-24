@@ -45,7 +45,7 @@ describe('card encoding', () => {
       expect(() => stringToCard(bad)).toThrow(/invalid card/);
     }
     expect(() => makeCard(13, 0)).toThrow(/rank out of range/);
-    expect(() => makeCard(0, 4)).toThrow(/suit out of range/);
+    expect(() => makeCard(0, 4 as never)).toThrow(/suit out of range/);
     expect(isCard(-1)).toBe(false);
     expect(isCard(52)).toBe(false);
     expect(isCard(1.5)).toBe(false);

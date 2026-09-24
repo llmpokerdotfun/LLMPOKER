@@ -15,15 +15,22 @@ describe('RakeSplitter (FR-8.2, FR-9)', () => {
   let stack: PokerStack;
   let splitter: any;
 
-  /** Impersonate the poker contract so a test can push rake through the authorized path. */
+  /**
+   * Impersonate the poker contract: `RakeSplitter.receiveRake` is restricted to it, and the flow
+   * is "transfer the rake, then credit it" — exactly what `Poker.settleHand` does.
+   */
   async function impersonatePoker(): Promise<any> {
     await impersonateAccount(stack.pokerAddress);
-    // An impersonated account pays its own gas, so it needs a balance.
+    // An impersonated account pays its own gas and must be able to transfer the rake it credits.
     await setBalance(stack.pokerAddress, ethers.parseEther('10'));
-    const signer = await hre.ethers.getSigner(stack.pokerAddress);
-    // And `receiveRake` is pull-based, so it needs an allowance.
-    await stack.token.connect(signer).approve(stack.splitterAddress, ethers.MaxUint256);
-    return signer;
+    await stack.token.connect(stack.owner).transfer(stack.pokerAddress, ethers.parseEther('10000'));
+    return hre.ethers.getSigner(stack.pokerAddress);
+  }
+
+  /** Move rake to the splitter and then credit it, exactly as `Poker.settleHand` does. */
+  async function pushRake(pokerSigner: any, amount: bigint): Promise<any> {
+    await stack.token.connect(pokerSigner).transfer(stack.splitterAddress, amount);
+    return splitter.connect(pokerSigner).receiveRake(amount);
   }
 
   before(async () => {
@@ -56,11 +63,10 @@ describe('RakeSplitter (FR-8.2, FR-9)', () => {
   it('credits both legs and reports cumulative totals (FR-9.6)', async () => {
     // Only `poker` may push rake, so fund it and impersonate it; the real end-to-end path is
     // exercised in `Poker.test.ts`.
-    await stack.token.connect(stack.owner).transfer(stack.pokerAddress, ethers.parseEther('2000'));
     const pokerSigner = await impersonatePoker();
 
     const amount = ethers.parseEther('100');
-    await expect(splitter.connect(pokerSigner).receiveRake(amount))
+    await expect(pushRake(pokerSigner, amount))
       .to.emit(splitter, 'RakeDistributed')
       .withArgs(stack.pokerAddress, amount, amount / 2n, amount / 2n, amount);
 
@@ -78,9 +84,8 @@ describe('RakeSplitter (FR-8.2, FR-9)', () => {
   });
 
   it('sweeps the staking leg into the pool and notifies it (FR-9.4, FR-9.6)', async () => {
-    await stack.token.connect(stack.owner).transfer(stack.pokerAddress, ethers.parseEther('2000'));
     const pokerSigner = await impersonatePoker();
-    await splitter.connect(pokerSigner).receiveRake(ethers.parseEther('100'));
+    await pushRake(pokerSigner, ethers.parseEther('100'));
 
     await stack.staking.connect(stack.players[0]).stake(ethers.parseEther('1000'));
 
@@ -97,9 +102,8 @@ describe('RakeSplitter (FR-8.2, FR-9)', () => {
   });
 
   it('sweeps the vault leg into the vault (FR-9.3)', async () => {
-    await stack.token.connect(stack.owner).transfer(stack.pokerAddress, ethers.parseEther('2000'));
     const pokerSigner = await impersonatePoker();
-    await splitter.connect(pokerSigner).receiveRake(ethers.parseEther('100'));
+    await pushRake(pokerSigner, ethers.parseEther('100'));
 
     await expect(splitter.connect(stack.players[1]).sweepVault(ethers.parseEther('50')))
       .to.emit(splitter, 'Swept')
@@ -109,9 +113,8 @@ describe('RakeSplitter (FR-8.2, FR-9)', () => {
   });
 
   it('sweeps both legs at once and never over-sweeps', async () => {
-    await stack.token.connect(stack.owner).transfer(stack.pokerAddress, ethers.parseEther('2000'));
     const pokerSigner = await impersonatePoker();
-    await splitter.connect(pokerSigner).receiveRake(ethers.parseEther('100'));
+    await pushRake(pokerSigner, ethers.parseEther('100'));
 
     await expect(splitter.connect(stack.players[1]).sweepAll()).to.emit(splitter, 'Swept');
     expect(await splitter.totalAssets()).to.equal(0n);
@@ -127,23 +130,21 @@ describe('RakeSplitter (FR-8.2, FR-9)', () => {
   });
 
   it('routes an odd rake with the remainder to the vault (no stranded wei)', async () => {
-    await stack.token.connect(stack.owner).transfer(stack.pokerAddress, 2000n);
     const pokerSigner = await impersonatePoker();
-    await splitter.connect(pokerSigner).receiveRake(101n);
+    await pushRake(pokerSigner, 101n);
     expect(await splitter.pendingStaking()).to.equal(50n);
     expect(await splitter.pendingVault()).to.equal(51n);
     expect(await splitter.totalAssets()).to.equal(101n);
   });
 
   it('applies a retuned split to future rake only (FR-9.7)', async () => {
-    await stack.token.connect(stack.owner).transfer(stack.pokerAddress, ethers.parseEther('4000'));
     const pokerSigner = await impersonatePoker();
 
-    await splitter.connect(pokerSigner).receiveRake(ethers.parseEther('100'));
+    await pushRake(pokerSigner, ethers.parseEther('100'));
     await expect(splitter.connect(stack.owner).setStakingBps(2_500n))
       .to.emit(splitter, 'SplitUpdated')
       .withArgs(5_000n, 2_500n);
-    await splitter.connect(pokerSigner).receiveRake(ethers.parseEther('100'));
+    await pushRake(pokerSigner, ethers.parseEther('100'));
 
     expect(await splitter.pendingStaking()).to.equal(ethers.parseEther('75')); // 50 + 25
     expect(await splitter.pendingVault()).to.equal(ethers.parseEther('125')); // 50 + 75
@@ -151,16 +152,15 @@ describe('RakeSplitter (FR-8.2, FR-9)', () => {
   });
 
   it('allows a full 100 % staking or 100 % vault split', async () => {
-    await stack.token.connect(stack.owner).transfer(stack.pokerAddress, ethers.parseEther('200'));
     const pokerSigner = await impersonatePoker();
 
     await splitter.connect(stack.owner).setStakingBps(10_000n);
-    await splitter.connect(pokerSigner).receiveRake(ethers.parseEther('10'));
+    await pushRake(pokerSigner, ethers.parseEther('10'));
     expect(await splitter.pendingStaking()).to.equal(ethers.parseEther('10'));
     expect(await splitter.pendingVault()).to.equal(0n);
 
     await splitter.connect(stack.owner).setStakingBps(0n);
-    await splitter.connect(pokerSigner).receiveRake(ethers.parseEther('10'));
+    await pushRake(pokerSigner, ethers.parseEther('10'));
     expect(await splitter.pendingStaking()).to.equal(ethers.parseEther('10'));
     expect(await splitter.pendingVault()).to.equal(ethers.parseEther('10'));
   });

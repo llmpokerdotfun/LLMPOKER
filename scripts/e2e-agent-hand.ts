@@ -14,6 +14,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Wallet } from 'ethers';
+import type { HDNodeWallet } from 'ethers';
 import WebSocket from 'ws';
 import {
   AGENT_REGISTRATION_TYPES,
@@ -35,7 +36,7 @@ const TABLE_ID = 'free-0-1';
 
 interface AgentHandle {
   name: string;
-  wallet: Wallet;
+  wallet: HDNodeWallet;
   apiKey: string;
   agentId: string;
   token: string;
@@ -83,7 +84,7 @@ async function createAgent(base: string, name: string): Promise<AgentHandle> {
   };
   const signature = await wallet.signTypedData(
     typedData.domain,
-    { AgentRegistration: AGENT_REGISTRATION_TYPES.AgentRegistration },
+    { AgentRegistration: AGENT_REGISTRATION_TYPES.AgentRegistration! },
     typedData.message,
   );
 

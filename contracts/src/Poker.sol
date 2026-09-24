@@ -331,7 +331,11 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
      * @param handId Commitment key produced by `Shuffle.commit`.
      * @param seats Seated players participating, in dealing order.
      */
-    function openHand(bytes32 tableId, bytes32 handId, uint8[] calldata seats) external onlyOperator {
+    function openHand(bytes32 tableId, bytes32 handId, uint8[] calldata seats)
+        external
+        onlyOperator
+        whenNotPaused
+    {
         Table storage table = _tables[tableId];
         if (!table.exists) revert UnknownTable(tableId);
         if (handId == bytes32(0)) revert ZeroAddress();
@@ -365,9 +369,12 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @notice Record the chips one seat moved into the current pot.
-     * @dev FR-5.2. Contributions are bounded by escrow at settlement time, so a seat can never
-     *      promise more than it holds.
+     * @notice Record the chips one seat moved into the current pot and move them out of escrow.
+     * @dev FR-5.2, FR-5.3. The chips are debited from the seat's escrow **here**, not at
+     *      settlement, so the pot is collateralised from the moment the engine declares it and
+     *      the contract's aggregate balance is the source of truth at every instant. A seat can
+     *      therefore never promise chips it does not hold, and a voided hand simply credits the
+     *      recorded contributions back (FR-5.6).
      * @param tableId Table identifier.
      * @param handId Open hand.
      * @param seat Contributing seat.
@@ -381,12 +388,17 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         Hand storage hand = _hands[tableId][handId];
         if (hand.status != HandStatus.Open) revert HandNotOpen(handId, hand.status);
         if (amount == 0) revert ContributionMismatch(0, 0);
-        if (pendingHandOf[_seatKey(tableId, seat)] != handId) revert NoPosition(tableId, seatOwner[_seatKey(tableId, seat)]);
+        bytes32 key = _seatKey(tableId, seat);
+        if (pendingHandOf[key] != handId) revert NoPosition(tableId, seatOwner[key]);
 
-        _hands[tableId][handId].pot += amount;
+        uint256 balance = escrowOf[key];
+        if (amount > balance) revert ContributionExceedsEscrow(seat, amount, balance);
+        escrowOf[key] = balance - amount;
+
+        hand.pot += amount;
         contributionOf[tableId][handId][seat] += amount;
 
-        emit HandCommitted(tableId, handId, seat, amount, _hands[tableId][handId].pot);
+        emit HandCommitted(tableId, handId, seat, amount, hand.pot);
     }
 
     /**
@@ -448,8 +460,10 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         hand.status = HandStatus.Settled;
         table.pendingHands -= 1;
 
-        // (4) Debts first, credits second: no award can be paid out of another seat's escrow.
-        _applySettlement(tableId, hand, contributions, winners, awards, table.config.maxSeats);
+        // (4) Credit the winners. The contributors' chips were already moved out of escrow by
+        // `commitHand`, so `creditSum == pot - rake <= balance` holds by construction and no
+        // award can ever be paid out of another seat's escrow.
+        _applySettlement(tableId, winners, awards, table.config.maxSeats);
 
         // (5) Rake leaves escrow atomically into the splitter (FR-8.2).
         if (rake != 0) {
@@ -635,9 +649,9 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
 
     /**
      * @dev FR-5.2: every non-zero entry of `contributions` must match a seat that actually
-     *      committed chips, must be affordable from that seat's escrow, and the entries must sum
-     *      to the recorded pot. Split out of `settleHand` to keep the settlement frame within
-     *      the EVM stack limit for 6 seats (NFR-3).
+     *      committed chips and the entries must sum to the recorded pot. Split out of
+     *      `settleHand` to keep the settlement frame inside the EVM stack limit for 6 seats
+     *      (NFR-3).
      */
     function _verifyContributions(
         bytes32 tableId,
@@ -654,27 +668,22 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
             uint8 seat = hand.participants[i];
             uint256 recorded = contributionOf[tableId][handId][seat];
             if (recorded != amount) revert ContributionMismatch(recorded, amount);
-            uint256 balance = escrowOf[_seatKey(tableId, seat)];
-            if (amount > balance) revert ContributionExceedsEscrow(seat, amount, balance);
             summed += amount;
         }
         if (summed != pot) revert ContributionMismatch(pot, summed);
     }
 
-    /// @dev FR-5.2: move the committed chips out of escrow, then credit the winners.
+    /**
+     * @dev FR-5.2: credit the winners. The losers' chips were already debited from escrow in
+     *      `commitHand`, so this loop only ever creates credits that are fully collateralised by
+     *      the chips this contract is holding.
+     */
     function _applySettlement(
         bytes32 tableId,
-        Hand storage hand,
-        uint256[] calldata contributions,
         uint8[] calldata winners,
         uint256[] calldata awards,
         uint8 maxSeats
     ) private {
-        for (uint256 i = 0; i < contributions.length; ++i) {
-            uint256 amount = contributions[i];
-            if (amount == 0) continue;
-            escrowOf[_seatKey(tableId, hand.participants[i])] -= amount;
-        }
         for (uint256 i = 0; i < winners.length; ++i) {
             uint8 seat = winners[i];
             if (seat >= maxSeats) revert InvalidSeat(seat, maxSeats);

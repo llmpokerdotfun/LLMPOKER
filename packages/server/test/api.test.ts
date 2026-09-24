@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Wallet } from 'ethers';
+import type { HDNodeWallet } from 'ethers';
 import type { FastifyInstance } from 'fastify';
 import {
   AGENT_REGISTRATION_TYPES,
@@ -77,7 +78,7 @@ async function buildHarness(env: NodeJS.ProcessEnv = {}): Promise<Harness> {
   };
 }
 
-async function registerAgent(name: string): Promise<{ agentId: string; apiKey: string; wallet: Wallet }> {
+async function registerAgent(name: string): Promise<{ agentId: string; apiKey: string; wallet: HDNodeWallet }> {
   const wallet = Wallet.createRandom();
   const response = await harness.app.inject({
     method: 'POST',
@@ -96,13 +97,30 @@ async function seatAgent(agentId: string, apiKey: string, tableId: string, buyIn
     headers: { authorization: `Bearer ${apiKey}` },
     payload: { buyIn },
   });
-  expect(response.statusCode).toBe(201);
+  expect(response.statusCode, response.body).toBe(201);
+  const body = response.json() as { seat: number; table: TableSnapshot };
+  const seated = body.table.seats.find((s) => s.seat === body.seat);
+  expect(seated?.agentId).toBe(agentId);
+  expect(seated?.stack).toBe(buyIn);
 }
 
 function tableSnapshot(tableId: string): Promise<TableSnapshot> {
   return harness.app
     .inject({ method: 'GET', url: `/api/v1/tables/${tableId}` })
     .then((r) => r.json() as TableSnapshot);
+}
+
+/**
+ * Seating gives newcomers a grace period (`handIntervalMs`) before the next hand
+ * starts, so a hand is only dealt once the clock has moved past it.
+ */
+async function startHand(tableId: string): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    await harness.orchestrator.tick(harness.advance(4_000));
+    const hand = harness.orchestrator.getTable(tableId).state.hand;
+    if (hand && !hand.complete) return;
+  }
+  throw new Error(`no hand started at ${tableId}`);
 }
 
 /**
@@ -213,6 +231,62 @@ describe('LLM Poker Arena server', () => {
       const escape = await harness.app.inject({ method: 'GET', url: '/assets/../../package.json' });
       expect([400, 404]).toContain(escape.statusCode);
     });
+
+    it('resolves every module the monitor imports, including the browser proof bundle', async () => {
+      const { readdirSync } = await import('node:fs');
+      const monitorRoot = join(process.cwd(), 'packages/monitor/public');
+
+      // Every asset the site ships must actually be reachable over HTTP.
+      const walk = (dir: string, prefix: string): string[] =>
+        readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+          const relative = `${prefix}${entry.name}`;
+          return entry.isDirectory() ? walk(join(dir, entry.name), `${relative}/`) : [relative];
+        });
+      const assets = walk(join(monitorRoot, 'assets'), '');
+      expect(assets.length).toBeGreaterThan(8);
+      for (const asset of assets) {
+        const response = await harness.app.inject({ method: 'GET', url: `/assets/${asset}` });
+        expect(response.statusCode, asset).toBe(200);
+      }
+
+      // The browser recomputes proofs with the *built* shared package served as
+      // ES modules, so the whole import graph must be fetchable: one missing file
+      // would silently break in-page verification.
+      const seen = new Set<string>();
+      const queue = ['index.js'];
+      let imports = 0;
+      while (queue.length > 0) {
+        const file = queue.shift()!;
+        if (seen.has(file)) continue;
+        seen.add(file);
+        const response = await harness.app.inject({ method: 'GET', url: `/vendor/shared/${file}` });
+        expect(response.statusCode, `vendor/shared/${file}`).toBe(200);
+        for (const match of response.body.matchAll(/from\s+'\.\/([A-Za-z0-9_.-]+\.js)'/g)) {
+          imports += 1;
+          queue.push(match[1]!);
+        }
+      }
+      expect(imports).toBeGreaterThan(10);
+      for (const required of ['proof.js', 'rng.js', 'keccak.js', 'cards.js', 'eip712.js']) {
+        expect(seen.has(required), required).toBe(true);
+      }
+    });
+
+    it('renders each monitor page and ships the shared chrome that links the contract', async () => {
+      for (const path of ['/', '/agents', '/tables', '/hands']) {
+        const response = await harness.app.inject({ method: 'GET', url: path });
+        expect(response.statusCode, path).toBe(200);
+        expect(response.body, path).toContain('/assets/app.css');
+        expect(response.body, path).toContain('id="site-header"');
+      }
+      // The nav/footer (including the /llm.txt link) is rendered by the shared
+      // chrome module, so check it there.
+      const ui = await harness.app.inject({ method: 'GET', url: '/assets/ui.js' });
+      expect(ui.statusCode).toBe(200);
+      for (const link of ['/agents', '/tables', '/hands', '/llm.txt']) {
+        expect(ui.body, link).toContain(link);
+      }
+    });
   });
 
   describe('registration and auth (FR-1)', () => {
@@ -275,7 +349,7 @@ describe('LLM Poker Arena server', () => {
       };
       const signature = await wallet.signTypedData(
         typedData.domain,
-        { AgentRegistration: AGENT_REGISTRATION_TYPES.AgentRegistration },
+        { AgentRegistration: AGENT_REGISTRATION_TYPES.AgentRegistration! },
         typedData.message,
       );
 
@@ -305,7 +379,7 @@ describe('LLM Poker Arena server', () => {
       const attacker = Wallet.createRandom();
       const forged = await attacker.signTypedData(
         typedData.domain,
-        { AgentRegistration: AGENT_REGISTRATION_TYPES.AgentRegistration },
+        { AgentRegistration: AGENT_REGISTRATION_TYPES.AgentRegistration! },
         typedData.message,
       );
       const rejected = await harness.app.inject({
@@ -377,12 +451,8 @@ describe('LLM Poker Arena server', () => {
 
       // Start the hand deterministically: the orchestrator runs the FR-6
       // commit → anchor → reveal sequence before dealing.
-      await harness.orchestrator.tick(harness.advance(1));
-      let table = await tableSnapshot(tableId);
-      for (let i = 0; i < 20 && table.handId === null; i++) {
-        await harness.orchestrator.tick(harness.advance(1));
-        table = await tableSnapshot(tableId);
-      }
+      await startHand(tableId);
+      const table = await tableSnapshot(tableId);
       expect(table.handId).not.toBeNull();
       expect(table.rngCommitment).toMatch(/^0x[0-9a-f]{64}$/);
       expect(table.street).toBe('PREFLOP');
@@ -494,8 +564,7 @@ describe('LLM Poker Arena server', () => {
       expect(bogus.statusCode).toBe(400);
       expect((bogus.json() as { error: { code: string } }).error.code).toBe('INVALID_ACTION');
 
-      await harness.orchestrator.tick(harness.advance(1));
-      await harness.orchestrator.tick(harness.advance(1));
+      await startHand('free-0-1');
       const table = await tableSnapshot('free-0-1');
       const waitingSeat = table.seats.find((s) => s.seat !== table.toActSeat && s.agentId !== null)!;
       const apiKey = waitingSeat.agentId === a.agentId ? a.apiKey : b.apiKey;
@@ -515,8 +584,7 @@ describe('LLM Poker Arena server', () => {
       await seatAgent(a.agentId, a.apiKey, 'free-0-1', '200');
       await seatAgent(b.agentId, b.apiKey, 'free-0-1', '200');
 
-      await harness.orchestrator.tick(harness.advance(1));
-      await harness.orchestrator.tick(harness.advance(1));
+      await startHand('free-0-1');
       const before = await tableSnapshot('free-0-1');
       expect(before.actionDeadlineTs).not.toBeNull();
 
@@ -606,8 +674,7 @@ describe('LLM Poker Arena server', () => {
       const b = await registerAgent('Muse');
       await seatAgent(a.agentId, a.apiKey, 'free-0-1', '200');
       await seatAgent(b.agentId, b.apiKey, 'free-0-1', '200');
-      await harness.orchestrator.tick(harness.advance(1));
-      await harness.orchestrator.tick(harness.advance(1));
+      await startHand('free-0-1');
 
       const live = await tableSnapshot('free-0-1');
       expect(live.seats.every((s) => s.holeCards === null)).toBe(true);
@@ -668,9 +735,7 @@ describe('LLM Poker Arena server', () => {
       expect(seated.mode).toBe('WAGER');
       expect(seated.seats.filter((s) => s.agentId !== null)).toHaveLength(2);
 
-      await harness.orchestrator.tick(harness.advance(1));
-      await harness.orchestrator.tick(harness.advance(1));
-      await harness.orchestrator.tick(harness.advance(1));
+      await startHand(tableId);
       const live = await tableSnapshot(tableId);
       expect(live.handId).not.toBeNull();
 
@@ -798,8 +863,7 @@ describe('LLM Poker Arena server', () => {
       const b = await registerAgent('Muse');
       await seatAgent(a.agentId, a.apiKey, 'free-0-1', '200');
       await seatAgent(b.agentId, b.apiKey, 'free-0-1', '200');
-      await harness.orchestrator.tick(harness.advance(1));
-      await harness.orchestrator.tick(harness.advance(1));
+      await startHand('free-0-1');
 
       await playOutTable(
         'free-0-1',
