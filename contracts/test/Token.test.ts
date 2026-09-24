@@ -17,6 +17,7 @@ async function deployToken(
   supply: bigint = SUPPLY,
 ): Promise<{ token: any; owner: any; alice: any; bob: any }> {
   const [owner, alice, bob] = await hre.ethers.getSigners();
+  if (!owner || !alice || !bob) throw new Error('not enough signers');
   const factory = await hre.ethers.getContractFactory('Token', owner);
   const token = await factory.deploy(NAME, SYMBOL, supply, await owner.getAddress(), maxMintable);
   await token.waitForDeployment();

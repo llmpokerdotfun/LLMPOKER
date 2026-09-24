@@ -45,6 +45,7 @@ describe('Shuffle — RNG vector conformance (FR-6.3, docs/RNG.md §3)', () => {
 
   before(async () => {
     const [owner] = await hre.ethers.getSigners();
+    if (!owner) throw new Error('no signer');
     const factory = await hre.ethers.getContractFactory('Shuffle', owner);
     shuffle = await factory.deploy(await owner.getAddress(), 12n);
     await shuffle.waitForDeployment();

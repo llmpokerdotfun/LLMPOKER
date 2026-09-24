@@ -139,12 +139,12 @@ async function main(): Promise<void> {
   const splitterContract = splitter as ethers.Contract;
   const stakingContract = staking as ethers.Contract;
   const shuffleContract = shuffle as ethers.Contract;
-  const rewrewardsNotifierRole = (await stakingContract.REWARDS_NOTIFIER_ROLE!()) as string;
+  const rewardsNotifierRole = (await stakingContract.REWARDS_NOTIFIER_ROLE!()) as string;
   const operatorRole = (await shuffleContract.OPERATOR_ROLE!()) as string;
 
   const wire: Array<[string, Promise<ethers.ContractTransactionResponse>]> = [
     ['splitter.setPoker(poker)', splitterContract.setPoker!(pokerAddress)],
-    ['staking.grantRole(REWARDS_NOTIFIER_ROLE, splitter)', stakingContract.grantRole!(rewrewardsNotifierRole, splitterAddress)],
+    ['staking.grantRole(REWARDS_NOTIFIER_ROLE, splitter)', stakingContract.grantRole!(rewardsNotifierRole, splitterAddress)],
     ['shuffle.grantRole(OPERATOR_ROLE, operator)', shuffleContract.grantRole!(operatorRole, operator)],
   ];
   for (const [label, pending] of wire) {

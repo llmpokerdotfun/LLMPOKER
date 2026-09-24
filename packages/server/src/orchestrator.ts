@@ -219,8 +219,18 @@ export class Orchestrator extends EventEmitter {
       const anchorBlock = commitRef.block + 1;
       const confirmations =
         mode === 'WAGER' ? this.config.wagerAnchorConfirmations : this.config.freeAnchorConfirmations;
+      // FR-6.2 / FR-5.6: read the anchor hash once it exists, then re-read it after
+      // the finality threshold. If the two disagree the anchor block was reorged,
+      // so the hand is voided before a single card is dealt instead of settling
+      // against an entropy that no longer exists on-chain (NFR-6).
+      const anchorHashAtCommit = await this.waitForAnchorHash(anchorBlock);
       await this.waitForFinal(anchorBlock, confirmations);
       const anchorBlockHash = await this.anchor.blockHash(anchorBlock);
+      if (anchorBlockHash !== anchorHashAtCommit) {
+        this.log('error', `anchor block ${anchorBlock} was reorged for ${handId}: hand voided (FR-5.6)`);
+        table.nextHandAt = now + table.state.config.handIntervalMs;
+        return;
+      }
       const revealRef = await this.anchor.submitReveal(handId, seed);
 
       const entropy = entropyHex(seed, anchorBlockHash);
@@ -271,6 +281,17 @@ export class Orchestrator extends EventEmitter {
       this.emit('error', error as Error, `startHand:${table.state.config.id}`);
     } finally {
       table.busy = false;
+    }
+  }
+
+  /** Blocks until the anchor block exists, then returns its hash (FR-6.2). */
+  private async waitForAnchorHash(anchorBlock: number): Promise<string> {
+    const deadline = this.now() + 30_000;
+    for (;;) {
+      if ((await this.anchor.currentBlock()) >= anchorBlock) return this.anchor.blockHash(anchorBlock);
+      if (this.now() > deadline) throw new Error(`timed out waiting for anchor block ${anchorBlock}`);
+      if (this.anchor instanceof LocalChain) this.anchor.produceBlock(1);
+      else await sleep(Math.min(500, Math.max(50, this.config.blockTimeMs)));
     }
   }
 

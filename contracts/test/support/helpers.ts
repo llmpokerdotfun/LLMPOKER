@@ -141,9 +141,20 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
 
   // Wiring: the splitter may only be pushed by Poker (FR-8.2), and the staking pool only
   // accrues when the splitter says so (FR-9.6).
-  await splitter.connect(owner).setPoker(await poker.getAddress());
-  await staking.connect(owner).grantRole(await staking.REWARDS_NOTIFIER_ROLE(), await splitter.getAddress());
-  await shuffle.connect(owner).grantRole(await shuffle.OPERATOR_ROLE(), await operator.getAddress());
+  //
+  // `getContractFactory().deploy()` is typed as `BaseContract`, which does not expose the
+  // generated `Contract` index signature, so the wiring calls go through `ethers.Contract`
+  // views. The `any` typed handles returned by this fixture keep the test files untyped.
+  const splitterContract = splitter as ethers.Contract;
+  const stakingContract = staking as ethers.Contract;
+  const shuffleContract = shuffle as ethers.Contract;
+  const tokenContract = token as ethers.Contract;
+  await splitterContract.setPoker!(await poker.getAddress());
+  await stakingContract.grantRole!(
+    (await stakingContract.REWARDS_NOTIFIER_ROLE!()) as string,
+    await splitter.getAddress(),
+  );
+  await shuffleContract.grantRole!((await shuffleContract.OPERATOR_ROLE!()) as string, await operator.getAddress());
 
   // Fund the players and let Poker/Staking/Vault pull.
   const spenders = [
@@ -154,9 +165,9 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   ];
   for (const player of players) {
     const address = await player.getAddress();
-    await token.connect(owner).transfer(address, ethers.parseEther('2000'));
+    await (tokenContract.connect(owner) as ethers.Contract).transfer!(address, ethers.parseEther('2000'));
     for (const spender of spenders) {
-      await token.connect(player).approve(spender, ethers.MaxUint256);
+      await (tokenContract.connect(player) as ethers.Contract).approve!(spender, ethers.MaxUint256);
     }
   }
 

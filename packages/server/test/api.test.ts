@@ -13,7 +13,7 @@ import {
   cardToString,
 } from '@llmpoker/shared';
 import { verifyHandHistory } from '@llmpoker/verifier';
-import { LocalChain, LocalEscrow } from '../src/chain.js';
+import { LocalChain, LocalEscrow, type AnchorProvider } from '../src/chain.js';
 import { loadConfig } from '../src/config.js';
 import { buildApp } from '../src/app.js';
 import { Orchestrator } from '../src/orchestrator.js';
@@ -991,6 +991,59 @@ describe('LLM Poker Arena server', () => {
         void agent;
       } finally {
         await withOperator.close();
+      }
+    });
+  });
+
+  describe('reorg safety (FR-5.6, NFR-6)', () => {
+    it('voids a hand when the anchor block hash changes before the reveal', async () => {
+      const reorging = await buildHarness();
+      // Replace the anchor with one whose anchor-block hash mutates between the
+      // first read and the post-finality re-read — that is a reorg.
+      const original = reorging.orchestrator.anchor as LocalChain;
+      let hashReads = 0;
+      const flaky: AnchorProvider = {
+        kind: 'LOCAL',
+        currentBlock: () => original.currentBlock(),
+        blockHash: async (block: number) => {
+          hashReads += 1;
+          const real = await original.blockHash(block);
+          return hashReads >= 2 ? `0x${'ab'.repeat(32)}` : real;
+        },
+        submitCommitment: (handId, commitment) => original.submitCommitment(handId, commitment),
+        submitReveal: (handId, seed) => original.submitReveal(handId, seed),
+        isFinal: (block, confirmations) => original.isFinal(block, confirmations),
+        close: () => original.close(),
+      };
+      const orchestrator = new Orchestrator({
+        config: reorging.orchestrator.config,
+        store: reorging.store,
+        anchor: flaky,
+        settlement: reorging.settlement,
+        now: () => reorging.now(),
+      });
+      orchestrator.init();
+      try {
+        const a = await createAgentOn(reorging, 'Reorg A');
+        const b = await createAgentOn(reorging, 'Reorg B');
+        for (const agent of [a, b]) {
+          const response = await reorging.app.inject({
+            method: 'POST',
+            url: '/api/v1/tables/free-0-1/seat',
+            headers: { authorization: `Bearer ${agent.apiKey}` },
+            payload: { buyIn: '200' },
+          });
+          expect(response.statusCode, response.body).toBe(201);
+        }
+
+        for (let i = 0; i < 5; i++) await orchestrator.tick(reorging.advance(4_000));
+        const table = orchestrator.getTable('free-0-1');
+        // No hand was dealt, no proof was published, and the table will retry.
+        expect(table.state.hand).toBeNull();
+        expect(table.proofs.size).toBe(0);
+        expect(reorging.store.handCount()).toBe(0);
+      } finally {
+        await orchestrator.stop();
       }
     });
   });

@@ -113,7 +113,7 @@ describe('Shuffle — commit / reveal lifecycle (FR-6)', () => {
     // `docs/RNG.md` §5 step 2: the anchor is the public hash of block commitBlock + 1, and the
     // stored value must equal what any verifier recomputes from the chain.
     const anchor = await hre.ethers.provider.getBlock(Number(commitBlock + 1n));
-    const anchorBlockHash = anchor!.hash;
+    const anchorBlockHash = anchor!.hash!;
     expect(await shuffle.anchorBlockHashOf(handId)).to.equal(anchorBlockHash);
     // §5 step 5: entropy is recomputable by the TypeScript implementation.
     expect(await shuffle.entropyOf(handId)).to.equal(entropyFrom(SEED_A, anchorBlockHash));
@@ -280,6 +280,7 @@ describe('Shuffle — commit / reveal lifecycle (FR-6)', () => {
   describe('requiredConfirmations bounds (FR-6.5, FR-9.7)', () => {
     it('rejects out-of-range constructor values', async () => {
       const [owner] = await hre.ethers.getSigners();
+      if (!owner) throw new Error('no signer');
       const factory = await hre.ethers.getContractFactory('Shuffle', owner);
       await expect(factory.deploy(await owner.getAddress(), 0n)).to.be.revertedWithCustomError(
         factory,
