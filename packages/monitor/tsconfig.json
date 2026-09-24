@@ -1,0 +1,20 @@
+{
+  "//": "The monitor is plain browser JavaScript with no build step. This config exists only so `npm run typecheck --workspace @llmpoker/monitor` (and CI) can check the shipped ES modules with checkJs, exactly like the command in the monitor's README-less contract: tsc --allowJs --checkJs.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": [],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["public/assets/**/*.js"]
+}

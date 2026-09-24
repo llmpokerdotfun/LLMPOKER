@@ -661,10 +661,11 @@ function progress(state: HandState, events: TableEvent[], now: number): HandStep
     break;
   }
 
-  return { state, events, actionRequest: buildActionRequest(state) };
+  return { state, events, actionRequest: actionRequestFor(state) };
 }
 
-function buildActionRequest(state: HandState): ActionRequest | null {
+/** The private turn notification for the seat on the clock (FR-3.5, FR-7.x). */
+export function actionRequestFor(state: HandState): ActionRequest | null {
   if (state.toActSeat === null) return null;
   const me = seatState(state, state.toActSeat);
   return {

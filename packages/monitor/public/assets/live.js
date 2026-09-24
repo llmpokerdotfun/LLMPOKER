@@ -253,8 +253,13 @@ function emitNow() {
  * @returns {void}
  */
 function emitHand(summary, result) {
-  state.completedHands.unshift(summary);
-  if (state.completedHands.length > 25) state.completedHands.length = 25;
+  // The same hand can arrive twice (a `MONITOR_EVENT.HAND_COMPLETE` and the
+  // table-scoped `TABLE_EVENT`); keep one row per handId.
+  const duplicate = state.completedHands.some((row) => row.handId === summary.handId);
+  if (!duplicate) {
+    state.completedHands.unshift(summary);
+    if (state.completedHands.length > 25) state.completedHands.length = 25;
+  }
   for (const listener of Array.from(handListeners)) {
     try {
       listener(summary, result);

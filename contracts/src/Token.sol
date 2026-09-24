@@ -67,7 +67,10 @@ contract Token is ERC20, ERC20Permit, Ownable {
      */
     function ownerMint(address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
-        uint256 mintable = maxMintable - totalSupply();
+        uint256 minted = totalSupply();
+        // `minted > maxMintable` cannot happen when the constructor supply respects the cap, but
+        // this guard keeps an over-supplied deployment from underflowing into a bare panic.
+        uint256 mintable = minted >= maxMintable ? 0 : maxMintable - minted;
         if (amount > mintable) revert MintCapExceeded(amount, mintable);
         _mint(to, amount);
         emit Minted(to, amount, totalSupply());

@@ -92,8 +92,8 @@ contract RakeSplitter is IRakeSplitter, Ownable, ReentrancyGuard {
         }
         if (initialOwner == address(0)) revert ZeroAddress();
         if (initialStakingBps > BPS_DENOMINATOR) revert InvalidSplit(initialStakingBps);
-        token = token_;
-        staking = staking_;
+        token = IERC20(token_);
+        staking = IStaking(staking_);
         vault = vault_;
         stakingBps = initialStakingBps;
     }

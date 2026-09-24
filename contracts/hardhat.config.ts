@@ -1,14 +1,19 @@
 import type { HardhatUserConfig } from 'hardhat/config';
-
-// NOTE ON MODULE SYNTAX (Hardhat 2 + ESM package)
-// ---------------------------------------------------------------------------
-// `contracts/package.json` sets `"type": "module"`, and Hardhat 2 loads its
-// config through `require()` (`hardhat/internal/core/config/config-loading.js`).
-// Node 24 strips the types of a `.ts` file on the fly and its `require(esm)`
-// interop returns the module namespace, whose `default` export Hardhat unwraps.
-// So this file is written as ordinary ESM TypeScript with `export default`;
-// `export =` and `module.exports` are both rejected by Node's strip-only loader.
-// ---------------------------------------------------------------------------
+// Hardhat 2 loads its config through `require()`, and `ts-node` transpiles this file with
+// `contracts/tsconfig.json` (`module: commonjs`). That is why `contracts/package.json` does
+// NOT declare `"type": "module"`: with it, ts-node treats every `.ts` file in this package as
+// ESM and Hardhat aborts config loading with
+// "Error HH19: Your project is an ESM project ... but your Hardhat config file uses the .js
+// extension". Nothing else in this workspace depends on that field.
+//
+// The plugin set is imported explicitly instead of pulling in
+// `@nomicfoundation/hardhat-toolbox`: the toolbox's transitive `solidity-coverage` plugin
+// throws at load time in this environment ("TypeError: subtask is not a function") from
+// inside `hardhat/config`'s live re-exports, which aborts config loading and leaves
+// `hre.ethers` undefined. The toolbox only bundles these plugins, so listing the ones this
+// suite uses is equivalent.
+import '@nomicfoundation/hardhat-ethers';
+import '@nomicfoundation/hardhat-chai-matchers';
 
 const RH_RPC_URL = process.env.RH_RPC_URL?.trim();
 const DEPLOYER_PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY?.trim();

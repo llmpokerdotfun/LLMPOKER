@@ -40,6 +40,12 @@ contract Shuffle is IShuffle, AccessControl {
     /// @notice Upper bound for `requiredConfirmations`, keeping `reveal < commitBlock + 256`.
     uint256 public constant MAX_REQUIRED_CONFIRMATIONS = 128;
 
+    /// @dev `2^64`, the width of one draw from the keccak counter-mode stream (`docs/RNG.md` §3).
+    uint256 private constant TWO_64 = 0x10000000000000000;
+
+    /// @dev `2^64 - 1`, used to truncate a stream word to its big-endian `uint64` draw.
+    uint256 private constant UINT64_MASK = 0xFFFFFFFFFFFFFFFF;
+
     /// @notice Blocks that must separate the anchor block and the reveal block (FR-6.5).
     uint256 public requiredConfirmations;
 
@@ -164,7 +170,7 @@ contract Shuffle is IShuffle, AccessControl {
             revert CommitmentMismatch();
         }
 
-        bytes32 entropy = entropyOf(deckSeed, anchorBlockHash);
+        bytes32 entropy = computeEntropy(deckSeed, anchorBlockHash);
         (uint8[52] memory deck,) = _computeDeck(entropy);
 
         record.entropy = entropy;
@@ -241,7 +247,7 @@ contract Shuffle is IShuffle, AccessControl {
      * @notice Canonical `entropy = keccak256(abi.encodePacked(bytes32 deckSeed, bytes32 anchorBlockHash))`.
      * @dev FR-6.1 step 4, `docs/RNG.md` Â§2.
      */
-    function entropyOf(bytes32 deckSeed, bytes32 anchorBlockHash) public pure returns (bytes32) {
+    function computeEntropy(bytes32 deckSeed, bytes32 anchorBlockHash) public pure returns (bytes32) {
         return keccak256(abi.encodePacked(deckSeed, anchorBlockHash));
     }
 
@@ -351,7 +357,9 @@ contract Shuffle is IShuffle, AccessControl {
         // i = 51 down to 1; `i == 0` needs no draw.
         for (uint256 i = 51; i >= 1; --i) {
             uint256 range = i + 1;
-            uint256 limit = (type(uint256).max / range) * range;
+            // Rejection bound for a uniform draw over `[0, 2^64)`: reject anything at or above
+            // the largest multiple of `range` that fits in 64 bits (`docs/RNG.md` §3).
+            uint256 limit = (TWO_64 / range) * range;
 
             uint256 d;
             bool rejected = true;
@@ -363,8 +371,8 @@ contract Shuffle is IShuffle, AccessControl {
                     }
                     drawInWord = 0;
                 }
-                uint256 shift = 192 - (drawInWord * 64);
-                d = uint256(word) >> shift;
+                // Big-endian `uint64` read: the top 64 bits of the stream word.
+                d = (uint256(word) >> (192 - (drawInWord * 64))) & UINT64_MASK;
                 unchecked {
                     ++drawInWord;
                 }

@@ -293,6 +293,11 @@ export interface HandHistory {
   result: HandResult;
   proof: RngProof;
   deck: Card[];
+  /**
+   * Table configuration in force for this hand. Required for a full replay
+   * (blinds, rake rules, burn-cards setting), so a verifier never has to guess.
+   */
+  config: TableConfig | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +323,14 @@ export interface RngProof {
   entropy: string | null;
   /** The stored 52-card ordering, as card ids. */
   deck: Card[];
+  /**
+   * Where the anchor came from. `ONCHAIN` is a public block hash; `LOCAL` is the
+   * simulated anchor used for free-mode play (FR-4.4) and for tests. A proof
+   * always states its own provenance so it can never be passed off as the other.
+   */
+  anchorSource: 'ONCHAIN' | 'LOCAL';
+  /** Confirmations the reveal must have over the anchor (FR-6.5). */
+  requiredConfirmations: number;
   verified: boolean;
   verifiedAt: number | null;
   /** Chain id of the settlement chain (4663 = Robinhood Chain). */

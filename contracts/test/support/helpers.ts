@@ -6,9 +6,10 @@
  * Shuffle → Poker.
  */
 
-import { ethers } from 'hardhat';
+import { ethers } from 'ethers';
+import hre from 'hardhat';
 import type { Signer } from 'ethers';
-import { mineUpTo } from '@nomicfoundation/hardhat-network-helpers';
+import { mineUpTo, takeSnapshot } from '@nomicfoundation/hardhat-network-helpers';
 
 const BPS_DENOMINATOR = 10_000n;
 
@@ -30,20 +31,6 @@ export type TableId = string;
 export type HandId = string;
 export type Address = string;
 
-/** A single committed RNG vector (`packages/shared/vectors/rng-vectors.json`). */
-export interface RngVector {
-  name: string;
-  note?: string;
-  deckSeed: string;
-  nonce: string;
-  commitment: string;
-  anchorBlockHash: string;
-  entropy: string;
-  deck: number[];
-  wordsConsumed: number;
-  drawsConsumed: number;
-}
-
 /** A deployed, fully wired stack plus its signers. */
 export interface PokerStack {
   owner: Signer;
@@ -64,8 +51,6 @@ export interface PokerStack {
   playerAddresses: Address[];
   ownerAddress: Address;
   operatorAddress: Address;
-  /** `keccak256(tableId, seat)` — matches `Poker._seatKey`. */
-  seatKey(tableId: TableId, seat: number): string;
 }
 
 /** The wager-table configuration used across the Poker tests (mirrors the `'low'` tier). */
@@ -98,24 +83,30 @@ export function commitmentFor(deckSeed: string, nonce: bigint | number): string 
 
 /**
  * Deploy the full stack.
- * @param requiredConfirmations Shuffle finality threshold (FR-6.5); the tests use a small value
- *        to keep block mining cheap while still exercising the ordering constraint.
+ * @param requiredConfirmations Shuffle finality threshold (FR-6.5); tests use small values to
+ *        keep block mining cheap while still exercising the ordering constraint.
  */
 export async function deployStack(requiredConfirmations: bigint = 12n): Promise<PokerStack> {
-  const signers = await ethers.getSigners();
+  const signers = await hre.ethers.getSigners();
   const owner = signers[0]!;
   const operator = signers[1]!;
-  const players = signers.slice(2, 12);
+  const players = signers.slice(2, 8);
 
-  const tokenFactory = await ethers.getContractFactory('Token', owner);
-  const token = await tokenFactory.deploy('LLM Poker Arena', 'POKER', ethers.parseEther('1000000'), await owner.getAddress(), 0n);
+  const tokenFactory = await hre.ethers.getContractFactory('Token', owner);
+  const token = await tokenFactory.deploy(
+    'LLM Poker Arena',
+    'POKER',
+    ethers.parseEther('1000000'),
+    await owner.getAddress(),
+    0n,
+  );
   await token.waitForDeployment();
 
-  const vaultFactory = await ethers.getContractFactory('Vault', owner);
+  const vaultFactory = await hre.ethers.getContractFactory('Vault', owner);
   const vault = await vaultFactory.deploy(await token.getAddress(), await owner.getAddress(), 5_000n);
   await vault.waitForDeployment();
 
-  const stakingFactory = await ethers.getContractFactory('Staking', owner);
+  const stakingFactory = await hre.ethers.getContractFactory('Staking', owner);
   const staking = await stakingFactory.deploy(
     await token.getAddress(),
     await owner.getAddress(),
@@ -124,7 +115,7 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   );
   await staking.waitForDeployment();
 
-  const splitterFactory = await ethers.getContractFactory('RakeSplitter', owner);
+  const splitterFactory = await hre.ethers.getContractFactory('RakeSplitter', owner);
   const splitter = await splitterFactory.deploy(
     await token.getAddress(),
     await staking.getAddress(),
@@ -134,11 +125,11 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   );
   await splitter.waitForDeployment();
 
-  const shuffleFactory = await ethers.getContractFactory('Shuffle', owner);
+  const shuffleFactory = await hre.ethers.getContractFactory('Shuffle', owner);
   const shuffle = await shuffleFactory.deploy(await owner.getAddress(), requiredConfirmations);
   await shuffle.waitForDeployment();
 
-  const pokerFactory = await ethers.getContractFactory('Poker', owner);
+  const pokerFactory = await hre.ethers.getContractFactory('Poker', owner);
   const poker = await pokerFactory.deploy(
     await token.getAddress(),
     await shuffle.getAddress(),
@@ -154,13 +145,19 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   await staking.connect(owner).grantRole(await staking.REWARDS_NOTIFIER_ROLE(), await splitter.getAddress());
   await shuffle.connect(owner).grantRole(await shuffle.OPERATOR_ROLE(), await operator.getAddress());
 
-  // Fund the players and let Poker pull escrow.
+  // Fund the players and let Poker/Staking/Vault pull.
+  const spenders = [
+    await poker.getAddress(),
+    await splitter.getAddress(),
+    await staking.getAddress(),
+    await vault.getAddress(),
+  ];
   for (const player of players) {
-    await token.connect(owner).transfer(await player.getAddress(), ethers.parseEther('2000'));
-    await token.connect(player).approve(await poker.getAddress(), ethers.MaxUint256);
-    await token.connect(player).approve(await splitter.getAddress(), ethers.MaxUint256);
-    await token.connect(player).approve(await staking.getAddress(), ethers.MaxUint256);
-    await token.connect(player).approve(await vault.getAddress(), ethers.MaxUint256);
+    const address = await player.getAddress();
+    await token.connect(owner).transfer(address, ethers.parseEther('2000'));
+    for (const spender of spenders) {
+      await token.connect(player).approve(spender, ethers.MaxUint256);
+    }
   }
 
   return {
@@ -182,18 +179,21 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
     playerAddresses: await Promise.all(players.map((p) => p.getAddress())),
     ownerAddress: await owner.getAddress(),
     operatorAddress: await operator.getAddress(),
-    seatKey,
   };
 }
 
 /** Create the shared wager table (FR-5.1). */
-export async function createWagerTable(stack: PokerStack, tableId: string = TABLE_ID, config = TABLE_CONFIG): Promise<void> {
+export async function createWagerTable(
+  stack: PokerStack,
+  tableId: string = TABLE_ID,
+  config: typeof TABLE_CONFIG = TABLE_CONFIG,
+): Promise<void> {
   await stack.poker.connect(stack.owner).createTable(tableId, config);
 }
 
 /**
  * Commit a hand as the operator and mine just enough blocks for `reveal` to be legal.
- * @returns The hand id plus the seed and the block timestamps needed by verifiers.
+ * @returns The commitment plus the commit block.
  */
 export async function commitHand(
   stack: PokerStack,
@@ -205,7 +205,8 @@ export async function commitHand(
   const tx = await stack.shuffle.connect(stack.operator).commit(handId, commitment, nonce);
   const receipt = await tx.wait();
   const commitBlock = receipt!.blockNumber;
-  await mineUpTo(commitBlock + 1 + Number(await stack.shuffle.requiredConfirmations()));
+  const confirmations = BigInt(await stack.shuffle.requiredConfirmations());
+  await mineUpTo(commitBlock + 1 + Number(confirmations));
   return { commitment, commitBlock };
 }
 
@@ -242,4 +243,28 @@ export function expectedRake(pot: bigint, rakeBps: bigint, rakeCap: bigint, sawF
   if (!sawFlop) return 0n;
   const raw = (pot * rakeBps) / BPS_DENOMINATOR;
   return raw > rakeCap ? rakeCap : raw;
+}
+
+/**
+ * Snapshot/restore fixture.
+ *
+ * Deploying the whole stack costs ~40 blocks of token transfers, so each `describe` block
+ * deploys once in `before` and every test starts from that snapshot. `restore` also rewinds the
+ * block number and timestamp, so block-window (FR-6.1) and cooldown (FR-9.5) tests stay
+ * deterministic.
+ */
+export interface SnapshotFixture {
+  stack: PokerStack;
+  reset(): Promise<void>;
+}
+
+export async function snapshotFixture(requiredConfirmations: bigint = 2n): Promise<SnapshotFixture> {
+  const stack = await deployStack(requiredConfirmations);
+  const snapshot = await takeSnapshot();
+  return {
+    stack,
+    async reset() {
+      await snapshot.restore();
+    },
+  };
 }

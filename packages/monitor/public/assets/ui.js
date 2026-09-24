@@ -600,15 +600,28 @@ export function startClock(root = document) {
 export function refreshClocks(root = document) {
   const now = Date.now();
   for (const node of root.querySelectorAll('[data-deadline]')) {
-    const raw = node.getAttribute('data-deadline');
-    const deadline = raw === null ? NaN : Number(raw);
+    const deadline = parseTimestamp(node.getAttribute('data-deadline'));
     const remaining = deadline - now;
     node.textContent = formatCountdown(remaining);
     node.classList.toggle('clock-urgent', remaining > 0 && remaining <= 5000);
     node.classList.toggle('clock-expired', remaining <= 0);
   }
   for (const node of root.querySelectorAll('[data-relative]')) {
-    const raw = node.getAttribute('data-relative');
-    node.textContent = formatRelative(raw === null ? NaN : Number(raw), now);
+    node.textContent = formatRelative(parseTimestamp(node.getAttribute('data-relative')), now);
   }
+}
+
+/**
+ * `data-*` attributes are strings; an absent timestamp arrives as `''` or
+ * `'null'` and must become `NaN` (not `0`, which would read as 1970).
+ *
+ * @param {string|null} raw
+ * @returns {number}
+ */
+function parseTimestamp(raw) {
+  if (raw === null) return NaN;
+  const trimmed = raw.trim();
+  if (trimmed === '' || trimmed === 'null' || trimmed === 'undefined') return NaN;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : NaN;
 }

@@ -167,13 +167,13 @@ export function formatInt(value) {
 }
 
 /**
- * Basis points as a percentage: `250` -> `"2.5%"`.
+ * Basis points as a percentage: `250` -> `"2.5%"`, `1` -> `"0.01%"`.
  * @param {number|null|undefined} bps
  * @returns {string}
  */
 export function formatBps(bps) {
   if (typeof bps !== 'number' || !Number.isFinite(bps)) return EM_DASH;
-  return `${(bps / 100).toFixed(bps % 100 === 0 ? 0 : 2)}%`;
+  return `${(bps / 100).toFixed(2).replace(/\.?0+$/, '')}%`;
 }
 
 /**

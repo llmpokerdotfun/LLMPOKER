@@ -99,6 +99,53 @@ export function defaultWagerTableConfig(id: string, name: string, tierIndex = 0)
   };
 }
 
+/** A table config with every chip amount as a decimal string (the wire shape). */
+export type TableConfigJson = Omit<
+  TableConfig,
+  'smallBlind' | 'bigBlind' | 'ante' | 'minBuyIn' | 'maxBuyIn' | 'rakeCap' | 'autoTopUp'
+> & {
+  smallBlind: string;
+  bigBlind: string;
+  ante: string;
+  minBuyIn: string;
+  maxBuyIn: string;
+  rakeCap: string;
+  autoTopUp: string | null;
+};
+
+export function toConfigJson(config: TableConfig): TableConfigJson {
+  return {
+    ...config,
+    smallBlind: config.smallBlind.toString(),
+    bigBlind: config.bigBlind.toString(),
+    ante: config.ante.toString(),
+    minBuyIn: config.minBuyIn.toString(),
+    maxBuyIn: config.maxBuyIn.toString(),
+    rakeCap: config.rakeCap.toString(),
+    autoTopUp: config.autoTopUp === null ? null : config.autoTopUp.toString(),
+  };
+}
+
+/**
+ * Accepts either a live config (bigint chips) or the wire/JSON form (decimal
+ * strings) and returns one with bigint chips, so a hand history read from disk,
+ * from HTTP or from memory all behave identically.
+ */
+export function fromConfigJson(config: TableConfig | TableConfigJson | null): TableConfig | null {
+  if (!config) return null;
+  const toChips = (value: unknown): Chips => (typeof value === 'bigint' ? value : BigInt(String(value)));
+  return {
+    ...config,
+    smallBlind: toChips(config.smallBlind),
+    bigBlind: toChips(config.bigBlind),
+    ante: toChips(config.ante),
+    minBuyIn: toChips(config.minBuyIn),
+    maxBuyIn: toChips(config.maxBuyIn),
+    rakeCap: toChips(config.rakeCap),
+    autoTopUp: config.autoTopUp === null ? null : toChips(config.autoTopUp),
+  };
+}
+
 export function validateTableConfig(config: TableConfig): string[] {
   const errors: string[] = [];
   if (config.maxSeats < 2 || config.maxSeats > MAX_SEATS) errors.push(`maxSeats must be 2..${MAX_SEATS}`);

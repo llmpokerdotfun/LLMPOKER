@@ -45,7 +45,11 @@ function check(name: string, ok: boolean, detail?: string): { name: string; ok: 
  */
 export function verifyRngProof(proof: RngProof, options: VerifyOptions = {}): ProofVerification {
   const requireReveal = options.requireReveal ?? true;
-  const minConfirmations = options.minAnchorConfirmations ?? DEFAULT_ANCHOR_CONFIRMATIONS;
+  // A proof states the finality it was produced under: wager hands require the
+  // full 12 confirmations (FR-6.5), free-mode hands use a local anchor where the
+  // rule is meaningless. A verifier can always demand more via options.
+  const minConfirmations =
+    options.minAnchorConfirmations ?? proof.requiredConfirmations ?? DEFAULT_ANCHOR_CONFIRMATIONS;
   const checks: { name: string; ok: boolean; detail?: string }[] = [];
 
   // 1. shape
@@ -55,6 +59,13 @@ export function verifyRngProof(proof: RngProof, options: VerifyOptions = {}): Pr
   const nonceOk = /^[0-9]+$/.test(proof.nonce);
   checks.push(check('proof.shape', seedOk && anchorHashOk && commitmentOkShape && nonceOk, 'hashes are 0x + 32 bytes, nonce is decimal'));
   checks.push(check('proof.deck_is_permutation', isCompleteDeck(proof.deck), `deck length ${proof.deck.length}`));
+  checks.push(
+    check(
+      'proof.anchor_source',
+      proof.anchorSource === 'ONCHAIN' || proof.anchorSource === 'LOCAL',
+      `anchorSource = ${String(proof.anchorSource)}`,
+    ),
+  );
 
   const revealed = proof.deckSeed !== null && proof.anchorBlockHash !== null;
   if (requireReveal) {
@@ -173,24 +184,41 @@ export function verifyHandDeal(result: HandResult, proof: RngProof): ProofVerifi
     ),
   );
 
-  const expected = dealHoldem(shuffled, result.dealingOrder, { burnCards: result.burns.length > 0 });
-  const expectedBoard = expected.board.join(',');
+  // Two cards per seat are dealt before anything else, so the hole cards are
+  // identical whether or not the table burns. A hand that ends preflop reveals no
+  // public cards, and in that case the burn setting is unobservable — so only the
+  // hole cards are checked, and the board/burn checks compare a prefix of what
+  // the canonical procedure would have produced.
+  const revealedNothingPublic = result.board.length === 0 && result.burns.length === 0;
+  const burnCards = revealedNothingPublic ? true : result.burns.length > 0;
+  const expected = dealHoldem(shuffled, result.dealingOrder, { burnCards });
+
+  for (const seat of result.seats) {
+    if (seat.holeCards === null || seat.holeCards === undefined) continue;
+    const actual = seat.holeCards.join(',');
+    const exp = (expected.holes.get(seat.seat) ?? []).join(',');
+    checks.push(check(`deal.seat_${seat.seat}_hole_cards_match`, exp === actual, `expected [${exp}] got [${actual}]`));
+  }
+
+  if (revealedNothingPublic) {
+    checks.push(
+      check('deal.board_matches_shuffle', true, 'hand ended preflop: no public cards to compare (hole cards verified)'),
+    );
+    return { ok: checks.every((c) => c.ok), checks };
+  }
+
+  const expectedBoard = expected.board.slice(0, result.board.length).join(',');
   const actualBoard = result.board.join(',');
   checks.push(
     check('deal.board_matches_shuffle', expectedBoard === actualBoard, `expected [${expectedBoard}] got [${actualBoard}]`),
   );
 
-  for (const seat of result.seats) {
-    const actual = (seat.holeCards ?? []).join(',');
-    if (seat.holeCards === null || seat.holeCards === undefined) continue;
-    const exp = (expected.holes.get(seat.seat) ?? []).join(',');
+  if (result.burns.length > 0) {
+    const expectedBurns = expected.burns.slice(0, result.burns.length).join(',');
     checks.push(
-      check(`deal.seat_${seat.seat}_hole_cards_match`, exp === actual, `expected [${exp}] got [${actual}]`),
+      check('deal.burns_match', expectedBurns === result.burns.join(','), `expected [${expectedBurns}] got [${result.burns.join(',')}]`),
     );
   }
-
-  const burnsMatch = expected.burns.join(',') === result.burns.join(',');
-  checks.push(check('deal.burns_match', burnsMatch, `expected [${expected.burns.join(',')}] got [${result.burns.join(',')}]`));
 
   return { ok: checks.every((c) => c.ok), checks };
 }

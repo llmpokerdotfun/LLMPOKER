@@ -130,9 +130,6 @@ function renderFilters() {
   if (agentInput instanceof HTMLInputElement) agentInput.value = route.agentId;
   const limitSelect = dom.filters.querySelector('select[name="limit"]');
   if (limitSelect instanceof HTMLSelectElement) limitSelect.value = String(route.limit);
-  // the `id` field, when present, keeps the detail view addressable
-  const idInput = dom.filters.querySelector('input[name="id"]');
-  if (idInput instanceof HTMLInputElement) idInput.value = route.id ?? '';
 }
 
 /** Populates the table-id datalist from the live snapshot. */

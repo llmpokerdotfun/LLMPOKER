@@ -45,6 +45,8 @@ function buildProof(deckSeed: string, anchorHash: string, nonce: bigint): RngPro
     revealTxHash: '0xtx2',
     entropy,
     deck: shuffleDeck(entropy).deck,
+    anchorSource: 'ONCHAIN',
+    requiredConfirmations: 12,
     verified: true,
     verifiedAt: 1,
     chainId: 4663,
