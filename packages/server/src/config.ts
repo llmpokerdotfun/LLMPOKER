@@ -37,6 +37,8 @@ export interface ServerConfig {
   settlement: SettlementMode;
   contracts: ContractAddresses;
   operatorAddress: string | null;
+  /** Enables the operator-only admin surface (FR-10.5). Unset ⇒ admin routes 403. */
+  operatorToken: string | null;
   rpcUrl: string | null;
   operatorPrivateKey: string | null;
   /** Tables created at boot. */
@@ -104,6 +106,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       rakeSplitter: env.LLMPOKER_RAKE_SPLITTER_ADDRESS ?? null,
     },
     operatorAddress: env.LLMPOKER_OPERATOR_ADDRESS ?? null,
+    operatorToken: env.LLMPOKER_OPERATOR_TOKEN ?? null,
     rpcUrl: env.RH_RPC_URL ?? null,
     operatorPrivateKey: env.DEPLOYER_PRIVATE_KEY ?? env.LLMPOKER_OPERATOR_KEY ?? null,
     freeTables: num(env.LLMPOKER_FREE_TABLES, 3),

@@ -38,10 +38,12 @@ interface Harness {
 
 let harness: Harness;
 let dataDir: string;
+const tempDirs: string[] = [];
 
 async function buildHarness(env: NodeJS.ProcessEnv = {}): Promise<Harness> {
   let clock = 1_760_000_000_000;
   dataDir = mkdtempSync(join(tmpdir(), 'llmpoker-test-'));
+  tempDirs.push(dataDir);
   const config = loadConfig({
     LLMPOKER_ROOT: process.cwd(),
     LLMPOKER_DATA_DIR: dataDir,
@@ -177,8 +179,42 @@ describe('LLM Poker Arena server', () => {
 
   afterEach(async () => {
     await harness.close();
-    rmSync(dataDir, { recursive: true, force: true });
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop()!;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
+
+  /** Agent creation against an arbitrary harness instance (used by the admin tests). */
+  async function createAgentOn(
+    target: Harness,
+    name: string,
+  ): Promise<{ agentId: string; apiKey: string; wallet: HDNodeWallet }> {
+    const wallet = Wallet.createRandom();
+    const response = await target.app.inject({
+      method: 'POST',
+      url: '/api/v1/agents/register',
+      payload: { name, wallet: wallet.address },
+    });
+    expect(response.statusCode).toBe(201);
+    const body = response.json() as { agent: { id: string }; apiKey: string };
+    return { agentId: body.agent.id, apiKey: body.apiKey, wallet };
+  }
+
+  async function postOn(
+    target: Harness,
+    path: string,
+    payload: Record<string, unknown>,
+    apiKey?: string,
+  ): Promise<{ statusCode: number; body: string }> {
+    const response = await target.app.inject({
+      method: 'POST',
+      url: path,
+      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+      payload,
+    });
+    return { statusCode: response.statusCode, body: response.body };
+  }
 
   describe('health and machine-readable contract (FR-2)', () => {
     it('reports the chain, modes and anchor kind', async () => {
@@ -854,6 +890,108 @@ describe('LLM Poker Arena server', () => {
       expect(leave.statusCode, leave.body).toBe(200);
       const cashOut = BigInt((leave.json() as { cashOut: string }).cashOut);
       expect(cashOut).toBeGreaterThan(0n);
+    });
+  });
+
+  describe('operator controls (FR-10.5, FR-10.3)', () => {
+    it('refuses the admin surface unless a token is configured, then honours it', async () => {
+      const a = await registerAgent('Hermes');
+      await seatAgent(a.agentId, a.apiKey, 'free-0-1', '200');
+      const b = await registerAgent('Muse');
+      await seatAgent(b.agentId, b.apiKey, 'free-0-1', '200');
+
+      // No token configured: the surface is closed, not open.
+      const disabled = await harness.app.inject({
+        method: 'POST',
+        url: '/api/v1/admin/tables/free-0-1/pause',
+        headers: { authorization: 'Bearer anything' },
+      });
+      expect(disabled.statusCode).toBe(403);
+      expect((disabled.json() as { error: { code: string } }).error.code).toBe('OPERATOR_DISABLED');
+
+      // With a token configured, a wrong token is rejected and the right one works.
+      const withToken = await buildHarness({ LLMPOKER_OPERATOR_TOKEN: 'operator-secret' });
+      try {
+        const refused = await withToken.app.inject({
+          method: 'POST',
+          url: '/api/v1/admin/tables/free-0-1/pause',
+          headers: { authorization: 'Bearer wrong' },
+        });
+        expect(refused.statusCode).toBe(401);
+
+        const paused = await withToken.app.inject({
+          method: 'POST',
+          url: '/api/v1/admin/tables/free-0-1/pause',
+          headers: { authorization: 'Bearer operator-secret' },
+        });
+        expect(paused.statusCode).toBe(200);
+        const body = paused.json() as { paused: boolean; table: TableSnapshot };
+        expect(body.paused).toBe(true);
+        expect(body.table.status).toBe('PAUSED');
+
+        // A paused table deals no new hands, even with two funded seats waiting.
+        const seatedA = await createAgentOn(withToken, 'Paused A');
+        const seatedB = await createAgentOn(withToken, 'Paused B');
+        await postOn(withToken, '/api/v1/tables/free-0-1/seat', { buyIn: '200' }, seatedA.apiKey);
+        await postOn(withToken, '/api/v1/tables/free-0-1/seat', { buyIn: '200' }, seatedB.apiKey);
+        for (let i = 0; i < 5; i++) await withToken.orchestrator.tick(withToken.advance(4_000));
+        expect(withToken.orchestrator.getTable('free-0-1').state.hand).toBeNull();
+
+        const resumed = await withToken.app.inject({
+          method: 'POST',
+          url: '/api/v1/admin/tables/free-0-1/resume',
+          headers: { authorization: 'Bearer operator-secret' },
+        });
+        expect(resumed.statusCode).toBe(200);
+        await withToken.orchestrator.tick(withToken.advance(4_000));
+        expect(withToken.orchestrator.getTable('free-0-1').state.hand).not.toBeNull();
+      } finally {
+        await withToken.close();
+      }
+    });
+
+    it('refuses to seat the operator account at its own wager table (FR-10.3)', async () => {
+      const operatorWallet = Wallet.createRandom();
+      const withOperator = await buildHarness({
+        LLMPOKER_OPERATOR_ADDRESS: operatorWallet.address,
+      });
+      try {
+        const registration = await withOperator.app.inject({
+          method: 'POST',
+          url: '/api/v1/agents/register',
+          payload: { name: 'House', wallet: operatorWallet.address },
+        });
+        const { agent, apiKey } = registration.json() as { agent: { id: string }; apiKey: string };
+
+        const deposit = await withOperator.app.inject({
+          method: 'POST',
+          url: '/api/v1/tables/wager-0-1/deposit',
+          headers: { authorization: `Bearer ${apiKey}` },
+          payload: { amount: '50000000000000000000' },
+        });
+        expect(deposit.statusCode).toBe(201);
+
+        const seat = await withOperator.app.inject({
+          method: 'POST',
+          url: '/api/v1/tables/wager-0-1/seat',
+          headers: { authorization: `Bearer ${apiKey}` },
+          payload: { buyIn: '2000000000000000000' },
+        });
+        expect(seat.statusCode).toBe(400);
+        expect((seat.json() as { error: { message: string } }).error.message).toContain('operator account');
+
+        // The same wallet is fine at a free table, which never settles on-chain.
+        const freeSeat = await withOperator.app.inject({
+          method: 'POST',
+          url: '/api/v1/tables/free-0-1/seat',
+          headers: { authorization: `Bearer ${apiKey}` },
+          payload: { buyIn: '200' },
+        });
+        expect(freeSeat.statusCode).toBe(201);
+        void agent;
+      } finally {
+        await withOperator.close();
+      }
     });
   });
 

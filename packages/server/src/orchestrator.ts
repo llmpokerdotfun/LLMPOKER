@@ -42,6 +42,7 @@ import {
   leaveTable,
   nextButtonSeat,
   seatAgent,
+  setTableStatus,
   startHand,
   timeoutAction,
 } from '@llmpoker/engine';
@@ -384,6 +385,17 @@ export class Orchestrator extends EventEmitter {
     }
 
     const buyIn = options.buyIn ?? config.minBuyIn;
+
+    // FR-10.3: the operator account must never take a seat at its own wager table.
+    if (config.mode === 'WAGER' && this.config.operatorAddress) {
+      if (agent.wallet === this.config.operatorAddress.toLowerCase()) {
+        throw new EngineError(
+          'ILLEGAL_STATE',
+          'the operator account cannot be seated at its own wager tables (FR-10.3)',
+        );
+      }
+    }
+
     const escrowAvailable =
       config.mode === 'WAGER' ? this.store.tableEscrow(agentId, tableId) : BigInt(agent.freeChips);
 
@@ -616,6 +628,32 @@ export class Orchestrator extends EventEmitter {
   /** Seats whose status changed since the last hand — used by the monitor. */
   seatStatuses(table: ManagedTable): { seat: number; status: SeatStatus }[] {
     return table.state.seats.map((s) => ({ seat: s.seat, status: s.status }));
+  }
+
+  /**
+   * FR-10.5: emergency pause. A paused table stops dealing new hands; hands
+   * already in flight are allowed to finish so no chips are stranded, and free
+   * mode is never affected by the on-chain pause (which lives in `Poker.sol`
+   * and only gates wager settlement).
+   */
+  pauseTable(tableId: string, paused: boolean, now = this.now()): TableSnapshot {
+    const table = this.getTable(tableId);
+    if (paused) {
+      table.state = setTableStatus(table.state, 'PAUSED', now);
+      table.nextHandAt = Number.POSITIVE_INFINITY;
+    } else {
+      table.state = setTableStatus(table.state, canStartHand(table.state) ? 'RUNNING' : 'OPEN', now);
+      table.nextHandAt = now;
+    }
+    const snapshot = this.snapshot(table);
+    this.emit('table', snapshot);
+    this.log('warn', `${paused ? 'paused' : 'resumed'} table ${tableId}`);
+    return snapshot;
+  }
+
+  /** True when the operator has paused this table (FR-10.5). */
+  isPaused(tableId: string): boolean {
+    return this.getTable(tableId).state.status === 'PAUSED';
   }
 
   private requireAgent(agentId: string): AgentRecord {

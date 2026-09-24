@@ -57,9 +57,10 @@ const config: HardhatUserConfig = {
   mocha: {
     timeout: 180_000,
     // Only the top-level `test/*.ts` files are specs; `test/support/**` holds shared fixtures
-    // and must not be loaded as a test suite.
+    // and must not be loaded as a test suite. `spec` is a real Mocha option that Hardhat's
+    // `MochaOptions` type does not surface, so the object is widened for this one field.
     spec: 'test/*.ts',
-  },
+  } as HardhatUserConfig['mocha'] & { spec: string },
 };
 
 export default config;

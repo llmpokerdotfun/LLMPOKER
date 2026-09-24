@@ -38,9 +38,10 @@ const MOJIBAKE: [RegExp, string][] = [
 
 const TEXT_EXTENSIONS = ['.ts', '.tsx', '.js', '.mjs', '.json', '.md', '.sol', '.yml', '.yaml', '.txt', '.css', '.html'];
 
+const SELF = 'scripts/fix-encoding.ts'; // this file legitimately contains mojibake literals
 const files = execFileSync('git', ['ls-files'], { encoding: 'utf8' })
   .split(/\r?\n/)
-  .filter((f) => f !== '' && TEXT_EXTENSIONS.some((ext) => f.endsWith(ext)));
+  .filter((f) => f !== '' && f !== SELF && TEXT_EXTENSIONS.some((ext) => f.endsWith(ext)));
 
 const checkOnly = process.argv.includes('--check');
 let repaired = 0;

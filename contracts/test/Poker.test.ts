@@ -369,10 +369,11 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       expect(rake).to.equal(0n);
       expect(award).to.equal(pot);
       expect(await stack.token.balanceOf(stack.splitterAddress)).to.equal(0n);
-      // No rake: the winner's escrow is its untouched buy-in plus the whole 40-token pot.
-      expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(LEGAL_BUY_IN + pot);
+      // No rake: the winner's escrow is exactly the pot it was credited (its own committed
+      // chips came straight back), and the contract still holds every chip of it.
+      expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(pot);
       expect(await poker.escrowBalanceOf(TABLE_ID, 1)).to.equal(0n);
-      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(LEGAL_BUY_IN + pot);
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(pot);
     });
 
     it('honours the rake cap, not just the bps (FR-8.1)', async () => {
@@ -504,7 +505,10 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
 
     it('locks escrow while a hand is open and releases it after settlement (FR-5.5)', async () => {
       const seats = [0, 1];
-      await seatAll(seats);
+      // Both seats buy in at the maximum so each keeps 5 tokens of free escrow after committing.
+      for (const seat of seats) {
+        await poker.connect(stack.players[seat]!).deposit(TABLE_ID, seat, TABLE_CONFIG.maxBuyIn);
+      }
       const handId = handIdOf('lock');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('lock-seed'));
       await commitHand(stack, handId, seed, 1n);
@@ -520,8 +524,12 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
         .connect(stack.operator)
         .settleHand(TABLE_ID, handId, [ethers.parseEther('20'), 0n], [1], [ethers.parseEther('20') - RAKE.cap], true);
 
-      // Settlement unlocks the seat.
-      await expect(poker.connect(stack.players[0]!).cashOut(TABLE_ID, 0)).to.not.be.reverted;
+      // Settlement unlocks the seat and its remaining escrow is withdrawable.
+      const free = TABLE_CONFIG.maxBuyIn - ethers.parseEther('20');
+      await expect(poker.connect(stack.players[0]!).cashOut(TABLE_ID, 0))
+        .to.emit(poker, 'CashedOut')
+        .withArgs(TABLE_ID, 0, stack.playerAddresses[0]!, free);
+      expect(await poker.occupantOf(TABLE_ID, 0)).to.equal(ethers.ZeroAddress);
     });
 
     it('ignores trailing zero contributions so fixed-size arrays are usable', async () => {
@@ -737,7 +745,10 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
   describe('emergency pause (FR-10.5)', () => {
     it('halts deposits and settlement but never cash-out', async () => {
       const seats = [0, 1];
-      await seatAll(seats);
+      // Both seats hold free escrow (5 tokens each) so the cash-out path is actually exercised.
+      for (const seat of seats) {
+        await poker.connect(stack.players[seat]!).deposit(TABLE_ID, seat, TABLE_CONFIG.maxBuyIn);
+      }
       await poker.connect(stack.owner).pause();
       expect(await poker.paused()).to.equal(true);
 
@@ -768,6 +779,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await poker.connect(stack.owner).pause();
       await expect(poker.connect(stack.players[1]!).cashOut(TABLE_ID, 1)).to.not.be.reverted;
       await expect(poker.connect(stack.players[0]!).cashOut(TABLE_ID, 0)).to.not.be.reverted;
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(0n);
     });
 
     it('only lets the owner pause and unpause', async () => {

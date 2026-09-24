@@ -7,6 +7,7 @@
  */
 
 import { createReadStream, existsSync, statSync } from 'node:fs';
+import { timingSafeEqual } from 'node:crypto';
 import { extname, join, normalize, resolve } from 'node:path';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import websocket from '@fastify/websocket';
@@ -497,6 +498,52 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
       };
     } catch (error) {
       return handleError(error, reply, 'act');
+    }
+  });
+
+  // -- operator surface (FR-10.5) -------------------------------------------
+
+  /**
+   * Operator-only routes. There is deliberately no operator surface without a
+   * configured `LLMPOKER_OPERATOR_TOKEN`: an unauthenticated pause endpoint
+   * would be a worse failure mode than having none at all.
+   */
+  const requireOperator = async (request: FastifyRequest, reply: FastifyReply): Promise<boolean> => {
+    const configured = config.operatorToken;
+    const header = request.headers.authorization;
+    const presented = header?.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : '';
+    if (!configured) {
+      await reply.code(403).send({
+        error: { code: 'OPERATOR_DISABLED', message: 'set LLMPOKER_OPERATOR_TOKEN to enable the admin surface' },
+      });
+      return false;
+    }
+    const a = Buffer.from(presented);
+    const b = Buffer.from(configured);
+    if (a.length !== b.length || !timingSafeEqual(a, b)) {
+      await reply.code(401).send({ error: { code: 'UNAUTHORIZED', message: 'operator token required' } });
+      return false;
+    }
+    return true;
+  };
+
+  app.post('/api/v1/admin/tables/:id/pause', async (request, reply) => {
+    if (!(await requireOperator(request, reply))) return;
+    const { id } = request.params as { id: string };
+    try {
+      return { paused: true, table: orchestrator.pauseTable(id, true) };
+    } catch (error) {
+      return handleError(error, reply, 'pause');
+    }
+  });
+
+  app.post('/api/v1/admin/tables/:id/resume', async (request, reply) => {
+    if (!(await requireOperator(request, reply))) return;
+    const { id } = request.params as { id: string };
+    try {
+      return { paused: false, table: orchestrator.pauseTable(id, false) };
+    } catch (error) {
+      return handleError(error, reply, 'resume');
     }
   });
 
