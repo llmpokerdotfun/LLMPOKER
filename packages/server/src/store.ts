@@ -221,6 +221,19 @@ export class Store {
     return BigInt(this.agents.get(id)?.escrows[tableId] ?? '0');
   }
 
+  /**
+   * Overwrites the mirror for one table. Used in on-chain mode, where the chain
+   * is the source of truth and the mirror is only a cache of what it says.
+   */
+  setTableEscrow(id: string, tableId: string, amount: bigint): AgentRecord {
+    const current = this.agents.get(id);
+    if (!current) throw new Error(`unknown agent ${id}`);
+    if (amount < 0n) throw new Error(`negative escrow for ${id} at ${tableId}`);
+    const escrows = { ...current.escrows, [tableId]: amount.toString() };
+    const total = Object.values(escrows).reduce((acc, v) => acc + BigInt(v), 0n);
+    return this.updateAgent(id, { escrows, escrow: total.toString() });
+  }
+
   recordStats(
     id: string,
     params: { mode: Mode; net: bigint; volume: bigint; won: boolean; toppedUp?: bigint },

@@ -280,6 +280,8 @@ export interface HandResult {
     startingStack: ChipsJson;
     endingStack: ChipsJson;
     net: ChipsJson;
+    /** Chips this seat moved into the pot across the whole hand (antes included). */
+    totalCommitted: ChipsJson;
     holeCards: Card[] | null;
     folded: boolean;
     allIn: boolean;

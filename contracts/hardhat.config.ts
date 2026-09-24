@@ -20,12 +20,21 @@ const DEPLOYER_PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY?.trim();
 
 // `robinhood` is only registered when RH_RPC_URL is present, so a machine with no
 // deployment secrets can still run `hardhat test` on the in-process network.
+const LOCALHOST_RPC_URL = process.env.LOCALHOST_RPC_URL?.trim() || 'http://127.0.0.1:8545';
+
 const networks: HardhatUserConfig['networks'] = {
   hardhat: {
     chainId: 31337,
     // The RNG tests walk 256-block reveal windows and the staking tests warp time.
     allowUnlimitedContractSize: false,
     mining: { auto: true },
+  },
+  // A standalone `npx hardhat node` (its first ten funded accounts are the well-known
+  // development keys, so no secret material is needed to deploy to it). This is what
+  // `npm run e2e:onchain` targets: a real RPC with real transactions, still not a public chain.
+  localhost: {
+    url: LOCALHOST_RPC_URL,
+    chainId: 31337,
   },
 };
 

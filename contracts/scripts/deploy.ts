@@ -24,6 +24,8 @@
 
 import { ethers } from 'ethers';
 import hre from 'hardhat';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 /** Defaults mirror `packages/shared/src/config.ts` (SRS §11 Q1–Q3). */
 const DEFAULTS = {
@@ -169,23 +171,25 @@ async function main(): Promise<void> {
 
   console.log('');
   console.log('Addresses (record these):');
-  console.log(
-    JSON.stringify(
-      {
-        chainId: chainId.toString(),
-        token: tokenAddress,
-        vault: vaultAddress,
-        staking: stakingAddress,
-        rakeSplitter: splitterAddress,
-        shuffle: shuffleAddress,
-        poker: pokerAddress,
-        owner: deployerAddress,
-        operator,
-      },
-      null,
-      2,
-    ),
-  );
+  const deployment = {
+    chainId: chainId.toString(),
+    token: tokenAddress,
+    vault: vaultAddress,
+    staking: stakingAddress,
+    rakeSplitter: splitterAddress,
+    shuffle: shuffleAddress,
+    poker: pokerAddress,
+    owner: deployerAddress,
+    operator,
+  };
+  console.log(JSON.stringify(deployment, null, 2));
+
+  // Machine-readable copy, so the server and the on-chain end-to-end script can
+  // read the addresses instead of scraping stdout.
+  const outFile = join('deployments', `${hre.network.name}.json`);
+  mkdirSync('deployments', { recursive: true });
+  writeFileSync(outFile, `${JSON.stringify({ ...deployment, network: hre.network.name }, null, 2)}\n`, 'utf8');
+  console.log(`Wrote ${outFile}`);
 
   console.log('');
   console.log('Next steps:');

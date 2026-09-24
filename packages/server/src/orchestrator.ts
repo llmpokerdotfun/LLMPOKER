@@ -70,6 +70,11 @@ export interface ManagedTable {
    */
   secrets: Map<string, { seed: string; salts: Uint8Array[]; commitment: DeckCommitment }>;
   histories: Map<string, HandHistory>;
+  /**
+   * On-chain mode only: the seat order handed to `Poker.openHand`, which
+   * `settleHand` must match. Recorded when the hand opens and cleared after.
+   */
+  openHandSeats: number[] | null;
   /** Epoch ms before which the next hand must not start. */
   nextHandAt: number;
   /** A commit/reveal/start sequence is in flight. */
@@ -77,6 +82,8 @@ export interface ManagedTable {
   /** Per-table monotonic hand nonce (FR-6.1). */
   nonce: bigint;
   startedHands: number;
+  /** Count of consecutive failed start attempts, so a retry gets a fresh hand id. */
+  attempt: number;
 }
 
 export interface OrchestratorEvents {
@@ -89,6 +96,14 @@ export interface OrchestratorEvents {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Seats that will be dealt into the next hand, in ascending order. */
+function fundedSeatIndexes(state: TableState): number[] {
+  return state.seats
+    .filter((seat) => seat.agentId !== null && seat.stack >= state.config.bigBlind)
+    .map((seat) => seat.seat)
+    .sort((a, b) => a - b);
+}
 
 export interface OrchestratorOptions {
   config: ServerConfig;
@@ -149,13 +164,35 @@ export class Orchestrator extends EventEmitter {
       proofs: new Map(),
       secrets: new Map(),
       histories: new Map(),
+      openHandSeats: null,
       nextHandAt: 0,
       busy: false,
       nonce: 0n,
       startedHands: 0,
+      attempt: 0,
     };
     this.tables.set(config.id, managed);
     return managed;
+  }
+
+  /**
+   * On-chain mode: makes sure every wager table exists on `Poker.sol`.
+   *
+   * Agents deposit with their own keys before they can take a seat, so the table
+   * has to exist at boot rather than at the first hand — otherwise their
+   * `deposit` reverts with `UnknownTable` and they have no way to know why.
+   */
+  async ensureTables(): Promise<void> {
+    if (!this.settlement.clientSideDeposits) return;
+    for (const table of this.tables.values()) {
+      if (table.state.config.mode !== 'WAGER') continue;
+      try {
+        const receipt = await this.settlement.ensureTable(table.state.config);
+        if (receipt) this.log('info', `table ${table.state.config.id} created on-chain in ${receipt.txHash}`);
+      } catch (error) {
+        this.emit('error', error as Error, `ensureTable:${table.state.config.id}`);
+      }
+    }
   }
 
   start(): void {
@@ -225,7 +262,9 @@ export class Orchestrator extends EventEmitter {
     if (table.busy) return;
     table.busy = true;
     const handNumber = table.state.handNumber + 1;
-    const handId = `${table.state.config.id}-h${handNumber}`;
+    // A hand id that failed mid-start is already committed on-chain and can never
+    // be reused, so a retry gets a fresh suffix instead of reverting forever.
+    const handId = table.attempt === 0 ? `${table.state.config.id}-h${handNumber}` : `${table.state.config.id}-h${handNumber}a${table.attempt}`;
     const mode: Mode = table.state.config.mode;
     try {
       // -- phase 1: commit the seed (FR-6.1) --------------------------------
@@ -234,6 +273,17 @@ export class Orchestrator extends EventEmitter {
       const nonce = table.nonce;
       const commitment = commitmentHex(seed, nonce);
       const seedRef = await this.anchor.commitSeed(handId, commitment, nonce);
+
+      // FR-5.1/5.2: in on-chain wager mode the contract must know which seats are
+      // in this hand before any chip is committed, and it refuses to open a hand
+      // whose seed is not already committed — which is exactly the state we are in.
+      if (mode === 'WAGER' && this.settlement.clientSideDeposits) {
+        await this.settlement.ensureTable(table.state.config);
+        const seats = fundedSeatIndexes(table.state);
+        const receipt = await this.settlement.openHand(table.state.config.id, handId, seats);
+        table.openHandSeats = seats;
+        if (receipt) this.log('info', `hand ${handId} opened on-chain in ${receipt.txHash}`);
+      }
 
       // -- anchor: the next block, read after it exists and again once final --
       const anchorBlock = seedRef.block + 1;
@@ -321,9 +371,23 @@ export class Orchestrator extends EventEmitter {
         nonce: nonce.toString(),
       });
       table.startedHands += 1;
+      table.attempt = 0;
       await this.applyStep(table, step, now);
       this.emit('table', this.snapshot(table));
     } catch (error) {
+      // The on-chain commitment for this hand id may already exist, so the next
+      // attempt must use a different one (see `handId` above).
+      if (table.openHandSeats) {
+        // The hand is open on-chain and holding its seats; release them so the
+        // table can deal again (FR-5.6). Best effort: the contract gates voiding
+        // on its reveal window, and a revert here is not fatal.
+        void this.settlement
+          .voidHand(table.state.config.id, handId)
+          .then(() => this.log('warn', `voided aborted hand ${handId} on-chain`))
+          .catch((voidError: unknown) => this.log('warn', `could not void ${handId}: ${String(voidError)}`));
+      }
+      table.attempt += 1;
+      table.openHandSeats = null;
       this.emit('error', error as Error, `startHand:${table.state.config.id}`);
     } finally {
       table.busy = false;
@@ -416,7 +480,11 @@ export class Orchestrator extends EventEmitter {
       if ((await this.anchor.currentBlock()) >= anchorBlock) return this.anchor.blockHash(anchorBlock);
       if (this.now() > deadline) throw new Error(`timed out waiting for anchor block ${anchorBlock}`);
       if (this.anchor instanceof LocalChain) this.anchor.produceBlock(1);
-      else await sleep(Math.min(500, Math.max(50, this.config.blockTimeMs)));
+      // A real chain produces blocks on its own; a development node may need a nudge.
+      else {
+        await this.anchor.advanceBlock?.();
+        await sleep(Math.min(500, Math.max(50, this.config.blockTimeMs)));
+      }
     }
   }
 
@@ -427,7 +495,10 @@ export class Orchestrator extends EventEmitter {
       if (this.now() > deadline) throw new Error(`timed out waiting for block ${block} to finalize`);
       // A simulated chain advances on demand; a real chain is polled.
       if (this.anchor instanceof LocalChain) this.anchor.produceBlock(1);
-      else await sleep(Math.min(500, Math.max(50, this.config.blockTimeMs)));
+      else {
+        await this.anchor.advanceBlock?.();
+        await sleep(Math.min(500, Math.max(50, this.config.blockTimeMs)));
+      }
     }
   }
 
@@ -485,15 +556,42 @@ export class Orchestrator extends EventEmitter {
     }
 
     if (mode === 'WAGER' && moves.length > 0) {
-      // Only the settlement adapter moves: it holds the agent's whole claim on
-      // the table (seat stack + escrow), so a hand result changes it by the net.
-      // The off-table escrow mirror is untouched here — it is only moved by
-      // deposit, buy-in and cash-out.
-      void this.settlement
-        .settle(table.state.config.id, result.handId, moves, rake)
-        .catch((error: unknown) => this.emit('error', error as Error, 'settlement'));
+      if (this.settlement.clientSideDeposits) {
+        // On-chain: the contract is the ledger. `settleHand` collateralises each
+        // seat's contribution first, computes its own rake, and rejects the
+        // settlement if our awards do not equal `pot - rake`.
+        const contributions = result.seats
+          .filter((seat) => seat.agentId !== null)
+          .map((seat) => ({ seat: seat.seat, amount: BigInt(seat.totalCommitted ?? '0') }));
+        const openSeats = table.openHandSeats;
+        if (!openSeats) {
+          this.log('error', `hand ${result.handId} completed with no on-chain openHand record`);
+        } else {
+          void this.settlement
+            .settleHand({
+              tableId: table.state.config.id,
+              handId: result.handId,
+              // Seat-aligned with the order handed to openHand, as the contract requires.
+              contributions: openSeats.map(
+                (seat) => contributions.find((c) => c.seat === seat) ?? { seat, amount: 0n },
+              ),
+              winners: result.pots.flatMap((pot) => pot.winners.map((w) => w.seat)),
+              awards: result.pots.flatMap((pot) => pot.winners.map((w) => BigInt(w.amount))),
+              sawFlop: result.board.length >= 3,
+              rake,
+            })
+            .then((receipt) => this.log('info', `hand ${result.handId} settled on-chain in ${receipt.txHash}`))
+            .catch((error: unknown) => this.emit('error', error as Error, 'settleHand'));
+        }
+      } else {
+        // Local mirror: it holds each agent's whole claim, so it settles by net.
+        void this.settlement
+          .settleMirror?.(table.state.config.id, result.handId, moves, rake)
+          .catch((error: unknown) => this.emit('error', error as Error, 'settlement'));
+      }
     }
 
+    table.openHandSeats = null;
     const summary = this.handSummary(history);
     table.nextHandAt = now + table.state.config.handIntervalMs;
     this.emit('handComplete', history, summary);
@@ -510,7 +608,14 @@ export class Orchestrator extends EventEmitter {
 
   // -- agent operations -----------------------------------------------------
 
-  /** FR-5.1: funds the per-table escrow for wager play. */
+  /**
+   * FR-5.1: funds the per-table escrow for wager play.
+   *
+   * In on-chain mode this is a **read**, not a transfer: `Poker.deposit` is
+   * `msg.sender`-based on purpose (FR-5.3), so the agent moves its own tokens and
+   * the server only verifies the resulting on-chain balance and caches it. The
+   * agent must already hold the seat it funded.
+   */
   async deposit(agentId: string, tableId: string, amount: Chips, now = this.now()): Promise<{ escrow: Chips }> {
     const table = this.getTable(tableId);
     if (table.state.config.mode !== 'WAGER') {
@@ -518,6 +623,22 @@ export class Orchestrator extends EventEmitter {
     }
     const agent = this.requireAgent(agentId);
     if (amount <= 0n) throw new EngineError('INVALID_AMOUNT', 'deposit must be positive');
+
+    if (this.settlement.clientSideDeposits) {
+      const seat = table.state.seats.find((s) => s.agentId === agentId);
+      if (!seat) {
+        throw new EngineError(
+          'SEAT_NOT_FOUND',
+          `on-chain mode: deposit your own token to the seat you intend to take, then POST /seat with that seat index`,
+        );
+      }
+      const onChain = await this.settlement.escrowOf(tableId, seat.seat);
+      const updated = this.store.setTableEscrow(agentId, tableId, onChain - seat.stack);
+      this.emit('agent', this.agentSnapshot(updated));
+      this.log('info', `verified on-chain escrow ${onChain} for ${agent.name} at ${tableId}#${seat.seat}`, { now });
+      return { escrow: BigInt(updated.escrows[tableId] ?? '0') };
+    }
+
     await this.settlement.deposit(agentId, tableId, amount);
     const updated = this.store.adjustEscrow(agentId, tableId, amount);
     this.emit('agent', this.agentSnapshot(updated));
@@ -552,18 +673,36 @@ export class Orchestrator extends EventEmitter {
       }
     }
 
-    const escrowAvailable =
-      config.mode === 'WAGER' ? this.store.tableEscrow(agentId, tableId) : BigInt(agent.freeChips);
-
+    let escrowAvailable: Chips;
     if (config.mode === 'FREE') {
+      escrowAvailable = BigInt(agent.freeChips);
       if (BigInt(agent.freeChips) < buyIn) {
         throw new EngineError('INSUFFICIENT_FUNDS', `agent has ${agent.freeChips} play chips, needs ${buyIn}`);
       }
-    } else if (escrowAvailable < buyIn) {
-      throw new EngineError(
-        'INSUFFICIENT_FUNDS',
-        `escrow at ${tableId} is ${escrowAvailable}; deposit at least ${buyIn} first`,
-      );
+    } else if (this.settlement.clientSideDeposits) {
+      // The chain holds the agent's claim at a specific seat, so on-chain mode
+      // needs that seat up front — the server cannot move the tokens for it.
+      if (options.seat === undefined) {
+        throw new EngineError(
+          'ILLEGAL_STATE',
+          'on-chain mode requires an explicit seat, so you can fund exactly that seat with Poker.deposit',
+        );
+      }
+      escrowAvailable = await this.settlement.escrowOf(tableId, options.seat);
+      if (escrowAvailable < buyIn) {
+        throw new EngineError(
+          'INSUFFICIENT_FUNDS',
+          `on-chain escrow for seat ${options.seat} is ${escrowAvailable}; deposit at least ${buyIn} to it first`,
+        );
+      }
+    } else {
+      escrowAvailable = this.store.tableEscrow(agentId, tableId);
+      if (escrowAvailable < buyIn) {
+        throw new EngineError(
+          'INSUFFICIENT_FUNDS',
+          `escrow at ${tableId} is ${escrowAvailable}; deposit at least ${buyIn} first`,
+        );
+      }
     }
 
     const { table: next, seat } = seatAgent(table.state, {
@@ -577,6 +716,9 @@ export class Orchestrator extends EventEmitter {
 
     if (config.mode === 'FREE') {
       this.store.adjustFreeChips(agentId, -buyIn);
+    } else if (this.settlement.clientSideDeposits) {
+      // Cache what the chain says minus the chips now on the table.
+      this.store.setTableEscrow(agentId, tableId, escrowAvailable - buyIn);
     } else {
       this.store.adjustEscrow(agentId, tableId, -buyIn);
     }
@@ -602,6 +744,14 @@ export class Orchestrator extends EventEmitter {
 
     if (next.config.mode === 'FREE') {
       this.store.adjustFreeChips(agentId, cashOut + escrow);
+    } else if (this.settlement.clientSideDeposits) {
+      // FR-5.5: the agent releases its own on-chain escrow (`Poker.cashOut` is
+      // msg.sender-based). The server only frees the seat and stops claiming it.
+      this.store.setTableEscrow(agentId, tableId, 0n);
+      this.log(
+        'info',
+        `${agent.name} left ${tableId}#${seat.seat}; ${cashOut + escrow} remains escrowed on-chain — call Poker.cashOut to withdraw it`,
+      );
     } else {
       // The agent's whole claim on the table is the stack plus untouched escrow;
       // the settlement adapter releases both (FR-5.5).
@@ -609,7 +759,6 @@ export class Orchestrator extends EventEmitter {
       if (total > 0n) await this.settlement.cashOut(agentId, tableId, total);
       if (escrow > 0n) this.store.adjustEscrow(agentId, tableId, -escrow);
     }
-    void agent;
 
     table.nextHandAt = now + next.config.handIntervalMs;
     const snapshot = this.snapshot(table);

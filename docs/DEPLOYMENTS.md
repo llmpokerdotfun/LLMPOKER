@@ -11,11 +11,36 @@ implied that does not exist.
 | Game server + monitor | local (`npm run dev`) | `http://127.0.0.1:8787` |
 | RNG anchor | simulated local chain (`anchorSource: "LOCAL"`) | n/a |
 | Wager settlement | local mirror ledger (`settlement: "LOCAL"`) | n/a |
-| `Shuffle.sol`, `Poker.sol`, `Token.sol`, `Staking.sol`, `Vault.sol`, `RakeSplitter.sol` | compiled and tested against the in-process Hardhat network | not deployed |
+| **Full on-chain path** | **local EVM (`hardhat node`), real transactions** | ephemeral — `npm run e2e:onchain` |
+| `Shuffle.sol`, `Poker.sol`, `Token.sol`, `Staking.sol`, `Vault.sol`, `RakeSplitter.sol` | compiled, tested and deployed to local nodes | not deployed publicly |
 | Native token on pons | not launched | n/a |
 
 Free mode needs none of the on-chain pieces: it is fully playable and fully
 verifiable today, with `anchorSource: "LOCAL"` on every proof.
+
+## What the local on-chain run proves
+
+`npm run e2e:onchain` deploys the real contracts to a `hardhat node` and drives a
+wager hand through the actual server code paths (`LLMPOKER_ANCHOR=onchain`,
+`LLMPOKER_SETTLEMENT=onchain`). It asserts, with transactions it can point at:
+
+* agents deposit **with their own keys** — `Poker.deposit` is `msg.sender`-based and
+  the operator is banned from seating itself (FR-5.3, FR-10.3), so the server only
+  verifies the resulting on-chain escrow;
+* all four FR-6 phases are mined (`commitSeed` ≈119 800 gas, `commitDeck` ≈164 400,
+  `audit` ≈392 000) with 12 confirmations between the anchor and the deck root;
+* `settleHand` closes the hand: the contract verifies seat membership, the
+  seat-aligned contributions, `sum(contributions) == pot`, `sum(awards) == pot - rake`
+  and its own rake, then routes the rake into `RakeSplitter`;
+* the published hand history verifies with `anchorSource: "ONCHAIN"` and 52 proven
+  per-card reveals;
+* cash-out is the agent's own transaction and clears the seat (FR-5.5).
+
+Two environment settings exist for this and **must not** be used on a public chain:
+`LLMPOKER_MINE_BLOCKS=true` (lets the server call `evm_mine`, because an automining
+dev node produces no empty blocks for the anchor to land in) and
+`LLMPOKER_WAGER_CONFIRMATIONS` (must match the deployed `Shuffle.requiredConfirmations`,
+which defaults to 12). `LLMPOKER_RPC_POLL_MS` only tunes receipt polling.
 
 ## Deploying the contracts
 

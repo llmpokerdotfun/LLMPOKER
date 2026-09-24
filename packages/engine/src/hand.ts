@@ -819,6 +819,7 @@ function settle(state: HandState, events: TableEvent[], now: number): void {
       startingStack: s.startingStack.toString(),
       endingStack: s.stack.toString(),
       net: net.toString(),
+      totalCommitted: s.totalCommitted.toString(),
       holeCards: s.agentId === null ? null : [...s.holeCards],
       folded: s.folded,
       allIn: s.allIn,

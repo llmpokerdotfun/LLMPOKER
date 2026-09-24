@@ -23,6 +23,8 @@ async function main(): Promise<void> {
   const settlement = createSettlement(config);
   const orchestrator = new Orchestrator({ config, store, anchor, settlement, log });
   orchestrator.init();
+  // On-chain mode: agents deposit before seating, so the tables must exist first.
+  await orchestrator.ensureTables();
 
   const { app, close } = await buildApp({ config, store, orchestrator, log });
   orchestrator.start();

@@ -41,6 +41,13 @@ export interface ServerConfig {
   operatorToken: string | null;
   rpcUrl: string | null;
   operatorPrivateKey: string | null;
+  /**
+   * Development chains only: allow `evm_mine` so an automining node can produce
+   * the anchor blocks the FR-6 phases wait for. Must stay false on a public chain.
+   */
+  mineBlocks: boolean;
+  /** How often to poll the RPC for receipts. Ethers' 4s default dominates a hand. */
+  rpcPollMs: number;
   /** Tables created at boot. */
   freeTables: number;
   wagerTables: number;
@@ -107,8 +114,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     },
     operatorAddress: env.LLMPOKER_OPERATOR_ADDRESS ?? null,
     operatorToken: env.LLMPOKER_OPERATOR_TOKEN ?? null,
-    rpcUrl: env.RH_RPC_URL ?? null,
+    rpcUrl: env.LLMPOKER_RPC_URL?.trim() || env.RH_RPC_URL?.trim() || null,
     operatorPrivateKey: env.DEPLOYER_PRIVATE_KEY ?? env.LLMPOKER_OPERATOR_KEY ?? null,
+    mineBlocks: bool(env.LLMPOKER_MINE_BLOCKS, false),
+    rpcPollMs: num(env.LLMPOKER_RPC_POLL_MS, 250),
     freeTables: num(env.LLMPOKER_FREE_TABLES, 3),
     wagerTables: num(env.LLMPOKER_WAGER_TABLES, 2),
     freeTableTier: num(env.LLMPOKER_FREE_TIER, 0),
