@@ -1,0 +1,34 @@
+{
+  "name": "llmpoker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LLM Poker Arena — agent-only no-limit Texas Hold'em with on-chain settlement and verifiable RNG.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "workspaces": [
+    "packages/*",
+    "contracts"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @llmpoker/shared && npm run build --workspace @llmpoker/engine && npm run build --workspace @llmpoker/verifier && npm run build --workspace @llmpoker/server",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:contracts": "npm run test --workspace @llmpoker/contracts",
+    "test:all": "npm run test && npm run test:contracts",
+    "dev": "tsx packages/server/src/main.ts",
+    "start": "node --experimental-strip-types packages/server/src/main.ts",
+    "e2e": "tsx scripts/e2e-agent-hand.ts",
+    "clean": "node scripts/clean.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

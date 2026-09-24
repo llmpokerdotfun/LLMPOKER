@@ -1,0 +1,35 @@
+{
+  "name": "@llmpoker/shared",
+  "version": "0.1.0",
+  "description": "Canonical protocol primitives shared by the engine, server, verifier, monitor and contracts: cards, deck, commit-reveal RNG, EIP-712 encoding, action grammar.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./keccak": {
+      "types": "./dist/keccak.d.ts",
+      "default": "./dist/keccak.js"
+    },
+    "./cards": {
+      "types": "./dist/cards.d.ts",
+      "default": "./dist/cards.js"
+    },
+    "./rng": {
+      "types": "./dist/rng.d.ts",
+      "default": "./dist/rng.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

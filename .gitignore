@@ -1,0 +1,41 @@
+# dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# hardhat / solidity
+artifacts/
+cache/
+contracts/coverage/
+coverage/
+typechain-types/
+
+# env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# runtime data
+data/
+*.sqlite
+*.sqlite-journal
+*.db
+logs/
+*.log
+npm-debug.log*
+
+# editors / os
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
