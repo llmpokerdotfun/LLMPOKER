@@ -29,6 +29,7 @@ import {
   panel,
   renderChrome,
   requireElement,
+  rngPhaseBadge,
   showBanner,
   startClock,
   statusBadge,
@@ -212,13 +213,14 @@ async function renderList(route) {
     { label: 'rake' },
     { label: 'players', className: 'num' },
     { label: 'winner(s)' },
-    { label: 'commitment' },
-    { label: 'N / N+1 / M' },
+    { label: 'commitment (FR-6.1)' },
+    { label: 'deck root (FR-6.2)' },
+    { label: 'audit (FR-6.4)' },
     { label: 'proof' },
   ]);
 
   if (hands.length === 0) {
-    tbody.appendChild(emptyRow(13, 'No hands match these filters.'));
+    tbody.appendChild(emptyRow(14, 'No hands match these filters.'));
   }
   for (const hand of hands) {
     tbody.appendChild(
@@ -240,8 +242,14 @@ async function renderList(route) {
         h('td', null, moneyEl(hand.totalRake, { maxFractionDigits: 6 })),
         h('td', { class: 'num', text: formatInt(hand.playerCount) }),
         h('td', { text: winnersText(hand) }),
-        h('td', null, h('code', { class: 'hash', text: shortHex(hand.commitment, 10, 6), title: hand.commitment || 'no commitment in this summary' })),
-        h('td', { class: 'nowrap muted', text: `${blockText(hand.commitBlock)} / ${blockText(hand.anchorBlock)} / ${blockText(hand.revealBlock)}` }),
+        h(
+          'td',
+          null,
+          h('code', { class: 'hash', text: shortHex(hand.commitment, 10, 6), title: hand.commitment || 'no commitment in this summary' }),
+          h('span', { class: 'muted small block', text: `N ${blockText(hand.commitBlock)} · anchor ${blockText(hand.anchorBlock)}` }),
+        ),
+        h('td', null, deckRootCell(hand)),
+        h('td', { class: 'nowrap' }, auditCell(hand)),
         h(
           'td',
           { class: 'nowrap' },
@@ -285,7 +293,11 @@ async function renderList(route) {
       h(
         'p',
         { class: 'note' },
-        'Every row carries the commit-reveal proof fields. Open ',
+        'Every row carries the FR-6 commit-reveal fields: the phase-1 seed commitment, the phase-2 ',
+        h('strong', { text: 'deck root' }),
+        ' and whether the phase-4 ',
+        h('strong', { text: 'audit' }),
+        ' opened them. Open ',
         h('strong', { text: 'proof' }),
         ' to recompute the shuffle in this browser and compare it with the server verdict.',
       ),
@@ -293,6 +305,33 @@ async function renderList(route) {
       pager,
     ),
   );
+}
+
+/**
+ * FR-6.2: the committed Merkle root for the hand. `null` on a row that has not
+ * committed a deck yet — that is "not published", never "no data".
+ *
+ * @param {HandSummary} hand
+ * @returns {HTMLElement}
+ */
+function deckRootCell(hand) {
+  if (typeof hand.deckRoot === 'string' && hand.deckRoot !== '') {
+    return h('code', { class: 'hash', text: shortHex(hand.deckRoot, 10, 6), title: hand.deckRoot });
+  }
+  return h('span', { class: 'muted', text: hand.fromLive ? 'pending audit' : 'not committed' });
+}
+
+/**
+ * FR-6.4: whether the end-of-hand audit published the seed, salts and ordering.
+ *
+ * @param {HandSummary} hand
+ * @returns {HTMLElement}
+ */
+function auditCell(hand) {
+  if (hand.fromLive) return badge('pending', 'pending', 'the live delta does not carry the audit yet');
+  return hand.audited
+    ? badge('AUDITED', 'verified', 'FR-6.4: seed, entropy, salts and the full deck ordering were published and matched the commitment')
+    : badge('not audited', 'pending', 'the FR-6.4 audit is missing, so the committed deck was never opened');
 }
 
 /**
@@ -400,6 +439,14 @@ function handHeader(history, route) {
           ? badge('verified', 'verified', 'stack deltas sum to zero across all seats')
           : badge('not verified', 'failed', 'the engine did not assert zero-sum settlement for this hand'),
       ),
+      stat('FR-6 phase', rngPhaseBadge(history.proof.phase)),
+      stat('deck root (FR-6.2)', deckRootNode(history.proof.deckRoot)),
+      stat(
+        'audited (FR-6.4)',
+        history.proof.audited
+          ? badge('AUDITED', 'verified', 'the audit published deckSeed, entropy, the 52 salts and the deck ordering')
+          : badge('not audited', 'pending', 'the committed deck has not been opened yet'),
+      ),
       stat(
         'proof (server flag)',
         history.proof.verified
@@ -434,6 +481,7 @@ function stat(label, value) {
  */
 function handBody(history) {
   const result = history.result;
+  const proof = history.proof;
   return h(
     'div',
     { class: 'detail-stack' },
@@ -451,6 +499,8 @@ function handBody(history) {
         h(
           'dl',
           { class: 'kv-inline wide' },
+          h('dt', { text: 'FR-6 phase' }),
+          h('dd', null, rngPhaseBadge(proof.phase)),
           h('dt', { text: 'dealing order (from SB)' }),
           h('dd', { text: (result.dealingOrder ?? []).join(' → ') || '—' }),
           h('dt', { text: 'burns' }),
@@ -459,12 +509,74 @@ function handBody(history) {
           h('dd', {
             text: `${formatInt((result.dealingOrder?.length ?? 0) * 2 + ((result.burns?.length ?? 0) > 0 ? 8 : 5))} of 52 (RNG.md §4)`,
           }),
-          h('dt', { text: 'deck length published' }),
-          h('dd', { text: `${formatInt(history.deck?.length ?? 0)} cards` }),
+          h('dt', { text: 'deck ordering published' }),
+          h('dd', null, deckPublication(proof, history.deck)),
+          h('dt', { text: 'cards made public (FR-6.3)' }),
+          h('dd', null, revealSummary(proof)),
         ),
+        h('p', {
+          class: 'note',
+          text:
+            'While a hand is live FR-6 forbids publishing the seed, the 52 salts and the deck ordering, so "0 of 52 cards published" means ' +
+            'not yet published — it is the required state, not missing data. The full ordering appears only with the phase-4 audit.',
+        }),
       ),
     ),
   );
+}
+
+/**
+ * @param {string|null} deckRoot
+ * @returns {HTMLElement}
+ */
+function deckRootNode(deckRoot) {
+  if (typeof deckRoot === 'string' && deckRoot !== '') {
+    return h('code', { class: 'hash', text: shortHex(deckRoot, 12, 8), title: deckRoot });
+  }
+  return h('span', { class: 'muted', text: 'not committed' });
+}
+
+/**
+ * FR-6: an empty `deck` while the hand is live is the **required** state.
+ *
+ * @param {import('../types.js').RngProof} proof
+ * @param {number[]|null|undefined} topLevelDeck the `deck` field of `/api/v1/hands/:id`
+ * @returns {HTMLElement}
+ */
+function deckPublication(proof, topLevelDeck) {
+  const deck = Array.isArray(proof.deck) ? proof.deck : [];
+  const legacy = Array.isArray(topLevelDeck) ? topLevelDeck.length : 0;
+  const live = proof.phase === 'SEED_COMMITTED' || proof.phase === 'DECK_COMMITTED' || proof.phase === 'NONE';
+  if (deck.length > 0) {
+    return h('span', { text: `${formatInt(deck.length)} of 52 cards, published with the FR-6.4 audit` });
+  }
+  if (live) {
+    return h('span', {
+      class: 'muted',
+      title: legacy > 0 ? `the legacy top-level deck field carries ${legacy} cards` : null,
+      text: `withheld until the FR-6.4 audit (0 of 52 published)`,
+    });
+  }
+  if (proof.phase === 'VOIDED') {
+    return h('span', { class: 'muted', text: 'a voided hand publishes no ordering (0 of 52) — by design' });
+  }
+  return h('span', { class: 'muted', text: 'the audit published no ordering (0 of 52), which fails FR-6.4' });
+}
+
+/**
+ * FR-6.3: the cards the rules made public, versus the commitments that stayed
+ * hidden. Never renders a card value — only the count.
+ *
+ * @param {import('../types.js').RngProof} proof
+ * @returns {HTMLElement}
+ */
+function revealSummary(proof) {
+  const reveals = Array.isArray(proof.reveals) ? proof.reveals : [];
+  const distinct = new Set(reveals.map((reveal) => reveal.index));
+  const hidden = Math.max(0, 52 - distinct.size);
+  return h('span', {
+    text: `${formatInt(distinct.size)} of 52 deck positions revealed — the other ${formatInt(hidden)} remained hidden commitments`,
+  });
 }
 
 /**

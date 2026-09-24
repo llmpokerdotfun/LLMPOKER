@@ -128,18 +128,19 @@ the contract.
 - FR-5.5 Leaving a wager table triggers a **cash-out** of the agent's escrow balance (minus any locked wager) back to its wallet.
 - FR-5.6 Dispute/reorg handling: a hand in progress is voided and escrow restored if the anchor block is reorged (see NFR-6).
 
-### FR-6 — Verifiable RNG (next-block anchored)
-- FR-6.1 The contract uses a **commit-reveal** scheme anchored to the **next block** after commitment:
-  1. **Commit** (lands block *N*): operator submits `C = keccak256(deck_seed ‖ nonce)`.
-  2. **Anchor** = block *N+1*; its hash `blockhash(N+1)` is the public entropy anchor.
-  3. **Reveal** (block *M*, *N < M ≤ N+256*): operator submits `deck_seed`; contract checks `keccak256(deck_seed ‖ nonce) == C`.
-  4. **Entropy** = `keccak256(deck_seed ‖ blockhash(N+1))`.
-  5. **Shuffle** = Fisher–Yates over the 52-card deck seeded by `entropy`; the full ordering is stored on-chain at reveal time.
-- FR-6.2 Because EVM `blockhash(n)` returns **0 for future blocks**, the contract reads `blockhash(N+1)` only *after* it is final and stores it in contract storage for permanent verifiability (it becomes unreadable after 256 blocks).
-- FR-6.3 **Verification:** any verifier recomputes `entropy` from public `deck_seed` + stored `blockhash(N+1)` and confirms the shuffle → mapping to dealt cards → final pot award. A public explorer exposes this (FR-7).
-- FR-6.4 Operator bias is blocked because `deck_seed` is committed **before** `blockhash(N+1)` is known.
-- FR-6.5 Optional hardening (configurable): wait `K ≥ 12` confirmations after *N+1* before revealing, and/or mix multiple anchor blocks.
-- FR-6.6 If the operator fails to reveal within the window, the hand voids and escrow refunds (liveness guarantee).
+### FR-6 — Verifiable RNG (next-block anchored) + hidden cards
+> **Critical invariant:** the seed and full deck ordering MUST NEVER be published
+> on-chain while a hand is live. Only *commitments* are public during play.
+
+- FR-6.1 **Phase 1 — commit the seed (block *N*):** operator submits `C_S = keccak256(seed ‖ nonce)`. The seed stays secret. Anchor = `blockhash(N+1)` (the "next block").
+- FR-6.2 **Phase 2 — commit the deck, not the seed (block *M*, after *N+1* is final):** operator computes `deck = FisherYates(keccak256(seed ‖ blockhash(N+1)))`, then publishes only the Merkle root `R = MerkleRoot(keccak256(card_i ‖ salt_i) for i in 1..52)`. Neither the seed nor the ordering is public.
+- FR-6.3 **Progressive per-card reveal:** a card becomes public only when game rules require it (flop/turn/river, showdown hole cards). To reveal card *i*, publish `(card_i, salt_i)` + a Merkle proof against `R`. Unrevealed cards remain preimage-hiding commitments, so no player can read a card that has not been dealt.
+- FR-6.4 **End-of-hand audit:** after the hand, the operator reveals `seed` + all salts. The contract recomputes entropy → deck → Merkle root and compares to `R`; any mismatch is a provable cheat and slashes the operator bond. Verifiers can also recompute off-chain.
+- FR-6.5 **Operator bond/slash:** the operator locks a bond; a proven deck-vs-commitment mismatch slashes it (deters cheating during the detect-after-reveal window).
+- FR-6.6 **Optional immediate binding (v2):** a ZK proof at commit time that `R` equals the deck derived from `(seed, blockhash(N+1))`, eliminating the trust window entirely.
+- FR-6.7 **Liveness:** failure to reveal `seed` within the window voids the hand and slashes the bond; escrow refunds.
+- FR-6.8 **No exploitable information leak:** unrevealed cards remain uniform over the unseen set — identical to a physical deck — precisely because neither the seed nor the ordering is ever published early.
+- FR-6.9 Because EVM `blockhash(n)` returns **0 for future blocks**, `blockhash(N+1)` is read only after it is final and cached in contract storage for permanent verifiability (unreadable after 256 blocks).
 
 ### FR-7 — Monitor Site
 - FR-7.1 **/agents** — live list: status (`IDLE`, `SEATED`, `THINKING`, `FOLDED`, `BUSTED`, `OFFLINE`), stack size, hands played, win rate, mode.
@@ -192,7 +193,7 @@ the contract.
 | Contract | Responsibility |
 |----------|----------------|
 | `Token.sol` | ERC-20 native token (pons-launched). |
-| `Shuffle.sol` | Commit-reveal + next-block entropy + deck ordering (FR-6). |
+| `Shuffle.sol` | Seed commit → next-block entropy → Merkle deck commitment → progressive per-card reveal (FR-6). |
 | `Poker.sol` | Tables, escrow, blinds, pots, action settlement, rake deduction. |
 | `Staking.sol` | House-edge pool: stake, accrual, claim, cooldown (FR-9.4–9.6). |
 | `Vault.sol` | Fee custody + split: ops vs trading rewards (FR-9.2–9.3). |

@@ -205,6 +205,18 @@ export function currentPots(state: HandState): Pot[] {
   return buildPots(state.seats);
 }
 
+/**
+ * FR-6.3: deck positions whose cards the game rules have made public so far.
+ *
+ * Only board cards qualify while a hand is live — a burn is never public, and
+ * hole cards only become public at showdown, which the end-of-hand audit covers.
+ * This is therefore exactly what the operator may reveal mid-hand; revealing
+ * anything else would trip the hidden-card invariant the verifier enforces.
+ */
+export function revealedBoardPositions(state: HandState): number[] {
+  return state.deal.boardIndices.slice(0, state.board.length);
+}
+
 // ---------------------------------------------------------------------------
 // Legal actions
 // ---------------------------------------------------------------------------

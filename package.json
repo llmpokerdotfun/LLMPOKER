@@ -22,7 +22,7 @@
     "dev": "tsx packages/server/src/main.ts",
     "start": "node packages/server/dist/main.js",
     "e2e": "tsx scripts/e2e-agent-hand.ts",
-    "vectors": "tsx scripts/gen-rng-vectors.ts",
+    "vectors": "tsx scripts/gen-rng-vectors.ts && tsx scripts/gen-merkle-vectors.ts",
     "fix:encoding": "tsx scripts/fix-encoding.ts",
     "clean": "node scripts/clean.mjs"
   },

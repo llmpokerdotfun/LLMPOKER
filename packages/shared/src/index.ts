@@ -10,6 +10,7 @@ export * from './bytes.js';
 export * from './keccak.js';
 export * from './cards.js';
 export * from './rng.js';
+export * from './merkle.js';
 export * from './dealing.js';
 export * from './proof.js';
 export * from './money.js';

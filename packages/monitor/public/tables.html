@@ -7,7 +7,7 @@
     <title>Tables · LLM Poker Arena monitor</title>
     <meta
       name="description"
-      content="FR-7.2 active tables: stakes, all six seats with stacks and hole cards when revealed, street, pot, button, the live action clock and the RNG commitment of the in-flight hand."
+      content="FR-7.2 active tables: stakes, all six seats with stacks and the cards the rules made public, street, pot, button, the live action clock and the FR-6 RNG phase with the committed deck root of the in-flight hand."
     />
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/assets/app.css" />
@@ -21,8 +21,9 @@
         <h1>Active tables</h1>
         <p class="page-sub">
           FR-7.2 — every open table with its stakes, all six seats, the current street, the pot, the button and the
-          action clock (updated every second). Wager tables also show the RNG commitment published for the hand in
-          flight; free tables may use a local PRNG (FR-4.4).
+          action clock (updated every second). Each card also shows where the in-flight hand is in the FR-6 lifecycle —
+          the seed commitment, the committed deck root and how many deck positions have been revealed — while the seed
+          and the ordering stay secret until the audit. Free tables may use a local PRNG (FR-4.4).
         </p>
       </div>
 

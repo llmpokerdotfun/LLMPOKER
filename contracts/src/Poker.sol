@@ -170,9 +170,11 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     error HandNotOpen(bytes32 handId, HandStatus status);
     /// @notice `settleHand` while paused (FR-10.5).
     error SettlementPaused();
-    /// @notice The hand's shuffle was never revealed on-chain (FR-6).
-    error ShuffleNotRevealed(bytes32 handId);
-    /// @notice The hand's shuffle voided, so it can only be voided here (FR-6.6).
+    /// @notice The hand has no phase-1 shuffle commitment yet (FR-6.1).
+    error ShuffleNotCommitted(bytes32 handId);
+    /// @notice The hand's shuffle deck root was never committed, so it cannot settle (FR-6.2).
+    error ShuffleDeckNotCommitted(bytes32 handId);
+    /// @notice The hand's shuffle voided, so it can only be voided here (FR-6.7).
     error ShuffleVoided(bytes32 handId);
     /// @notice The hand's shuffle is still pending, so it cannot be voided yet.
     error ShuffleStillPending(bytes32 handId);
@@ -342,7 +344,7 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         if (seats.length < 2 || seats.length > table.config.maxSeats) {
             revert InvalidSeat(seats.length, table.config.maxSeats);
         }
-        if (shuffle.commitmentOf(handId) == bytes32(0)) revert ShuffleNotRevealed(handId);
+        if (!shuffle.hasCommitment(handId)) revert ShuffleNotCommitted(handId);
 
         Hand storage hand = _hands[tableId][handId];
         if (hand.status != HandStatus.None) revert HandNotOpen(handId, hand.status);
@@ -435,9 +437,14 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         if (hand.status == HandStatus.None) revert UnknownHand(tableId, handId);
         if (hand.status != HandStatus.Open) revert HandNotOpen(handId, hand.status);
 
-        IShuffle.State shuffleState = shuffle.stateOf(handId);
-        if (shuffleState == IShuffle.State.Voided) revert ShuffleVoided(handId);
-        if (shuffleState != IShuffle.State.Revealed) revert ShuffleNotRevealed(handId);
+        // FR-6.2: a hand can only settle against a committed (hidden) deck root. The contract does
+        // not need the ordering to move chips — the engine reports the winners, and the deck is
+        // auditable later — so no card, seed or ordering is required here.
+        IShuffle.Phase shufflePhase = shuffle.phaseOf(handId);
+        if (shufflePhase == IShuffle.Phase.Voided) revert ShuffleVoided(handId);
+        if (shufflePhase != IShuffle.Phase.DeckCommitted && shufflePhase != IShuffle.Phase.Audited) {
+            revert ShuffleDeckNotCommitted(handId);
+        }
 
         uint256 pot = hand.pot;
         if (pot == 0) revert ContributionMismatch(0, 0);
@@ -475,12 +482,16 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @notice Void a hand and restore every contribution to escrow (FR-5.6, FR-6.6).
-     * @dev Permissionless by design: the liveness guarantee must not depend on the operator.
-     *      Only reachable once `Shuffle` has actually voided the hand, so it cannot be used to
-     *      escape a losing settlement while the shuffle is still pending.
+     * @notice Void a hand whose shuffle voided, restoring every contribution to escrow.
+     * @dev FR-5.6, FR-6.7. Permissionless by design: the liveness guarantee must not depend on the
+     *      operator. Reachable once `Shuffle` has recorded a `Voided` phase, which covers both
+     *      liveness failures — no deck root inside the reveal window, and a deck root whose audit
+     *      never arrived — as well as the reorg case where the anchor block was orphaned and the
+     *      reveal window expired (NFR-6). Because `Shuffle.void` already returns early for handed
+     *      states, this cannot be used to escape a losing settlement, and it can only ever move
+     *      chips back to the seats that contributed them.
      * @param tableId Table identifier.
-     * @param handId Open hand whose shuffle timed out.
+     * @param handId Open hand whose shuffle voided.
      */
     function voidHand(bytes32 tableId, bytes32 handId) external nonReentrant {
         Table storage table = _tables[tableId];
@@ -490,9 +501,7 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         if (hand.status == HandStatus.None) revert UnknownHand(tableId, handId);
         if (hand.status != HandStatus.Open) revert HandNotOpen(handId, hand.status);
 
-        IShuffle.State shuffleState = shuffle.stateOf(handId);
-        if (shuffleState == IShuffle.State.Revealed) revert ShuffleStillPending(handId);
-        if (shuffleState != IShuffle.State.Voided) revert ShuffleStillPending(handId);
+        if (shuffle.phaseOf(handId) != IShuffle.Phase.Voided) revert ShuffleStillPending(handId);
 
         uint256 restored = 0;
         for (uint256 i = 0; i < hand.seatCount; ++i) {
@@ -507,47 +516,6 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         table.pendingHands -= 1;
 
         emit HandVoided(tableId, handId, restored, "SHUFFLE_VOIDED");
-    }
-
-    /**
-     * @notice Void a hand whose shuffle fell outside the blockhash window.
-     * @dev FR-5.6, NFR-6. This is the reorg path: a reorg can orphan the anchor block so that
-     *      the operator can no longer reveal inside the window, leaving `Shuffle` permanently
-     *      `Committed`. Without this path the participants' chips would be stranded, so the
-     *      owner (the same authority that can pause settlement) may restore escrow once the
-     *      reveal window has provably expired. It can never settle a hand or move chips
-     *      anywhere but back to the seats that contributed them.
-     * @param tableId Table identifier.
-     * @param handId Open hand whose reveal window expired.
-     */
-    function voidInvalidAnchor(bytes32 tableId, bytes32 handId) external onlyOwner nonReentrant {
-        Table storage table = _tables[tableId];
-        if (!table.exists) revert UnknownTable(tableId);
-
-        Hand storage hand = _hands[tableId][handId];
-        if (hand.status == HandStatus.None) revert UnknownHand(tableId, handId);
-        if (hand.status != HandStatus.Open) revert HandNotOpen(handId, hand.status);
-
-        IShuffle.State shuffleState = shuffle.stateOf(handId);
-        if (shuffleState == IShuffle.State.Revealed) revert ShuffleStillPending(handId);
-        if (shuffleState == IShuffle.State.Voided) revert ShuffleVoided(handId);
-
-        uint256 voidableFrom = shuffle.voidableFromBlockOf(handId);
-        if (block.number < voidableFrom) revert ShuffleStillPending(handId);
-
-        uint256 restored = 0;
-        for (uint256 i = 0; i < hand.seatCount; ++i) {
-            uint8 seat = hand.participants[i];
-            uint256 amount = contributionOf[tableId][handId][seat];
-            if (amount == 0) continue;
-            escrowOf[_seatKey(tableId, seat)] += amount;
-            contributionOf[tableId][handId][seat] = 0;
-            restored += amount;
-        }
-        hand.status = HandStatus.Voided;
-        table.pendingHands -= 1;
-
-        emit HandVoided(tableId, handId, restored, "ANCHOR_INVALID");
     }
 
     /**

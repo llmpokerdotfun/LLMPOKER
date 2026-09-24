@@ -1010,8 +1010,10 @@ describe('LLM Poker Arena server', () => {
           const real = await original.blockHash(block);
           return hashReads >= 2 ? `0x${'ab'.repeat(32)}` : real;
         },
-        submitCommitment: (handId, commitment) => original.submitCommitment(handId, commitment),
-        submitReveal: (handId, seed) => original.submitReveal(handId, seed),
+        commitSeed: (handId, commitment, nonce) => original.commitSeed(handId, commitment, nonce),
+        commitDeck: (handId, root, leaves) => original.commitDeck(handId, root, leaves),
+        revealCard: (handId, index, card, salt, proof) => original.revealCard(handId, index, card, salt, proof),
+        audit: (handId, seed, deck, salts) => original.audit(handId, seed, deck, salts),
         isFinal: (block, confirmations) => original.isFinal(block, confirmations),
         close: () => original.close(),
       };

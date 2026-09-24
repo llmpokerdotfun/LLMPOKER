@@ -108,6 +108,11 @@ Client → server: `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`.
 Server → client: `WELCOME`, `SUBSCRIBED`, `MONITOR_SNAPSHOT`, `MONITOR_EVENT`,
 `TABLE_STATE`, `TABLE_EVENT`, `ACTION_REQUIRED`, `HAND_COMPLETE`, `PONG`, `ERROR`.
 
+The RNG phases are visible as they happen: `RNG_SEED_COMMITTED` (phase 1),
+`RNG_DECK_COMMITTED` (the Merkle deck root, phase 2), `CARD_REVEALED` (one card the
+rules turned face-up, with its Merkle proof — the **only** way a card becomes public
+mid-hand), `RNG_AUDITED` (the end-of-hand audit) and `RNG_VOIDED`.
+
 `ACTION_REQUIRED` is the only message carrying private hole cards, and it is sent
 **only** to sockets authenticated as the seat on the clock. The public table event
 stream deserialises hole cards as card ids that are never exposed until showdown —
@@ -121,7 +126,7 @@ this is asserted by the engine's own event-stream privacy test.
 |---|---|---|
 | GET | `/api/v1/hands?limit=&offset=&tableId=&agentId=&mode=` | `{ hands: HandSummary[], total }` |
 | GET | `/api/v1/hands/{id}` | `{ result, proof, deck, config }` — everything needed to verify |
-| GET | `/api/v1/verify/hands/{id}` | the server's own `{ proof, deal, settlement }` verdicts |
+| GET | `/api/v1/verify/hands/{id}` | the server's own `{ proof, reveals, deal, settlement }` verdicts |
 | GET | `/api/v1/monitor/agents` | `{ agents: AgentSnapshot[], updatedAt }` |
 | GET | `/api/v1/leaderboards?mode=FREE\|WAGER` | `{ rows }` |
 | GET | `/api/v1/health` | chain, anchor kind, settlement kind, table/agent/hand counts |

@@ -1,22 +1,29 @@
 /**
- * The anchor provider (FR-6) and the settlement adapter (FR-5).
+ * The RNG pipeline (FR-6) and the settlement adapter (FR-5).
  *
- * Two implementations of each:
+ * Under the patched FR-6 the operator runs four phases per hand, and the *only*
+ * thing that ever becomes public while a hand is live is a commitment or a card
+ * the rules required:
  *
- * * **LOCAL** — a simulated chain used for free-mode play and for tests. It
- *   produces real random block hashes *at production time*, so the fairness
- *   property still holds (the seed is committed before the anchor hash exists);
- *   it simply is not a public chain. Every proof it produces is labelled
- *   `LOCAL`, never passed off as a chain anchor.
- * * **ONCHAIN** — an ethers client against Robinhood Chain. Commitments and
- *   reveals are published as 0-value transactions with the payload in calldata,
- *   which needs no deployed contract, and the anchor hash is read from the block
- *   after the commit. The `Shuffle.sol` contract provides the on-chain-stored
- *   variant used by `Poker.sol` for settlement.
+ * 1. `commitSeed`  — `keccak256(seed ‖ nonce)`; the seed stays secret.
+ * 2. `commitDeck`  — the Merkle root over `keccak256(card_i ‖ salt_i)`; the
+ *    ordering and every salt stay secret.
+ * 3. `revealCard`  — one `(index, card, salt, proof)` per public card.
+ * 4. `audit`       — after the hand, the seed and all salts, so the commitment
+ *    can be proven forever.
+ *
+ * Two implementations:
+ *
+ * * **LOCAL** — a simulated chain for free-mode play and tests. Block hashes are
+ *   drawn from the CSPRNG when the block is produced, so the fairness property
+ *   still holds (the seed is fixed before the anchor exists); it simply is not a
+ *   public chain. Every proof it produces is labelled `LOCAL`.
+ * * **ONCHAIN** — an ethers client. `Shuffle.sol` is called for all four phases;
+ *   commitments and reveals are transactions on Robinhood Chain.
  */
 
 import { EventEmitter } from 'node:events';
-import { bytesToHex, hexToBytes, keccak256Concat, randomDeckSeed, uint256ToBytes } from '@llmpoker/shared';
+import { bytesToHex, keccak256Concat, randomDeckSeed, uint256ToBytes } from '@llmpoker/shared';
 import type { AnchorMode, ServerConfig } from './config.js';
 
 export interface BlockRef {
@@ -25,14 +32,26 @@ export interface BlockRef {
   txHash: string;
 }
 
+/** The `Shuffle.sol` surface the server calls, in the order FR-6 uses it. */
+interface ShuffleContract {
+  commitSeed(handId: string, seedCommitment: string, nonce: bigint): Promise<{ hash: string }>;
+  commitDeck(handId: string, deckRoot: string, leaves: string[]): Promise<{ hash: string }>;
+  revealCard(handId: string, deckIndex: number, card: number, salt: string, proof: string[]): Promise<{ hash: string }>;
+  audit(handId: string, deckSeed: string, cards: number[], salts: string[]): Promise<{ hash: string }>;
+}
+
 export interface AnchorProvider {
   readonly kind: 'LOCAL' | 'ONCHAIN';
   currentBlock(): Promise<number>;
   blockHash(block: number): Promise<string>;
-  /** Publishes the commitment; returns the block it landed in. */
-  submitCommitment(handId: string, commitment: string): Promise<BlockRef>;
-  /** Publishes the reveal; returns the block it landed in. */
-  submitReveal(handId: string, deckSeed: string): Promise<BlockRef>;
+  /** FR-6.1 phase 1: publish the seed commitment. The seed itself stays secret. */
+  commitSeed(handId: string, commitment: string, nonce: bigint): Promise<BlockRef>;
+  /** FR-6.2 phase 2: publish the Merkle deck root (never the ordering). */
+  commitDeck(handId: string, deckRoot: string, leaves: readonly string[]): Promise<BlockRef>;
+  /** FR-6.3 phase 3: publish one card the rules made public, with its proof. */
+  revealCard(handId: string, index: number, card: number, salt: string, proof: readonly string[]): Promise<BlockRef>;
+  /** FR-6.4 phase 4: publish the seed and all salts once the hand is over. */
+  audit(handId: string, deckSeed: string, deck: readonly number[], salts: readonly string[]): Promise<BlockRef>;
   /** True once `block` + `confirmations` has been produced. */
   isFinal(block: number, confirmations: number): Promise<boolean>;
   close(): Promise<void>;
@@ -89,22 +108,46 @@ export class LocalChain extends EventEmitter implements AnchorProvider {
     return hash;
   }
 
-  private record(kind: 'commit' | 'reveal', handId: string, payload: string): BlockRef {
-    const txHash = `0x${bytesToHex(keccak256Concat([new TextEncoder().encode(kind), hexToBytes(payload), uint256ToBytes(BigInt(this.block))]))}`;
+  private record(kind: 'seed' | 'deck' | 'card' | 'audit', handId: string, payload: string): BlockRef {
+    const txHash = `0x${bytesToHex(
+      keccak256Concat([
+        new TextEncoder().encode(kind),
+        new TextEncoder().encode(handId),
+        new TextEncoder().encode(payload),
+        uint256ToBytes(BigInt(this.block)),
+      ]),
+    )}`;
     const ref: BlockRef = { block: this.block, hash: payload, txHash };
     this.txHashes.set(`${kind}:${handId}`, ref);
     return ref;
   }
 
-  async submitCommitment(handId: string, commitment: string): Promise<BlockRef> {
-    // Simulated mining latency: one block for the commitment to land.
+  async commitSeed(handId: string, commitment: string, nonce: bigint): Promise<BlockRef> {
+    // Simulated mining latency: one block for the commitment to land. Only the
+    // commitment is recorded — never the seed.
     this.produceBlock(1);
-    return this.record('commit', handId, commitment);
+    return this.record('seed', handId, `${commitment}:${nonce}`);
   }
 
-  async submitReveal(handId: string, deckSeed: string): Promise<BlockRef> {
+  async commitDeck(handId: string, deckRoot: string, leaves: readonly string[]): Promise<BlockRef> {
     this.produceBlock(1);
-    return this.record('reveal', handId, deckSeed);
+    // Only the root and its leaves are public here; no card value is derivable.
+    return this.record('deck', handId, `${deckRoot}:${leaves.length}`);
+  }
+
+  async revealCard(
+    handId: string,
+    index: number,
+    card: number,
+    salt: string,
+    proof: readonly string[],
+  ): Promise<BlockRef> {
+    return this.record('card', handId, `${deckRootKey(handId, index)}:${card}:${salt}:${proof.length}`);
+  }
+
+  async audit(handId: string, deckSeed: string, deck: readonly number[], salts: readonly string[]): Promise<BlockRef> {
+    this.produceBlock(1);
+    return this.record('audit', handId, `${deckSeed}:${deck.length}:${salts.length}`);
   }
 
   async isFinal(block: number, confirmations: number): Promise<boolean> {
@@ -114,6 +157,11 @@ export class LocalChain extends EventEmitter implements AnchorProvider {
   async close(): Promise<void> {
     this.stop();
   }
+}
+
+/** Keeps the local bookkeeping key readable without leaking the payload. */
+function deckRootKey(handId: string, index: number): string {
+  return `${handId}#${index}`;
 }
 
 /**
@@ -129,6 +177,7 @@ export class OnChainAnchor implements AnchorProvider {
   constructor(
     private readonly rpcUrl: string,
     private readonly privateKey: string,
+    private readonly shuffleAddress: string | null,
   ) {
     if (!rpcUrl || !privateKey) throw new Error('on-chain anchoring requires RH_RPC_URL and an operator private key');
   }
@@ -157,23 +206,75 @@ export class OnChainAnchor implements AnchorProvider {
     return found.hash;
   }
 
-  private async send(payload: Uint8Array): Promise<BlockRef> {
-    const { Wallet, hexlify } = await this.ethers();
+  /**
+   * Calls `Shuffle.sol` for every FR-6 phase. The fragments below mirror
+   * `contracts/src/interfaces/IShuffle.sol`; if the contract surface changes,
+   * this is the one place the server has to follow.
+   *
+   * NOTE: this path has never been exercised against a live RPC in this
+   * repository. It refuses to construct without an RPC URL, an operator key and
+   * the Shuffle address, and wager tables are only created when the adapter is
+   * configured, so an unconfigured deployment fails loudly rather than silently
+   * settling off-chain.
+   */
+  private async shuffleContract(): Promise<ShuffleContract> {
+    if (!this.shuffleAddress) {
+      throw new Error('on-chain anchoring requires LLMPOKER_SHUFFLE_ADDRESS');
+    }
+    const { Contract, Wallet } = await this.ethers();
     const provider = await this.getProvider();
     const wallet = new Wallet(this.privateKey, provider);
-    const tx = await wallet.sendTransaction({ to: await wallet.getAddress(), value: 0n, data: hexlify(payload) });
-    const receipt = await tx.wait();
-    if (!receipt) throw new Error('transaction was not mined');
+    const abi = [
+      'function commitSeed(bytes32 handId, bytes32 seedCommitment, uint256 nonce)',
+      'function commitDeck(bytes32 handId, bytes32 deckRoot, bytes32[] leaves)',
+      'function revealCard(bytes32 handId, uint8 deckIndex, uint8 card, bytes32 salt, bytes32[] proof)',
+      'function audit(bytes32 handId, bytes32 deckSeed, uint8[] cards, bytes32[] salts)',
+    ];
+    return new Contract(this.shuffleAddress, abi, wallet) as unknown as ShuffleContract;
+  }
+
+  private async handId32(handId: string): Promise<string> {
+    const { keccak256, toUtf8Bytes } = await this.ethers();
+    return keccak256(toUtf8Bytes(handId));
+  }
+
+  private async mined(hash: string): Promise<BlockRef> {
+    const { keccak256, toUtf8Bytes } = await this.ethers();
+    const provider = await this.getProvider();
+    const receipt = await provider.waitForTransaction(hash);
+    if (!receipt) throw new Error(`transaction ${hash} was not mined`);
     const block = await provider.getBlock(receipt.blockNumber);
-    return { block: receipt.blockNumber, hash: block?.hash ?? '', txHash: receipt.hash };
+    return { block: receipt.blockNumber, hash: block?.hash ?? keccak256(toUtf8Bytes(hash)), txHash: receipt.hash };
   }
 
-  async submitCommitment(_handId: string, commitment: string): Promise<BlockRef> {
-    return this.send(hexToBytes(commitment));
+  async commitSeed(handId: string, commitment: string, nonce: bigint): Promise<BlockRef> {
+    const contract = await this.shuffleContract();
+    const tx = await contract.commitSeed(await this.handId32(handId), commitment, nonce);
+    return this.mined(tx.hash);
   }
 
-  async submitReveal(_handId: string, deckSeed: string): Promise<BlockRef> {
-    return this.send(hexToBytes(deckSeed));
+  async commitDeck(handId: string, deckRoot: string, leaves: readonly string[]): Promise<BlockRef> {
+    const contract = await this.shuffleContract();
+    const tx = await contract.commitDeck(await this.handId32(handId), deckRoot, [...leaves]);
+    return this.mined(tx.hash);
+  }
+
+  async revealCard(
+    handId: string,
+    index: number,
+    card: number,
+    salt: string,
+    proof: readonly string[],
+  ): Promise<BlockRef> {
+    const contract = await this.shuffleContract();
+    const tx = await contract.revealCard(await this.handId32(handId), index, card, salt, [...proof]);
+    return this.mined(tx.hash);
+  }
+
+  async audit(handId: string, deckSeed: string, deck: readonly number[], salts: readonly string[]): Promise<BlockRef> {
+    const contract = await this.shuffleContract();
+    const tx = await contract.audit(await this.handId32(handId), deckSeed, [...deck], [...salts]);
+    return this.mined(tx.hash);
   }
 
   async isFinal(block: number, confirmations: number): Promise<boolean> {
@@ -192,7 +293,10 @@ export function createAnchor(config: ServerConfig): AnchorProvider {
     if (!config.rpcUrl || !config.operatorPrivateKey) {
       throw new Error('LLMPOKER_ANCHOR=onchain requires RH_RPC_URL and an operator private key');
     }
-    return new OnChainAnchor(config.rpcUrl, config.operatorPrivateKey);
+    if (!config.contracts.shuffle) {
+      throw new Error('LLMPOKER_ANCHOR=onchain requires LLMPOKER_SHUFFLE_ADDRESS (FR-6 phases live there)');
+    }
+    return new OnChainAnchor(config.rpcUrl, config.operatorPrivateKey, config.contracts.shuffle);
   }
   return new LocalChain(config.blockTimeMs);
 }

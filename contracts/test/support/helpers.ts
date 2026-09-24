@@ -11,6 +11,8 @@ import hre from 'hardhat';
 import type { Signer } from 'ethers';
 import { mineUpTo, takeSnapshot } from '@nomicfoundation/hardhat-network-helpers';
 
+import { cardProof, commitmentForDeck, type DeckCommitment } from './merkle';
+
 const BPS_DENOMINATOR = 10_000n;
 
 /** Rake defaults mirrored from `packages/shared/src/config.ts` and `Poker.DEFAULT_*`. */
@@ -81,6 +83,27 @@ export function commitmentFor(deckSeed: string, nonce: bigint | number): string 
   return ethers.keccak256(ethers.solidityPacked(['bytes32', 'uint256'], [deckSeed, nonce]));
 }
 
+/** Bond the operator must hold to commit hands (FR-6.5); tests use a small value. */
+export const TEST_REQUIRED_BOND = ethers.parseEther('100');
+
+/** Post-`commitDeck` audit grace, at the contract minimum to keep tests cheap (FR-6.7). */
+export const TEST_AUDIT_GRACE_BLOCKS = 64n;
+
+/** `Shuffle.Phase` mirror (FR-6.1–6.4). */
+export const PHASE = {
+  None: 0n,
+  SeedCommitted: 1n,
+  DeckCommitted: 2n,
+  Audited: 3n,
+  Voided: 4n,
+} as const;
+
+/** `Shuffle.VoidReason` mirror (FR-6.7). */
+export const VOID_REASON = {
+  NoDeckCommitment: 0n,
+  AuditStalled: 1n,
+} as const;
+
 /**
  * Deploy the full stack.
  * @param requiredConfirmations Shuffle finality threshold (FR-6.5); tests use small values to
@@ -126,7 +149,13 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   await splitter.waitForDeployment();
 
   const shuffleFactory = await hre.ethers.getContractFactory('Shuffle', owner);
-  const shuffle = await shuffleFactory.deploy(await owner.getAddress(), requiredConfirmations);
+  const shuffle = await shuffleFactory.deploy(
+    await token.getAddress(),
+    await owner.getAddress(),
+    requiredConfirmations,
+    TEST_AUDIT_GRACE_BLOCKS,
+    TEST_REQUIRED_BOND,
+  );
   await shuffle.waitForDeployment();
 
   const pokerFactory = await hre.ethers.getContractFactory('Poker', owner);
@@ -155,6 +184,17 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
     await splitter.getAddress(),
   );
   await shuffleContract.grantRole!((await shuffleContract.OPERATOR_ROLE!()) as string, await operator.getAddress());
+
+  // Fund the operator and post its FR-6.5 bond.
+  await (tokenContract.connect(owner) as ethers.Contract).transfer!(
+    await operator.getAddress(),
+    ethers.parseEther('2000'),
+  );
+  await (tokenContract.connect(operator) as ethers.Contract).approve!(
+    await shuffle.getAddress(),
+    ethers.MaxUint256,
+  );
+  await (shuffleContract.connect(operator) as ethers.Contract).postBond!(TEST_REQUIRED_BOND);
 
   // Fund the players and let Poker/Staking/Vault pull.
   const spenders = [
@@ -203,33 +243,106 @@ export async function createWagerTable(
 }
 
 /**
- * Commit a hand as the operator and mine just enough blocks for `reveal` to be legal.
- * @returns The commitment plus the commit block.
+ * FR-6.1 phase 1: commit the seed and mine until phase 2 is legal.
+ *
+ * The deck commitment is built **before** any further mining: Hardhat only serves
+ * `blockhash`/`getBlock` for the most recent 256 blocks, so reading the anchor any later would
+ * lose it. This mirrors what the operator must do in production.
+ *
+ * @returns The seed commitment, the commit block, and the deck commitment to publish at phase 2.
  */
-export async function commitHand(
-  stack: PokerStack,
-  handId: string,
-  deckSeed: string,
-  nonce: bigint,
-): Promise<{ commitment: string; commitBlock: number }> {
-  const commitment = commitmentFor(deckSeed, nonce);
-  const tx = await stack.shuffle.connect(stack.operator).commit(handId, commitment, nonce);
-  const receipt = await tx.wait();
+export async function commitSeedPhase(stack: PokerStack, handId: string, deckSeed: string, nonce: bigint) {
+  const seedCommitment = commitmentFor(deckSeed, nonce);
+  const receipt = await (await stack.shuffle.connect(stack.operator).commitSeed(handId, seedCommitment, nonce)).wait();
   const commitBlock = receipt!.blockNumber;
+  const anchorBlock = commitBlock + 1;
+
+  // Mine to the anchor, read its hash (only possible once it exists, and only for 256 blocks),
+  // then mine out the confirmations. This mirrors the sequence a production operator follows.
+  await mineUpTo(anchorBlock);
+  const anchor = await hre.ethers.provider.getBlock(anchorBlock);
+  if (!anchor?.hash) throw new Error(`anchor block ${anchorBlock} is not readable`);
+  const anchorBlockHash = anchor.hash;
+
   const confirmations = BigInt(await stack.shuffle.requiredConfirmations());
-  await mineUpTo(commitBlock + 1 + Number(confirmations));
-  return { commitment, commitBlock };
+  await mineUpTo(anchorBlock + Number(confirmations));
+
+  const deck = await derivedDeckFromHash(stack, deckSeed, anchorBlockHash);
+  const commitmentRecord = commitmentForDeck(handId, deck);
+  return { seedCommitment, commitBlock, anchorBlock, anchorBlockHash, deck, commitmentRecord };
 }
 
-/** Reveal a hand and return the parsed `Revealed` event args (FR-6.1). */
-export async function revealHand(
+/**
+ * FR-6.2 phase 2: publish the Merkle deck root and capture the anchor hash.
+ * @returns The parsed `DeckCommitted` args.
+ */
+export async function commitDeckPhase(
+  stack: PokerStack,
+  handId: string,
+  commitmentRecord: DeckCommitment,
+): Promise<{ deckRoot: string; anchorBlockHash: string; anchorBlock: bigint; confirmations: bigint }> {
+  const receipt = await (
+    await stack.shuffle.connect(stack.operator).commitDeck(handId, commitmentRecord.root, commitmentRecord.leaves)
+  ).wait();
+  const parsed = parseShuffleLog(stack, receipt, 'DeckCommitted');
+  return {
+    deckRoot: parsed.args[1],
+    anchorBlockHash: parsed.args[5],
+    anchorBlock: parsed.args[4] as bigint,
+    confirmations: parsed.args[6] as bigint,
+  };
+}
+
+/**
+ * Build a *deliberately rigged* deck commitment: the real deck with two cards swapped.
+ *
+ * `DeckCommitted` cannot detect this (only the root's internal consistency is checkable at phase
+ * 2), which is precisely the trust window the FR-6.5 bond prices; the audit slashes it.
+ */
+export function riggedCommitment(handId: string, realDeck: number[]): DeckCommitment {
+  const rigged = [...realDeck];
+  [rigged[0], rigged[1]] = [rigged[1]!, rigged[0]!];
+  return commitmentForDeck(handId, rigged);
+}
+
+/**
+ * Run phases 1 and 2 for a hand: commit the seed, wait out the confirmations, then commit the
+ * deck root built from the deck that `(seed, anchorBlockHash)` actually derives.
+ * @returns The deck, its commitment record and the block data verifiers need.
+ */
+export async function commitHiddenDeck(stack: PokerStack, handId: string, deckSeed: string, nonce: bigint) {
+  const { seedCommitment, commitBlock, deck, commitmentRecord } = await commitSeedPhase(stack, handId, deckSeed, nonce);
+  const committed = await commitDeckPhase(stack, handId, commitmentRecord);
+  return { seedCommitment, commitBlock, deck, commitmentRecord, ...committed };
+}
+
+/** FR-6.3: publish one card with its proof. */
+export async function revealCardPhase(
+  stack: PokerStack,
+  handId: string,
+  commitmentRecord: DeckCommitment,
+  index: number,
+): Promise<number> {
+  const card = commitmentRecord.deck[index]!;
+  const salt = commitmentRecord.salts[index]!;
+  const proof = cardProof(commitmentRecord, index);
+  await stack.shuffle.connect(stack.operator).revealCard(handId, index, card, salt, proof);
+  return card;
+}
+
+/** FR-6.4: run the end-of-hand audit against the committed deck. */
+export async function auditPhase(
   stack: PokerStack,
   handId: string,
   deckSeed: string,
-): Promise<{ anchorBlockHash: string; entropy: string; deck: bigint[]; revealBlock: number; anchorBlock: bigint }> {
-  const tx = await stack.shuffle.connect(stack.operator).reveal(handId, deckSeed);
-  const receipt = await tx.wait();
-  const parsed = receipt!.logs
+  commitmentRecord: DeckCommitment,
+): Promise<void> {
+  await stack.shuffle.connect(stack.operator).audit(handId, deckSeed, commitmentRecord.deck, commitmentRecord.salts);
+}
+
+/** Parse a named event out of a receipt produced by the `Shuffle` contract. */
+export function parseShuffleLog(stack: PokerStack, receipt: any, name: string): any {
+  const parsed = receipt.logs
     .map((log: any) => {
       try {
         return stack.shuffle.interface.parseLog(log);
@@ -237,15 +350,43 @@ export async function revealHand(
         return null;
       }
     })
-    .find((entry: any) => entry !== null && entry.name === 'Revealed');
-  if (!parsed) throw new Error('Revealed event not found');
-  return {
-    anchorBlockHash: parsed.args.anchorBlockHash,
-    entropy: parsed.args.entropy,
-    deck: parsed.args.deck as bigint[],
-    revealBlock: Number(parsed.args.revealBlock),
-    anchorBlock: parsed.args.anchorBlock as bigint,
-  };
+    .find((entry: any) => entry !== null && entry.name === name);
+  if (!parsed) throw new Error(`${name} event not found`);
+  return parsed;
+}
+
+/**
+ * The deck that `(deckSeed, blockhash(anchorBlock))` actually derives, computed through the
+ * contract's pure `computeDeck` (`docs/RNG.md` §3). The vector suite separately proves that
+ * function reproduces the committed vectors, so using it here is not circular.
+ *
+ * A happy-path audit compares the *real* derived deck against the committed root, so tests that
+ * expect a successful audit must run phases 2–4 over this ordering.
+ */
+export async function derivedDeckFromHash(stack: PokerStack, deckSeed: string, anchorBlockHash: string): Promise<number[]> {
+  const entropy = entropyFrom(deckSeed, anchorBlockHash);
+  const deck = (await stack.shuffle.computeDeck(entropy)) as bigint[];
+  return Array.from(deck, (card) => Number(card));
+}
+
+/**
+ * Convenience wrapper: read the anchor hash from the chain (only possible within the 256-block
+ * `blockhash` window) and derive the deck from it.
+ */
+export async function derivedDeck(stack: PokerStack, deckSeed: string, anchorBlockNumber: number): Promise<number[]> {
+  const anchor = await hre.ethers.provider.getBlock(anchorBlockNumber);
+  if (!anchor?.hash) throw new Error(`anchor block ${anchorBlockNumber} is outside the blockhash window`);
+  return derivedDeckFromHash(stack, deckSeed, anchor.hash);
+}
+
+/** Deterministic 32-byte seed for a hand's RNG. */
+export function seedFor(handId: string): string {
+  return ethers.keccak256(ethers.solidityPacked(['string', 'bytes32'], ['seed', handId]));
+}
+
+/** Deterministic 32-byte `handId`. */
+export function handIdFor(label: string): string {
+  return ethers.keccak256(ethers.toUtf8Bytes(label));
 }
 
 /** Rake for a pot, mirroring `Poker.computeRake` and `computeRake` in shared `config.ts` (FR-8.1). */

@@ -1,13 +1,14 @@
 /**
  * `/tables` — FR-7.2: active tables with stakes, seat occupancy, street, pot,
- * button, the live action clock and the RNG commitment of the in-flight hand.
+ * button, the live action clock and the FR-6 RNG lifecycle of the in-flight hand
+ * (phase + committed deck root + how many positions have been revealed).
  *
  * The 1 Hz countdown is driven by `[data-deadline]` nodes handled by
  * `ui.startClock()`, so only the clock text node is touched every second.
  */
 
 import { formatBps, formatDateTime, formatInt, formatRelative, formatTokens, parseChips, shortHex } from '../format.js';
-import { getActionRequest, getState, startLive, subscribe } from '../live.js';
+import { getActionRequest, getRevealedPositions, getState, startLive, subscribe } from '../live.js';
 import {
   badge,
   banner,
@@ -21,6 +22,7 @@ import {
   panel,
   renderChrome,
   requireElement,
+  rngPhaseBadge,
   showBanner,
   startClock,
   statusBadge,
@@ -256,10 +258,17 @@ function tableCard(table) {
         h(
           'div',
           { class: 'rng-box' },
-          h('span', { class: 'clock-label', text: 'RNG commitment (in-flight hand)' }),
+          h('span', { class: 'clock-label', text: 'FR-6 phase (in-flight hand)' }),
+          rngPhaseBadge(table.rngPhase),
+          h('span', { class: 'clock-label', text: 'committed deck root (FR-6.2)' }),
+          table.rngDeckRoot
+            ? h('code', { class: 'hash', text: shortHex(table.rngDeckRoot, 18, 12), title: table.rngDeckRoot })
+            : h('span', { class: 'muted', text: 'not committed yet — the ordering and salts are still secret' }),
+          h('span', { class: 'clock-label', text: 'seed commitment (FR-6.1)' }),
           table.rngCommitment
             ? h('code', { class: 'hash', text: shortHex(table.rngCommitment, 18, 12), title: table.rngCommitment })
             : h('span', { class: 'muted', text: table.handId ? 'awaiting commit (free mode may use a local PRNG, FR-4.4)' : 'no hand in flight' }),
+          table.handId ? revealCount(table) : null,
           h(
             'span',
             { class: 'clock-label', text: 'board' },
@@ -278,6 +287,35 @@ function tableCard(table) {
       potsBlock(table),
       configBlock(table),
     ),
+  );
+}
+
+/**
+ * How many deck positions this connection has seen revealed (FR-6.3).
+ *
+ * Positions that were never revealed are **never rendered**: the feed carries no
+ * card value for them at all, only the per-card reveals the rules forced. The
+ * count is what this page saw, so it is a lower bound after a reconnect — the
+ * authoritative list is `proof.reveals` on `/api/v1/hands/:id`.
+ *
+ * @param {TableSnapshot} table
+ * @returns {HTMLElement}
+ */
+function revealCount(table) {
+  const positions = getRevealedPositions(table.id);
+  const revealed = positions ? positions.size : 0;
+  const hidden = Math.max(0, 52 - revealed);
+  return h(
+    'span',
+    { class: 'clock-label', title: 'positions revealed on this connection; un-revealed positions stay hidden commitments' },
+    'cards made public (FR-6.3) ',
+    h('span', {
+      class: 'muted',
+      text:
+        revealed === 0
+          ? 'none yet — all 52 positions are hidden commitments'
+          : `${revealed} of 52 positions revealed — the other ${hidden} stay hidden commitments`,
+    }),
   );
 }
 
@@ -318,6 +356,9 @@ function seatCard(seat, table) {
   if (toAct) classes.push('seat-toact');
   if (seat.agentId === null) classes.push('seat-empty');
 
+  // FR-6: `holeCards` is `null` while a card is hidden, and the snapshot never
+  // carries a value the hand has not made public. An un-revealed seat renders
+  // face-down placeholders — this page never guesses or reconstructs a card.
   let cards;
   if (seat.holeCards && seat.holeCards.length > 0) cards = cardRow(seat.holeCards);
   else if (seat.agentId !== null && table.handId) cards = faceDownCards(2);

@@ -14,6 +14,7 @@ import {
   type AgentSnapshot,
   type Card,
   type Chips,
+  type DeckCommitment,
   type HandHistory,
   type HandSummary,
   type Mode,
@@ -24,12 +25,17 @@ import {
   type TableEvent,
   type TableSnapshot,
   bytesToHex,
+  bytesToHex32,
+  commitDeckOrder,
   commitmentHex,
   defaultFreeTableConfig,
   defaultWagerTableConfig,
   EngineError,
   entropyHex,
   randomDeckSeed,
+  randomSalts,
+  revealFor,
+  revealSetFor,
   shuffleDeck,
   toChipsJson,
   verifyRngProof,
@@ -41,6 +47,7 @@ import {
   createTable,
   leaveTable,
   nextButtonSeat,
+  revealedBoardPositions,
   seatAgent,
   setTableStatus,
   startHand,
@@ -55,6 +62,13 @@ import { type AgentRecord, Store, toPublicAgent } from './store.js';
 export interface ManagedTable {
   state: TableState;
   proofs: Map<string, RngProof>;
+  /**
+   * Live secrets for hands in flight: the seed and every salt. These are the
+   * things that must never be published while the hand is live (FR-6), so they
+   * live outside the proof object and are dropped the moment the audit publishes
+   * them.
+   */
+  secrets: Map<string, { seed: string; salts: Uint8Array[]; commitment: DeckCommitment }>;
   histories: Map<string, HandHistory>;
   /** Epoch ms before which the next hand must not start. */
   nextHandAt: number;
@@ -133,6 +147,7 @@ export class Orchestrator extends EventEmitter {
     const managed: ManagedTable = {
       state,
       proofs: new Map(),
+      secrets: new Map(),
       histories: new Map(),
       nextHandAt: 0,
       busy: false,
@@ -180,7 +195,7 @@ export class Orchestrator extends EventEmitter {
         if (hand && !hand.complete && hand.deadlineTs !== null && hand.deadlineTs <= now) {
           try {
             const step = timeoutAction(table.state, now);
-            this.applyStep(table, step, now);
+            await this.applyStep(table, step, now);
           } catch (error) {
             this.emit('error', error as Error, `timeout:${table.state.config.id}`);
           }
@@ -198,9 +213,13 @@ export class Orchestrator extends EventEmitter {
   // -- hand lifecycle (FR-6 + FR-3) -----------------------------------------
 
   /**
-   * FR-6: draw a seed, publish the commitment, wait for the anchor block, read
-   * its hash, publish the reveal, derive the deck, then start the hand. The deck
-   * is a pure function of public data by the time a single card is dealt.
+   * FR-6: run the four phases and deal.
+   *
+   * 1. commit the seed (the seed stays in memory only),
+   * 2. anchor it to the next block and commit the Merkle deck root — the ordering
+   *    and the salts never leave this process until the audit,
+   * 3. deal and reveal individual cards as the rules expose them,
+   * 4. audit the whole deck once the hand is over.
    */
   async startNextHand(table: ManagedTable, now = this.now()): Promise<void> {
     if (table.busy) return;
@@ -209,20 +228,17 @@ export class Orchestrator extends EventEmitter {
     const handId = `${table.state.config.id}-h${handNumber}`;
     const mode: Mode = table.state.config.mode;
     try {
-      const seedBytes = randomDeckSeed();
-      const seed = `0x${bytesToHex(seedBytes)}`;
+      // -- phase 1: commit the seed (FR-6.1) --------------------------------
+      const seed = `0x${bytesToHex(randomDeckSeed())}`;
       table.nonce += 1n;
       const nonce = table.nonce;
       const commitment = commitmentHex(seed, nonce);
+      const seedRef = await this.anchor.commitSeed(handId, commitment, nonce);
 
-      const commitRef = await this.anchor.submitCommitment(handId, commitment);
-      const anchorBlock = commitRef.block + 1;
+      // -- anchor: the next block, read after it exists and again once final --
+      const anchorBlock = seedRef.block + 1;
       const confirmations =
         mode === 'WAGER' ? this.config.wagerAnchorConfirmations : this.config.freeAnchorConfirmations;
-      // FR-6.2 / FR-5.6: read the anchor hash once it exists, then re-read it after
-      // the finality threshold. If the two disagree the anchor block was reorged,
-      // so the hand is voided before a single card is dealt instead of settling
-      // against an entropy that no longer exists on-chain (NFR-6).
       const anchorHashAtCommit = await this.waitForAnchorHash(anchorBlock);
       await this.waitForFinal(anchorBlock, confirmations);
       const anchorBlockHash = await this.anchor.blockHash(anchorBlock);
@@ -231,41 +247,71 @@ export class Orchestrator extends EventEmitter {
         table.nextHandAt = now + table.state.config.handIntervalMs;
         return;
       }
-      const revealRef = await this.anchor.submitReveal(handId, seed);
 
+      // -- phase 2: commit the deck root, never the ordering (FR-6.2) --------
       const entropy = entropyHex(seed, anchorBlockHash);
       const deck: Card[] = shuffleDeck(entropy).deck;
+      const salts = randomSalts();
+      const commitmentDeck = commitDeckOrder(deck, salts);
+      const deckRoot = bytesToHex32(commitmentDeck.root);
+      const leaves = commitmentDeck.leaves.map(bytesToHex32);
+      const deckRef = await this.anchor.commitDeck(handId, deckRoot, leaves);
 
       const proof: RngProof = {
         handId,
         tableId: table.state.config.id,
         handNumber,
+        phase: 'DECK_COMMITTED',
         commitment,
-        deckSeed: seed,
         nonce: nonce.toString(),
-        commitBlock: commitRef.block,
-        commitTxHash: commitRef.txHash,
+        commitBlock: seedRef.block,
+        commitTxHash: seedRef.txHash,
         anchorBlock,
         anchorBlockHash,
-        revealBlock: revealRef.block,
-        revealTxHash: revealRef.txHash,
-        entropy,
-        deck,
+        deckRoot,
+        deckRootBlock: deckRef.block,
+        deckRootTxHash: deckRef.txHash,
+        reveals: [],
+        audited: false,
+        deckSeed: null,
+        entropy: null,
+        salts: null,
+        deck: [],
+        auditBlock: null,
+        auditTxHash: null,
+        slashed: null,
+        voidedReason: null,
         anchorSource: this.anchor.kind === 'ONCHAIN' ? 'ONCHAIN' : 'LOCAL',
         requiredConfirmations: confirmations,
         verified: false,
         verifiedAt: null,
         chainId: this.config.chainId,
       };
-      const verdict = verifyRngProof(proof, {
-        minAnchorConfirmations: confirmations,
-      });
+
+      const verdict = verifyRngProof(proof, { requireReveal: false, minAnchorConfirmations: confirmations });
       proof.verified = verdict.ok;
       proof.verifiedAt = now;
       if (!verdict.ok) {
-        this.log('error', `hand ${handId} produced an unverifiable proof`, verdict.checks.filter((c) => !c.ok));
+        this.log('error', `hand ${handId} produced an unverifiable live proof`, verdict.checks.filter((c) => !c.ok));
       }
       table.proofs.set(handId, proof);
+      // The secrets live beside the proof, never inside it (FR-6 invariant).
+      table.secrets.set(handId, { seed, salts, commitment: commitmentDeck });
+
+      this.emit('tableEvent', table.state.config.id, [
+        {
+          type: 'RNG_SEED_COMMITTED',
+          commitment,
+          nonce: nonce.toString(),
+          commitBlock: seedRef.block,
+        },
+        {
+          type: 'RNG_DECK_COMMITTED',
+          deckRoot,
+          deckRootBlock: deckRef.block,
+          anchorBlock,
+        },
+      ]);
 
       const step = startHand(table.state, {
         handId,
@@ -275,13 +321,92 @@ export class Orchestrator extends EventEmitter {
         nonce: nonce.toString(),
       });
       table.startedHands += 1;
-      this.applyStep(table, step, now);
+      await this.applyStep(table, step, now);
       this.emit('table', this.snapshot(table));
     } catch (error) {
       this.emit('error', error as Error, `startHand:${table.state.config.id}`);
     } finally {
       table.busy = false;
     }
+  }
+
+  /**
+   * FR-6.3: publish the cards the rules have exposed since the last call. Only
+   * board cards qualify while a hand is live — hole cards are revealed by the
+   * audit at the end, never early.
+   */
+  private async publishReveals(table: ManagedTable, handId: string, now: number): Promise<void> {
+    const hand = table.state.hand;
+    const proof = table.proofs.get(handId);
+    const secret = table.secrets.get(handId);
+    if (!hand || !proof || !secret || proof.phase !== 'DECK_COMMITTED') return;
+
+    const wanted = revealedBoardPositions(hand);
+    const alreadyPublished = new Set(proof.reveals.map((r) => r.index));
+    const events: TableEvent[] = [];
+
+    for (const index of wanted) {
+      if (alreadyPublished.has(index)) continue;
+      const reveal = revealFor(secret.commitment, index);
+      try {
+        await this.anchor.revealCard(handId, reveal.index, reveal.card, reveal.salt, reveal.proof);
+      } catch (error) {
+        this.emit('error', error as Error, `revealCard:${handId}`);
+        continue;
+      }
+      proof.reveals.push(reveal);
+      events.push({ type: 'CARD_REVEALED', reveal });
+    }
+
+    if (events.length > 0) {
+      proof.verifiedAt = now;
+      this.emit('tableEvent', table.state.config.id, events);
+    }
+  }
+
+  /**
+   * FR-6.4: end-of-hand audit. Publishes the seed, the entropy, every salt and
+   * the full ordering, then re-verifies the commitment — which is what makes the
+   * hand permanently checkable. This is the only moment the ordering becomes
+   * public, and by then the hand is over.
+   */
+  private async auditHand(table: ManagedTable, handId: string, now: number): Promise<void> {
+    const proof = table.proofs.get(handId);
+    const secret = table.secrets.get(handId);
+    if (!proof || !secret || proof.phase === 'AUDITED') return;
+
+    const saltsHex = secret.salts.map(bytesToHex32);
+    try {
+      const ref = await this.anchor.audit(handId, secret.seed, secret.commitment.deck, saltsHex);
+      proof.auditBlock = ref.block;
+      proof.auditTxHash = ref.txHash;
+    } catch (error) {
+      this.emit('error', error as Error, `audit:${handId}`);
+    }
+
+    proof.phase = 'AUDITED';
+    proof.audited = true;
+    proof.deckSeed = secret.seed;
+    proof.entropy = entropyHex(secret.seed, proof.anchorBlockHash ?? '');
+    proof.salts = saltsHex;
+    proof.deck = [...secret.commitment.deck];
+    // All 52 proofs from one tree build: rebuilding the tree per position made
+    // the audit an order of magnitude slower than it needs to be.
+    proof.reveals = revealSetFor(
+      secret.commitment,
+      secret.commitment.deck.map((_, index) => index),
+    );
+
+    const verdict = verifyRngProof(proof, { minAnchorConfirmations: proof.requiredConfirmations });
+    proof.verified = verdict.ok;
+    proof.verifiedAt = now;
+    if (!verdict.ok) {
+      this.log('error', `audit for ${handId} failed verification`, verdict.checks.filter((c) => !c.ok));
+    }
+
+    this.emit('tableEvent', table.state.config.id, [{ type: 'RNG_AUDITED', proof }]);
+    // The secrets are no longer needed once they are public.
+    table.secrets.delete(handId);
   }
 
   /** Blocks until the anchor block exists, then returns its hash (FR-6.2). */
@@ -306,11 +431,21 @@ export class Orchestrator extends EventEmitter {
     }
   }
 
-  private applyStep(table: ManagedTable, step: TableStep, now: number): void {
+  private async applyStep(table: ManagedTable, step: TableStep, now: number): Promise<void> {
     table.state = step.table;
     if (step.events.length > 0) this.emit('tableEvent', table.state.config.id, step.events);
     if (step.actionRequest) this.emit('actionRequired', step.actionRequest);
-    if (step.table.hand?.complete) this.finalizeHand(table, now);
+
+    const handId = step.table.hand?.handId;
+    if (handId) {
+      // FR-6.3: publish whatever the rules just made public, and nothing else.
+      await this.publishReveals(table, handId, now);
+      if (step.table.hand?.complete) {
+        // FR-6.4: the audit is what finally publishes the ordering.
+        await this.auditHand(table, handId, now);
+        this.finalizeHand(table, now);
+      }
+    }
     this.emit('table', this.snapshot(table));
   }
 
@@ -493,7 +628,7 @@ export class Orchestrator extends EventEmitter {
     if (!hand || hand.complete) throw new EngineError('HAND_NOT_FOUND', `table ${tableId} has no live hand`);
 
     const step = actOnTable(table.state, seat.seat, action, now, 'AGENT');
-    this.applyStep(table, step, now);
+    await this.applyStep(table, step, now);
     this.store.markSeen(agentId, now);
 
     // A hand that completes on this action also releases any agent whose whole
@@ -558,6 +693,8 @@ export class Orchestrator extends EventEmitter {
       toActSeat: hand && !hand.complete ? hand.toActSeat : null,
       actionDeadlineTs: hand && !hand.complete ? hand.deadlineTs : null,
       rngCommitment: proof?.commitment ?? null,
+      rngDeckRoot: proof?.deckRoot ?? null,
+      rngPhase: proof?.phase ?? 'NONE',
       startedAt: state.createdAt,
       updatedAt: state.updatedAt,
     };
@@ -619,7 +756,9 @@ export class Orchestrator extends EventEmitter {
       commitment: proof.commitment,
       commitBlock: proof.commitBlock,
       anchorBlock: proof.anchorBlock,
-      revealBlock: proof.revealBlock,
+      deckRootBlock: proof.deckRootBlock,
+      deckRoot: proof.deckRoot,
+      audited: proof.audited,
       proofVerified: proof.verified,
     };
   }

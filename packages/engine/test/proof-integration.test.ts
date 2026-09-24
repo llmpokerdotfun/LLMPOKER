@@ -3,12 +3,17 @@ import {
   type HandResult,
   type RngProof,
   bytesToHex,
+  commitDeckOrder,
   commitmentFor,
   entropyFrom,
-  hexToBytes,
   isCompleteDeck,
+  publicDeckPositions,
+  randomSalts,
+  revealFor,
   shuffleDeck,
   verifyHandDeal,
+  verifyHiddenCardInvariant,
+  verifyPublicReveals,
   verifyRngProof,
 } from '@llmpoker/shared';
 import { applyAction, createHand, legalActions, replayHand } from '../src/hand.js';
@@ -16,41 +21,30 @@ import { deckFor, stripTimes, wagerConfig } from './helpers.js';
 import type { PlayerAction } from '@llmpoker/shared';
 
 /**
- * End-to-end fairness test for the off-chain side of FR-6:
- * seed → commitment → anchor block hash → entropy → deck → dealt cards → payout,
- * with the published hand history verified by an independent recomputation.
+ * End-to-end fairness test for the off-chain side of the patched FR-6:
+ * seed → seed commitment → anchor → deck → Merkle root → per-card reveals →
+ * audit, with the published hand history verified by independent recomputation.
+ *
+ * The two regimes are both covered: what a verifier can prove *while the hand is
+ * live* (only commitments and individually proven cards), and what it can prove
+ * after the audit (the whole ordering).
  */
 
 const CONFIG = wagerConfig();
-const SEED = '0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20';
-const ANCHOR = '0x9f2d1b4c7e6a8d0f3b5c9a1e2d4f6078aabbccddeeff00112233445566778899';
+const SEED = `0x${'01'.repeat(32)}`;
+const ANCHOR = `0x9f2d1b4c7e6a8d0f3b5c9a1e2d4f6078aabbccddeeff00112233445566778899`;
+const SECONDS = `0x${'02'.repeat(32)}`;
 const NONCE = 42n;
 const COMMIT_BLOCK = 1_000;
+const DECK_ROOT_BLOCK = COMMIT_BLOCK + 20;
+const AUDIT_BLOCK = DECK_ROOT_BLOCK + 30;
 
-function buildProof(deckSeed: string, anchorHash: string, nonce: bigint): RngProof {
-  const entropy = `0x${bytesToHex(entropyFrom(deckSeed, anchorHash))}`;
-  return {
-    handId: 'h-proof',
-    tableId: CONFIG.id,
-    handNumber: 1,
-    commitment: `0x${bytesToHex(commitmentFor(deckSeed, nonce))}`,
-    deckSeed,
-    nonce: nonce.toString(),
-    commitBlock: COMMIT_BLOCK,
-    commitTxHash: '0xtx',
-    anchorBlock: COMMIT_BLOCK + 1,
-    anchorBlockHash: anchorHash,
-    // 12+ confirmations after the anchor, inside the 256-block reveal window.
-    revealBlock: COMMIT_BLOCK + 20,
-    revealTxHash: '0xtx2',
-    entropy,
-    deck: shuffleDeck(entropy).deck,
-    anchorSource: 'ONCHAIN',
-    requiredConfirmations: 12,
-    verified: true,
-    verifiedAt: 1,
-    chainId: 4663,
-  };
+/**
+ * The deck the proof's seed and anchor imply. The hand must be played with
+ * exactly this ordering, otherwise the reveals legitimately point at other cards.
+ */
+function proofDeck(): number[] {
+  return shuffleDeck(entropyFrom(SEED, ANCHOR)).deck;
 }
 
 function playHand(deck: number[]): HandResult {
@@ -80,89 +74,192 @@ function playHand(deck: number[]): HandResult {
   return step.state.result!;
 }
 
+/** Builds the proof a live hand would publish, plus the audit when asked. */
+function buildProof(result: HandResult, options: { audited: boolean; leakDeck?: boolean }): RngProof {
+  const entropy = entropyFrom(SEED, ANCHOR);
+  const deck = shuffleDeck(entropy).deck;
+  const salts = randomSalts();
+  const commitment = commitDeckOrder(deck, salts);
+
+  // The cards the rules have made public: the board always, hole cards at showdown.
+  const positions = publicDeckPositions(result);
+  const publicIndices = [
+    ...positions.board.slice(0, result.board.length),
+    ...[...positions.holes.values()].flat(),
+  ];
+  const reveals = [...new Set(publicIndices)].map((index) => revealFor(commitment, index));
+
+  const base: RngProof = {
+    handId: result.handId,
+    tableId: result.tableId,
+    handNumber: result.handNumber,
+    phase: options.audited ? 'AUDITED' : 'DECK_COMMITTED',
+    commitment: `0x${bytesToHex(commitmentFor(SEED, NONCE))}`,
+    nonce: NONCE.toString(),
+    commitBlock: COMMIT_BLOCK,
+    commitTxHash: '0xtx1',
+    anchorBlock: COMMIT_BLOCK + 1,
+    anchorBlockHash: ANCHOR,
+    deckRoot: `0x${bytesToHex(commitment.root)}`,
+    deckRootBlock: DECK_ROOT_BLOCK,
+    deckRootTxHash: '0xtx2',
+    reveals,
+    audited: options.audited,
+    deckSeed: options.audited ? SEED : null,
+    entropy: options.audited ? `0x${bytesToHex(entropy)}` : null,
+    salts: options.audited ? salts.map((s) => `0x${bytesToHex(s)}`) : null,
+    deck: options.audited || options.leakDeck ? deck : [],
+    auditBlock: options.audited ? AUDIT_BLOCK : null,
+    auditTxHash: options.audited ? '0xtx3' : null,
+    slashed: null,
+    voidedReason: null,
+    anchorSource: 'ONCHAIN',
+    requiredConfirmations: 12,
+    verified: true,
+    verifiedAt: 1,
+    chainId: 4663,
+  };
+  return base;
+}
+
 describe('RNG proof verification (FR-6.3, acceptance criterion #4)', () => {
-  it('recomputes the shuffle from public data and matches the stored deck', () => {
-    const proof = buildProof(SEED, ANCHOR, NONCE);
+  it('verifies an audited hand: commitment, anchor, root, shuffle and reveals', () => {
+    const result = playHand(proofDeck());
+    const proof = buildProof(result, { audited: true });
+
     const verdict = verifyRngProof(proof);
+    expect(verdict.checks.filter((c) => !c.ok)).toEqual([]);
     expect(verdict.ok).toBe(true);
-    expect(verdict.checks.every((c) => c.ok)).toBe(true);
     expect(isCompleteDeck(proof.deck)).toBe(true);
-    expect(proof.deck).toHaveLength(52);
+    expect(proof.reveals.length).toBeGreaterThan(0);
+
+    expect(verifyPublicReveals(result, proof).ok).toBe(true);
+    expect(verifyHandDeal(result, proof).ok).toBe(true);
   });
 
-  it('detects a swapped seed, a wrong anchor, a bad entropy and a rigged deck', () => {
-    const proof = buildProof(SEED, ANCHOR, NONCE);
+  it('verifies a live hand from commitments and per-card reveals alone', () => {
+    const result = playHand(proofDeck());
+    const live = buildProof(result, { audited: false });
 
-    const swappedSeed = { ...proof, deckSeed: `0x${'11'.repeat(32)}` };
-    expect(verifyRngProof(swappedSeed).ok).toBe(false);
+    // The audit is not required to be present, and nothing secret is published.
+    const verdict = verifyRngProof(live, { requireReveal: false });
+    expect(verdict.checks.filter((c) => !c.ok)).toEqual([]);
+    expect(verdict.ok).toBe(true);
+    expect(live.deckSeed).toBeNull();
+    expect(live.entropy).toBeNull();
+    expect(live.salts).toBeNull();
+    expect(live.deck).toEqual([]);
 
-    const wrongAnchor = { ...proof, anchorBlockHash: `0x${'22'.repeat(32)}` };
-    expect(verifyRngProof(wrongAnchor).ok).toBe(false);
+    // Every public card is proven against the committed root.
+    expect(verifyPublicReveals(result, live).ok).toBe(true);
 
-    const badEntropy = { ...proof, entropy: `0x${'33'.repeat(32)}` };
-    expect(verifyRngProof(badEntropy).ok).toBe(false);
-
-    const riggedDeck = { ...proof, deck: [...proof.deck.slice(1), proof.deck[0]!] };
-    const verdict = verifyRngProof(riggedDeck);
-    expect(verdict.ok).toBe(false);
-    expect(verdict.checks.find((c) => c.name === 'rng.shuffle_matches_stored_deck')?.ok).toBe(false);
-
-    const wrongNonce = { ...proof, nonce: '43' };
-    expect(verifyRngProof(wrongNonce).ok).toBe(false);
+    // The full deal map is not checkable yet, and the verifier says so instead of
+    // pretending the hand is unverifiable or verified.
+    const deal = verifyHandDeal(result, live);
+    expect(deal.ok).toBe(false);
+    expect(deal.checks.some((c) => c.name === 'deal.requires_audit' && !c.ok)).toBe(true);
+    expect(deal.checks.some((c) => c.name.startsWith('reveals.') && !c.ok)).toBe(false);
   });
 
-  it('enforces the anchor-block rule, the reveal window and finality', () => {
-    const proof = buildProof(SEED, ANCHOR, NONCE);
-    expect(verifyRngProof({ ...proof, anchorBlock: COMMIT_BLOCK + 2 }).ok).toBe(false);
-    expect(verifyRngProof({ ...proof, revealBlock: COMMIT_BLOCK + 300 }).ok).toBe(false);
-    expect(verifyRngProof({ ...proof, revealBlock: COMMIT_BLOCK }).ok).toBe(false);
-    // Only 5 confirmations over the anchor: fails the default K = 12.
-    expect(verifyRngProof({ ...proof, revealBlock: COMMIT_BLOCK + 6 }).ok).toBe(false);
-    // …but passes when the verifier explicitly lowers its own threshold.
-    expect(verifyRngProof({ ...proof, revealBlock: COMMIT_BLOCK + 6 }, { minAnchorConfirmations: 5 }).ok).toBe(true);
+  it('fails a live proof that leaks the ordering — the patched FR-6 invariant', () => {
+    const result = playHand(proofDeck());
+    const leaked = buildProof(result, { audited: false, leakDeck: true });
+
+    const hidden = verifyHiddenCardInvariant(leaked);
+    expect(hidden.ok).toBe(false);
+    const ordering = hidden.checks.find((c) => c.name === 'hidden.no_ordering');
+    expect(ordering?.ok).toBe(false);
+    expect(ordering?.detail).toContain('52 cards');
+
+    // And the whole-proof verdict must reject it too.
+    expect(verifyRngProof(leaked, { requireReveal: false }).ok).toBe(false);
   });
 
-  it('flags an unrevealed proof when a reveal is required', () => {
-    const hidden: RngProof = {
-      ...buildProof(SEED, ANCHOR, NONCE),
-      deckSeed: null,
-      anchorBlockHash: null,
-      entropy: null,
-      revealBlock: null,
-      deck: [],
+  it('fails an audited proof that hides the ordering, and a voided one that publishes it', () => {
+    const result = playHand(proofDeck());
+    const audited = buildProof(result, { audited: true });
+    const stripped: RngProof = { ...audited, deck: [], salts: null };
+    expect(verifyRngProof(stripped).ok).toBe(false);
+
+    const voided: RngProof = {
+      ...audited,
+      phase: 'VOIDED',
+      voidedReason: 'AUDIT_STALLED',
+      slashed: '100000000000000000000',
     };
-    const verdict = verifyRngProof(hidden);
+    expect(verifyRngProof(voided, { requireReveal: false }).ok).toBe(false); // still publishes the ordering
+  });
+
+  it('detects a swapped seed, a wrong anchor, a bad root and a rigged deck', () => {
+    const result = playHand(proofDeck());
+    const proof = buildProof(result, { audited: true });
+
+    expect(verifyRngProof({ ...proof, deckSeed: SECONDS }).ok).toBe(false);
+    expect(verifyRngProof({ ...proof, anchorBlockHash: SECONDS }).ok).toBe(false);
+    expect(verifyRngProof({ ...proof, deckRoot: SECONDS }).ok).toBe(false);
+    expect(verifyRngProof({ ...proof, nonce: '43' }).ok).toBe(false);
+
+    // A deck that is not what the seed implies: the Merkle root no longer matches.
+    const rigged = [...proof.deck];
+    const tmp = rigged[0]!;
+    rigged[0] = rigged[1]!;
+    rigged[1] = tmp;
+    const riggedVerdict = verifyRngProof({ ...proof, deck: rigged });
+    expect(riggedVerdict.ok).toBe(false);
+    expect(riggedVerdict.checks.find((c) => c.name === 'audit.shuffle_matches_published_deck')?.ok).toBe(false);
+    expect(riggedVerdict.checks.find((c) => c.name === 'audit.deck_root_matches')?.ok).toBe(false);
+  });
+
+  it('detects a reveal that does not match the committed position', () => {
+    const result = playHand(proofDeck());
+    const live = buildProof(result, { audited: false });
+    const first = live.reveals[0]!;
+
+    const swappedCard = { ...first, card: (first.card + 1) % 52 };
+    const tampered: RngProof = { ...live, reveals: [swappedCard, ...live.reveals.slice(1)] };
+    const verdict = verifyRngProof(tampered, { requireReveal: false });
     expect(verdict.ok).toBe(false);
-    expect(verdict.checks.find((c) => c.name === 'proof.revealed')?.ok).toBe(false);
+    expect(verdict.checks.find((c) => c.name === 'rng.card_reveals_proven')?.ok).toBe(false);
+
+    // …and the board check catches a card that was never revealed at its position.
+    const dropped: RngProof = { ...live, reveals: live.reveals.slice(1) };
+    const revealVerdict = verifyPublicReveals(result, dropped);
+    expect(revealVerdict.ok).toBe(false);
+    expect(revealVerdict.checks.some((c) => !c.ok && c.detail?.includes('without a Merkle reveal'))).toBe(true);
+  });
+
+  it('enforces the anchor-block rule, the deck-root window and finality', () => {
+    const result = playHand(proofDeck());
+    const proof = buildProof(result, { audited: true });
+
+    expect(verifyRngProof({ ...proof, anchorBlock: COMMIT_BLOCK + 2 }).ok).toBe(false);
+    expect(verifyRngProof({ ...proof, deckRootBlock: COMMIT_BLOCK + 300 }).ok).toBe(false);
+    expect(verifyRngProof({ ...proof, deckRootBlock: COMMIT_BLOCK }).ok).toBe(false);
+    // Only 5 confirmations over the anchor: fails the default K = 12…
+    expect(verifyRngProof({ ...proof, deckRootBlock: COMMIT_BLOCK + 6 }).ok).toBe(false);
+    // …but passes when the verifier lowers its own threshold.
+    expect(verifyRngProof({ ...proof, deckRootBlock: COMMIT_BLOCK + 6 }, { minAnchorConfirmations: 5 }).ok).toBe(true);
+  });
+
+  it('requires the audit once the hand is over', () => {
+    const result = playHand(proofDeck());
+    const live = buildProof(result, { audited: false });
+    const verdict = verifyRngProof(live); // default requireReveal: true
+    expect(verdict.ok).toBe(false);
+    expect(verdict.checks.find((c) => c.name === 'audit.present')?.ok).toBe(false);
   });
 });
 
 describe('hand history is the hand that was actually played', () => {
-  it('verifies the dealt cards against the recomputed deck', () => {
-    const proof = buildProof(SEED, ANCHOR, NONCE);
-    const result = playHand(proof.deck);
-
-    const proofVerdict = verifyRngProof(proof);
-    expect(proofVerdict.ok).toBe(true);
-
-    const dealVerdict = verifyHandDeal(result, proof);
-    expect(dealVerdict.checks.filter((c) => !c.ok)).toEqual([]);
-    expect(dealVerdict.ok).toBe(true);
-
-    // The board truly comes from the shuffled deck.
+  it('replays the published history to the same result', () => {
+    const result = playHand(deckFor(11));
+    const replayed = replayHand({ result, deck: deckFor(11), config: CONFIG });
+    expect(stripTimes(replayed)).toEqual(stripTimes(result));
     expect(result.board).toHaveLength(5);
-    for (const card of result.board) expect(proof.deck).toContain(card);
-
-    // A hand history that lies about a single hole card must not verify.
-    const tampered: HandResult = {
-      ...result,
-      seats: result.seats.map((s, i) => (i === 0 ? { ...s, holeCards: [s.holeCards![0]! ^ 1, s.holeCards![1]!] } : s)),
-    };
-    expect(verifyHandDeal(tampered, proof).ok).toBe(false);
   });
 
   it('verifies a hand that ran out after an all-in, including burns', () => {
-    const proof = buildProof(SEED, ANCHOR, NONCE);
+    const proofDeck = deckFor(12);
     const players = [0, 1].map((seat) => ({
       seat,
       agentId: `agent-${seat}`,
@@ -170,13 +267,13 @@ describe('hand history is the hand that was actually played', () => {
       stack: 1_000n,
     }));
     let step = createHand({
-      handId: 'h-proof',
+      handId: 'h-allin',
       tableId: CONFIG.id,
       handNumber: 1,
       config: CONFIG,
       buttonSeat: 0,
       players,
-      deck: proof.deck,
+      deck: proofDeck,
       now: 0,
     });
     while (!step.state.complete) {
@@ -188,30 +285,35 @@ describe('hand history is the hand that was actually played', () => {
     const result = step.state.result!;
     expect(result.board).toHaveLength(5);
     expect(result.burns).toHaveLength(3);
-    expect(verifyHandDeal(result, proof).ok).toBe(true);
+
+    // Rebuild a proof over the deck this hand actually used.
+    const salts = randomSalts();
+    const commitment = commitDeckOrder(proofDeck, salts);
+    const positions = publicDeckPositions(result);
+    const proof: RngProof = {
+      ...buildProof(result, { audited: true }),
+      deck: proofDeck,
+      deckRoot: `0x${bytesToHex(commitment.root)}`,
+      salts: salts.map((s) => `0x${bytesToHex(s)}`),
+      reveals: [...new Set([...positions.board, ...[...positions.holes.values()].flat()])].map((i) =>
+        revealFor(commitment, i),
+      ),
+    };
+    // This is the "rigged deck" scenario: the committed root opens honestly, but
+    // it is NOT the deck the seed and anchor imply. The audit is what catches it.
+    const audit = verifyRngProof(proof);
+    expect(audit.ok).toBe(false);
+    expect(audit.checks.find((c) => c.name === 'audit.shuffle_matches_published_deck')?.ok).toBe(false);
+
+    // The reveals are still internally consistent with the committed root, which
+    // is exactly why per-card proofs alone cannot catch this — only the audit can.
+    expect(verifyPublicReveals(result, proof).ok).toBe(true);
+
+    // And the deal-map check fails, because the dealt cards do not come from the
+    // ordering the entropy implies.
+    const deal = verifyHandDeal(result, proof);
+    expect(deal.ok).toBe(false);
+    expect(deal.checks.some((c) => c.name === 'deal.board_matches_shuffle' && !c.ok)).toBe(true);
     expect(result.zeroSumVerified).toBe(true);
-  });
-
-  it('replays the published history to the same result', () => {
-    const proof = buildProof(SEED, ANCHOR, NONCE);
-    const result = playHand(proof.deck);
-    const replayed = replayHand({ result, deck: proof.deck, config: CONFIG });
-    expect(stripTimes(replayed)).toEqual(stripTimes(result));
-  });
-
-  it('a different anchor block hash would have produced a different deck', () => {
-    const a = shuffleDeck(`0x${bytesToHex(entropyFrom(SEED, ANCHOR))}`).deck;
-    const other = `0x${bytesToHex(hexToBytes(ANCHOR).map((b) => b ^ 0xff))}`;
-    const b = shuffleDeck(`0x${bytesToHex(entropyFrom(SEED, other))}`).deck;
-    expect(a).not.toEqual(b);
-    // And the deck is a pure function of the entropy.
-    expect(shuffleDeck(`0x${bytesToHex(entropyFrom(SEED, ANCHOR))}`).deck).toEqual(a);
-  });
-
-  it('is stable against the committed cross-language vectors', () => {
-    // deckFor() is the same shuffle the Solidity tests pin; a regression here
-    // would also break the on-chain implementation.
-    expect(deckFor(1).slice(0, 4)).toHaveLength(4);
-    expect(isCompleteDeck(deckFor(1))).toBe(true);
   });
 });

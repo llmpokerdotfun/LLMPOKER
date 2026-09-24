@@ -322,7 +322,9 @@ export class Store {
         commitment: proof.commitment,
         commitBlock: proof.commitBlock,
         anchorBlock: proof.anchorBlock,
-        revealBlock: proof.revealBlock,
+        deckRootBlock: proof.deckRootBlock,
+        deckRoot: proof.deckRoot,
+        audited: proof.audited,
         proofVerified: proof.verified,
       });
     }

@@ -17,6 +17,7 @@ import {
   chipsToTokenString,
   fromConfigJson,
   verifyHandDeal,
+  verifyPublicReveals,
   verifyRngProof,
 } from '@llmpoker/shared';
 import { replayHand } from '@llmpoker/engine';
@@ -25,9 +26,11 @@ export interface HandVerdict {
   handId: string;
   tableId: string;
   ok: boolean;
-  /** Commit-reveal / entropy / shuffle checks (FR-6.3). */
+  /** Seed commitment, hidden-card invariant, anchor, deck root and audit (FR-6.1–6.4, 6.8). */
   proof: ProofVerification;
-  /** The dealt cards really came from the verified deck (FR-6.3, step 7). */
+  /** Every card the hand published opened against the committed root (FR-6.3). */
+  reveals: ProofVerification;
+  /** The dealt cards really came from the audited deck (FR-6.3, §5 step 11). */
   deal: ProofVerification;
   /** Re-running the recorded actions reproduces the published result (NFR-4). */
   replay: { ok: boolean; detail: string } | null;
@@ -88,7 +91,13 @@ export function verifySettlement(result: HandResult): ProofVerification {
 export function verifyHandHistory(history: HandHistory, options: VerifyHandOptions = {}): HandVerdict {
   const { result, proof } = history;
   const proofVerdict = verifyRngProof(proof, options);
-  const dealVerdict = proof.entropy === null ? { ok: false, checks: [check('deal.deck_available', false, 'proof not revealed')] } : verifyHandDeal(result, proof);
+  // FR-6.3 checks that work before the audit too: each published card must open
+  // against the committed root, and must sit at the position the deal map says.
+  const revealVerdict = verifyPublicReveals(result, proof);
+  const dealVerdict =
+    proof.phase === 'AUDITED'
+      ? verifyHandDeal(result, proof)
+      : { ok: false, checks: [check('deal.requires_audit', false, `the deck is only fully checkable after the FR-6.4 audit (phase = ${proof.phase})`)] };
   const settlementVerdict = verifySettlement(result);
 
   let replay: HandVerdict['replay'] = null;
@@ -109,13 +118,18 @@ export function verifyHandHistory(history: HandHistory, options: VerifyHandOptio
   }
 
   const ok =
-    proofVerdict.ok && dealVerdict.ok && settlementVerdict.ok && (replay === null || replay.ok);
+    proofVerdict.ok &&
+    revealVerdict.ok &&
+    dealVerdict.ok &&
+    settlementVerdict.ok &&
+    (replay === null || replay.ok);
 
   return {
     handId: result.handId,
     tableId: result.tableId,
     ok,
     proof: proofVerdict,
+    reveals: revealVerdict,
     deal: dealVerdict,
     replay,
     settlement: settlementVerdict,

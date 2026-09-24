@@ -8,6 +8,11 @@
  *
  * Keep this file in sync with `packages/shared/src/types.ts`; it contains no
  * runtime code.
+ *
+ * FR-6 (patched) is encoded in {@link RngProof}: while a hand is live the seed,
+ * the entropy, the salts and the deck ordering are secret — `proof.deck` is an
+ * **empty array by design**, not missing data. Only per-card {@link CardReveal}
+ * entries carry card values before the phase-4 audit.
  */
 
 /** @typedef {string} ChipsJson Decimal string of chip base units (1 token = 1e18). */
@@ -19,6 +24,12 @@
 /** @typedef {'OPEN'|'RUNNING'|'PAUSED'|'CLOSED'} TableStatus */
 /** @typedef {'EMPTY'|'SITTING_OUT'|'ACTIVE'|'FOLDED'|'ALL_IN'|'BUSTED'} SeatStatus */
 /** @typedef {'HIGH_CARD'|'PAIR'|'TWO_PAIR'|'TRIPS'|'STRAIGHT'|'FLUSH'|'FULL_HOUSE'|'QUADS'|'STRAIGHT_FLUSH'|'ROYAL_FLUSH'} HandCategory */
+
+/** FR-6 lifecycle of one verifiable-RNG hand, mirroring `IShuffle.Phase`. */
+/** @typedef {'NONE'|'SEED_COMMITTED'|'DECK_COMMITTED'|'AUDITED'|'VOIDED'} RngPhase */
+
+/** FR-6.7 liveness: why a hand was voided instead of audited. */
+/** @typedef {'NO_DECK_COMMITMENT'|'AUDIT_STALLED'|'AUDIT_FAILED'} RngVoidReason */
 
 /**
  * @typedef {Object} TableConfig
@@ -50,7 +61,7 @@
  * @property {ChipsJson} stack
  * @property {ChipsJson} committed
  * @property {ChipsJson} totalCommitted
- * @property {number[]|null} holeCards
+ * @property {number[]|null} holeCards `null` while hidden (FR-6: never sent mid-hand)
  * @property {ChipsJson|null} escrow
  */
 
@@ -80,7 +91,9 @@
  * @property {ChipsJson} minRaiseTo
  * @property {number|null} toActSeat
  * @property {number|null} actionDeadlineTs
- * @property {string|null} rngCommitment
+ * @property {string|null} rngCommitment FR-6.1 phase-1 seed commitment for the in-flight hand.
+ * @property {string|null} rngDeckRoot FR-6.2 phase-2 Merkle root of the salted deck.
+ * @property {RngPhase} rngPhase how far the FR-6 lifecycle has progressed for the in-flight hand.
  * @property {number} startedAt
  * @property {number} updatedAt
  */
@@ -114,24 +127,52 @@
  */
 
 /**
+ * One card the game rules made public, with its Merkle path (FR-6.3).
+ *
+ * @typedef {Object} CardReveal
+ * @property {number} index position in the shuffled deck, `0..51`
+ * @property {number} card card id `0..51`
+ * @property {string} salt 0x-prefixed 32-byte salt
+ * @property {string[]} proof 6 sibling hashes, leaf level first
+ */
+
+/**
+ * Everything a verifier needs about one hand's shuffle (FR-6, patched).
+ *
+ * While `phase` is `SEED_COMMITTED` or `DECK_COMMITTED`, `deckSeed`, `entropy`
+ * and `salts` are `null` and `deck` is empty; only `reveals` may carry card
+ * values. After the hand, `phase` is `AUDITED` and the full `deck`, `salts`,
+ * `deckSeed` and `entropy` are published so the commitment is provable forever.
+ *
  * @typedef {Object} RngProof
  * @property {string} handId
  * @property {string} tableId
  * @property {number} handNumber
- * @property {string} commitment
- * @property {string|null} deckSeed
- * @property {string} nonce
- * @property {number|null} commitBlock
+ * @property {RngPhase} phase
+ * @property {string} commitment FR-6.1: keccak256(abi.encodePacked(deckSeed, nonce))
+ * @property {string} nonce per-table uint256, decimal
+ * @property {number|null} commitBlock block N
  * @property {string|null} commitTxHash
- * @property {number|null} anchorBlock
- * @property {string|null} anchorBlockHash
- * @property {number|null} revealBlock
- * @property {string|null} revealTxHash
- * @property {string|null} entropy
- * @property {number[]} deck
- * @property {boolean} verified
+ * @property {number|null} anchorBlock block N+1
+ * @property {string|null} anchorBlockHash hash of block N+1
+ * @property {string|null} deckRoot FR-6.2: Merkle root over leaf_i = keccak256(card_i ‖ salt_i)
+ * @property {number|null} deckRootBlock block M
+ * @property {string|null} deckRootTxHash
+ * @property {CardReveal[]} reveals FR-6.3: only what the rules made public
+ * @property {boolean} audited FR-6.4: the end-of-hand audit passed
+ * @property {string|null} deckSeed null while live; published with the audit
+ * @property {string|null} entropy null while live; published with the audit
+ * @property {string[]|null} salts 52 salts, published with the audit
+ * @property {number[]} deck the 52-card ordering: EMPTY while the hand is live
+ * @property {number|null} auditBlock
+ * @property {string|null} auditTxHash
+ * @property {string|null} slashed bond slashed because the audit proved a cheat (FR-6.5)
+ * @property {RngVoidReason|null} voidedReason FR-6.7 liveness
+ * @property {'ONCHAIN'|'LOCAL'} anchorSource
+ * @property {number} requiredConfirmations confirmations required over the anchor (FR-6.5)
+ * @property {boolean} verified server-stored verdict flag
  * @property {number|null} verifiedAt
- * @property {number} chainId
+ * @property {number} chainId 4663 = Robinhood Chain
  */
 
 /**
@@ -216,7 +257,8 @@
  * @typedef {Object} HandHistory
  * @property {HandResult} result
  * @property {RngProof} proof
- * @property {number[]} deck
+ * @property {number[]} deck top-level copy of the audited ordering; empty while live
+ * @property {TableConfig|null} [config]
  */
 
 /**
@@ -237,8 +279,9 @@
  * @property {string} commitment
  * @property {number|null} commitBlock
  * @property {number|null} anchorBlock
- * @property {number|null} revealBlock
  * @property {boolean} proofVerified
+ * @property {string|null} deckRoot FR-6.2: the committed deck root for this hand
+ * @property {boolean} audited FR-6.4: the end-of-hand audit passed
  * @property {boolean} [fromLive] Locally derived from a WS delta, not from `/api/v1/hands`.
  */
 
@@ -282,12 +325,42 @@
  * @property {number} deadlineTs
  */
 
+// ---------------------------------------------------------------------------
+// Table events — the delta vocabulary on /api/v1/ws (FR-6.1, FR-6.2, FR-6.3, FR-6.4)
+// ---------------------------------------------------------------------------
+
+/** @typedef {'HAND_STARTED'|'BLIND_POSTED'|'HOLE_CARDS_DEALT'|'ACTION_REQUIRED'|'ACTION_TAKEN'|'STREET_ADVANCED'|'SHOWDOWN'|'POT_AWARDED'|'HAND_COMPLETE'|'RNG_SEED_COMMITTED'|'RNG_DECK_COMMITTED'|'CARD_REVEALED'|'RNG_AUDITED'|'RNG_VOIDED'|'SEAT_CHANGED'|'TABLE_STATE'} TableEventType */
+
+/** @typedef {{type: 'HAND_STARTED', handId: string, handNumber: number, buttonSeat: number, blinds: {sb: number, bb: number}, ante: ChipsJson}} HandStartedEvent */
+/** @typedef {{type: 'BLIND_POSTED', seat: number, amount: ChipsJson, kind: 'SMALL_BLIND'|'BIG_BLIND'|'ANTE'}} BlindPostedEvent */
+/** @typedef {{type: 'HOLE_CARDS_DEALT', seat: number}} HoleCardsDealtEvent */
+/** @typedef {{type: 'ACTION_REQUIRED', seat: number, request: ActionRequest}} ActionRequiredEvent */
+/** @typedef {{type: 'ACTION_TAKEN', record: ActionRecord}} ActionTakenEvent */
+/** @typedef {{type: 'STREET_ADVANCED', street: Street, board: number[], burns: number}} StreetAdvancedEvent */
+/** @typedef {{type: 'SHOWDOWN', reveals: RevealedHand[]}} ShowdownEvent */
+/** @typedef {{type: 'POT_AWARDED', award: PotAward}} PotAwardedEvent */
+/** @typedef {{type: 'HAND_COMPLETE', result: HandResult}} HandCompleteEvent */
+/** @typedef {{type: 'RNG_SEED_COMMITTED', commitment: string, nonce: string, commitBlock: number|null}} RngSeedCommittedEvent */
+/** @typedef {{type: 'RNG_DECK_COMMITTED', deckRoot: string, deckRootBlock: number|null, anchorBlock: number|null}} RngDeckCommittedEvent */
+/** @typedef {{type: 'CARD_REVEALED', reveal: CardReveal}} CardRevealedEvent */
+/** @typedef {{type: 'RNG_AUDITED', proof: RngProof}} RngAuditedEvent */
+/** @typedef {{type: 'RNG_VOIDED', reason: RngVoidReason}} RngVoidedEvent */
+/** @typedef {{type: 'SEAT_CHANGED', seat: number, status: SeatStatus, stack: ChipsJson}} SeatChangedEvent */
+/** @typedef {{type: 'TABLE_STATE', table: TableSnapshot}} TableStateEvent */
+
+/**
+ * The frozen table-event union. The two FR-6 event names of the *old* scheme
+ * (`RNG_COMMITTED`, `RNG_REVEALED`) no longer exist.
+ *
+ * @typedef {HandStartedEvent|BlindPostedEvent|HoleCardsDealtEvent|ActionRequiredEvent|ActionTakenEvent|StreetAdvancedEvent|ShowdownEvent|PotAwardedEvent|HandCompleteEvent|RngSeedCommittedEvent|RngDeckCommittedEvent|CardRevealedEvent|RngAuditedEvent|RngVoidedEvent|SeatChangedEvent|TableStateEvent} TableEvent
+ */
+
 /**
  * @typedef {Object} TableEventEnvelope
  * @property {number} seq
  * @property {number} at
  * @property {string} tableId
- * @property {any} payload
+ * @property {TableEvent} payload
  */
 
 /**
@@ -356,8 +429,9 @@
 
 /**
  * @typedef {Object} HandVerificationResponse
- * @property {ProofVerification} proof
- * @property {ProofVerification} deal
+ * @property {ProofVerification} proof `verifyRngProof()` on the server
+ * @property {ProofVerification} deal `verifyHandDeal()` on the server
+ * @property {ProofVerification} [settlement] `verifySettlement()` on the server
  */
 
 export {};

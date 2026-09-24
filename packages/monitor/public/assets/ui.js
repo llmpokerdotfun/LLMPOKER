@@ -198,6 +198,57 @@ export function boolBadge(label, ok, title) {
   return badge(label, ok ? 'verified' : 'failed', title);
 }
 
+/**
+ * FR-6 lifecycle (`RngPhase`): short human label for each phase.
+ *
+ * @type {Record<string, string>}
+ */
+const RNG_PHASE_LABEL = {
+  NONE: 'no commitment',
+  SEED_COMMITTED: 'seed committed',
+  DECK_COMMITTED: 'deck committed',
+  AUDITED: 'audited',
+  VOIDED: 'voided',
+};
+
+/** @type {Record<string, string>} */
+const RNG_PHASE_KIND = {
+  NONE: 'muted',
+  SEED_COMMITTED: 'info',
+  DECK_COMMITTED: 'active',
+  AUDITED: 'verified',
+  VOIDED: 'failed',
+};
+
+/** @type {Record<string, string>} */
+const RNG_PHASE_TITLE = {
+  NONE: 'FR-6: no seed commitment published for this hand yet',
+  SEED_COMMITTED: 'FR-6.1: commitment published — the seed itself is still secret',
+  DECK_COMMITTED: 'FR-6.2: the salted-deck Merkle root is committed — ordering and salts stay secret',
+  AUDITED: 'FR-6.4: the hand ended and the audit published the seed, entropy, salts and deck ordering',
+  VOIDED: 'FR-6.7: the hand was voided and publishes no ordering',
+};
+
+/**
+ * @param {import('./types.js').RngPhase|string|null|undefined} phase
+ * @returns {string} human label, `—` for an unknown/absent phase
+ */
+export function rngPhaseLabel(phase) {
+  if (typeof phase !== 'string') return '\u2014';
+  return RNG_PHASE_LABEL[phase] ?? phase;
+}
+
+/**
+ * Badge for the FR-6 lifecycle phase of a hand.
+ *
+ * @param {import('./types.js').RngPhase|string|null|undefined} phase
+ * @returns {HTMLElement}
+ */
+export function rngPhaseBadge(phase) {
+  const key = typeof phase === 'string' ? phase : 'NONE';
+  return badge(rngPhaseLabel(key), RNG_PHASE_KIND[key] ?? 'muted', RNG_PHASE_TITLE[key] ?? `phase = ${key}`);
+}
+
 // ---------------------------------------------------------------------------
 // Cards and money
 // ---------------------------------------------------------------------------

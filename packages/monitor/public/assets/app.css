@@ -1001,6 +1001,12 @@ a:focus-visible {
   border-color: #f0c96a;
 }
 
+.proof-voided {
+  color: #f7e9e8;
+  background: #7d2a26;
+  border-color: #ff8b84;
+}
+
 .proof-subblock {
   display: flex;
   flex-direction: column;
@@ -1081,6 +1087,119 @@ a:focus-visible {
 .deck-mismatch {
   border-color: var(--red);
   background: var(--red-soft);
+}
+
+/* --------------------------------------------------- FR-6 phase timeline  */
+
+.phase-stepper {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.phase-step {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas:
+    "marker label"
+    "marker sub";
+  gap: 2px 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: #0e1524;
+}
+
+.phase-step-marker {
+  grid-area: marker;
+  font-family: var(--mono);
+  font-size: 1rem;
+  color: var(--muted);
+}
+
+.phase-step-label {
+  grid-area: label;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.phase-step-sub {
+  grid-area: sub;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.phase-step[data-state="done"] {
+  border-color: var(--green);
+  background: var(--green-soft);
+}
+
+.phase-step[data-state="done"] .phase-step-marker {
+  color: var(--green);
+}
+
+.phase-step[data-state="current"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.phase-step[data-state="current"] .phase-step-marker {
+  color: var(--accent);
+}
+
+.phase-step[data-state="void"] {
+  border-color: var(--red);
+  background: var(--red-soft);
+}
+
+.phase-step[data-state="void"] .phase-step-marker {
+  color: var(--red);
+}
+
+.reveal-summary {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--amber);
+  border-radius: var(--radius-sm);
+  background: var(--amber-soft);
+}
+
+.reveal-summary strong {
+  color: var(--amber);
+}
+
+.reveal-table {
+  font-size: 0.84rem;
+}
+
+.merkle-proof {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.card-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.audit-deck {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.check-table tr.check-pending td {
+  color: var(--text-dim);
+}
+
+.check-table tr.check-pending .badge {
+  opacity: 0.9;
 }
 
 .street-group {

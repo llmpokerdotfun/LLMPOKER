@@ -13,10 +13,12 @@ import {
   RAKE,
   TABLE_CONFIG,
   TABLE_ID,
-  commitHand,
+  TEST_REQUIRED_BOND,
+  VOID_REASON,
+  commitHiddenDeck,
+  commitSeedPhase,
   createWagerTable,
   expectedRake,
-  revealHand,
   seatKey,
   snapshotFixture,
   type PokerStack,
@@ -69,12 +71,11 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
     const sawFlop = options.sawFlop ?? true;
 
     const seed = ethers.keccak256(ethers.toUtf8Bytes(`${handId}-seed`));
-    await commitHand(stack, handId, seed, 1n);
+    await commitHiddenDeck(stack, handId, seed, 1n);
     await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
     for (const [index, seat] of seats.entries()) {
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, seat, contributions[index]!);
     }
-    await revealHand(stack, handId, seed);
 
     const pot = contributions.reduce((a, b) => a + b, 0n);
     const rake = expectedRake(pot, TABLE_CONFIG.rakeBps, TABLE_CONFIG.rakeCap, sawFlop);
@@ -282,7 +283,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll();
       const handId = handIdOf('uncommitted');
       await expect(poker.connect(stack.operator).openHand(TABLE_ID, handId, SEATS))
-        .to.be.revertedWithCustomError(poker, 'ShuffleNotRevealed')
+        .to.be.revertedWithCustomError(poker, 'ShuffleNotCommitted')
         .withArgs(handId);
     });
 
@@ -290,7 +291,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll();
       const handId = handIdOf('operator-only');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
 
       await expect(poker.connect(stack.players[0]!).openHand(TABLE_ID, handId, SEATS))
         .to.be.revertedWithCustomError(poker, 'NotOperator')
@@ -298,7 +299,6 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, SEATS);
       await expect(poker.connect(stack.players[0]!).commitHand(TABLE_ID, handId, 0, 1n))
         .to.be.revertedWithCustomError(poker, 'NotOperator');
-      await revealHand(stack, handId, seed);
       await expect(
         poker.connect(stack.players[0]!).settleHand(TABLE_ID, handId, [], [0], [0n], true),
       ).to.be.revertedWithCustomError(poker, 'NotOperator');
@@ -344,13 +344,12 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll(seats);
       const handId = handIdOf('event');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('event-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       const contributions = seats.map(() => ethers.parseEther('10'));
       for (const [index, seat] of seats.entries()) {
         await poker.connect(stack.operator).commitHand(TABLE_ID, handId, seat, contributions[index]!);
       }
-      await revealHand(stack, handId, seed);
 
       const pot = ethers.parseEther('40');
       const rake = RAKE.cap;
@@ -393,11 +392,10 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll(seats);
       const handId = handIdOf('bad-contributions');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('bad-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('20'));
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 1, ethers.parseEther('20'));
-      await revealHand(stack, handId, seed);
 
       // Under-declared pot.
       await expect(
@@ -419,12 +417,11 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       const handId = handIdOf('bad-awards');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('bad-awards-seed'));
       const contributions = [ethers.parseEther('20'), ethers.parseEther('20')];
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       for (const [index, seat] of seats.entries()) {
         await poker.connect(stack.operator).commitHand(TABLE_ID, handId, seat, contributions[index]!);
       }
-      await revealHand(stack, handId, seed);
 
       const expected = ethers.parseEther('40') - RAKE.cap;
       await expect(
@@ -434,19 +431,20 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
         .withArgs(expected, expected + 1n);
     });
 
-    it('rejects a settlement of a hand whose shuffle was never revealed', async () => {
+    it('rejects a settlement of a hand whose deck root was never committed (FR-6.2)', async () => {
       const seats = [0, 1];
       await seatAll(seats);
       const handId = handIdOf('unrevealed');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('unrevealed-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      // Phase 1 only: the seed is committed but no deck root exists yet, so nothing can settle.
+      await commitSeedPhase(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('20'));
 
       await expect(
         poker.connect(stack.operator).settleHand(TABLE_ID, handId, [ethers.parseEther('20'), 0n], [0], [ethers.parseEther('20')], true),
       )
-        .to.be.revertedWithCustomError(poker, 'ShuffleNotRevealed')
+        .to.be.revertedWithCustomError(poker, 'ShuffleDeckNotCommitted')
         .withArgs(handId);
     });
 
@@ -488,7 +486,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll([0, 1]);
       const handId = handIdOf('dup-seat');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('dup-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await expect(poker.connect(stack.operator).openHand(TABLE_ID, handId, [0, 0]))
         .to.be.revertedWithCustomError(poker, 'HandPending')
         .withArgs(handId);
@@ -498,7 +496,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll([0, 1]);
       const handId = handIdOf('unseated');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('unseated-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await expect(poker.connect(stack.operator).openHand(TABLE_ID, handId, [0, 4]))
         .to.be.revertedWithCustomError(poker, 'NoPosition');
     });
@@ -511,15 +509,13 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       }
       const handId = handIdOf('lock');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('lock-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('20'));
 
       await expect(poker.connect(stack.players[0]!).cashOut(TABLE_ID, 0))
         .to.be.revertedWithCustomError(poker, 'HandPending')
         .withArgs(handId);
-
-      await revealHand(stack, handId, seed);
       await poker
         .connect(stack.operator)
         .settleHand(TABLE_ID, handId, [ethers.parseEther('20'), 0n], [1], [ethers.parseEther('20') - RAKE.cap], true);
@@ -537,13 +533,12 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll(seats);
       const handId = handIdOf('trailing-zeros');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('trailing-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       const contributions = [ethers.parseEther('20'), ethers.parseEther('20')];
       for (const [index, seat] of seats.entries()) {
         await poker.connect(stack.operator).commitHand(TABLE_ID, handId, seat, contributions[index]!);
       }
-      await revealHand(stack, handId, seed);
 
       // Six entries for a two-seat hand: the extra four are zero.
       const padded = [...contributions, 0n, 0n, 0n, 0n];
@@ -559,7 +554,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll(seats);
       const handId = handIdOf('over-escrow');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('over-escrow-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
 
       // FR-5.3: chips leave escrow as they are committed, so a seat can never promise more than
@@ -580,12 +575,11 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       const handId = handIdOf('split-pot');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('split-seed'));
       const contributions = seats.map(() => ethers.parseEther('20'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       for (const [index, seat] of seats.entries()) {
         await poker.connect(stack.operator).commitHand(TABLE_ID, handId, seat, contributions[index]!);
       }
-      await revealHand(stack, handId, seed);
 
       const pot = ethers.parseEther('60');
       const rake = RAKE.cap;
@@ -607,8 +601,8 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       const second = handIdOf('concurrent-b');
       const seedA = ethers.keccak256(ethers.toUtf8Bytes('a'));
       const seedB = ethers.keccak256(ethers.toUtf8Bytes('b'));
-      await commitHand(stack, first, seedA, 1n);
-      await commitHand(stack, second, seedB, 1n);
+      await commitHiddenDeck(stack, first, seedA, 1n);
+      await commitHiddenDeck(stack, second, seedB, 1n);
 
       await poker.connect(stack.operator).openHand(TABLE_ID, first, [0, 1]);
       await expect(poker.connect(stack.operator).openHand(TABLE_ID, second, [1, 2]))
@@ -625,7 +619,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll(seats);
       const handId = handIdOf('void-pending');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('void-pending-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('20'));
 
@@ -640,7 +634,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       const handId = handIdOf('void-restores');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('void-restores-seed'));
       const contributions = [ethers.parseEther('20'), ethers.parseEther('15'), ethers.parseEther('10')];
-      const { commitBlock } = await commitHand(stack, handId, seed, 1n);
+      const { commitBlock } = await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       for (const [index, seat] of seats.entries()) {
         await poker.connect(stack.operator).commitHand(TABLE_ID, handId, seat, contributions[index]!);
@@ -673,7 +667,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll(seats);
       const handId = handIdOf('void-then-settle');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('void-then-settle-seed'));
-      const { commitBlock } = await commitHand(stack, handId, seed, 1n);
+      const { commitBlock } = await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('20'));
       await mineUpTo(BigInt(commitBlock) + 257n);
@@ -692,36 +686,41 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       );
     });
 
-    it('lets the owner void a hand whose anchor block was orphaned (FR-5.6, NFR-6)', async () => {
+    it('refunds a hand whose shuffle window expired, permissionlessly (FR-5.6, FR-6.7, NFR-6)', async () => {
       const seats = [0, 1];
       await seatAll(seats);
       const handId = handIdOf('reorg');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('reorg-seed'));
-      const { commitBlock } = await commitHand(stack, handId, seed, 1n);
+      // Phase 1 only: the operator never publishes a deck root, which is the FR-6.7 liveness
+      // failure this path exists for (and the shape a reorg-orphaned anchor takes).
+      const { commitBlock } = await commitSeedPhase(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('20'));
 
-      // Before the window expires the anchor is not invalid yet.
-      await expect(poker.connect(stack.owner).voidInvalidAnchor(TABLE_ID, handId))
-        .to.be.revertedWithCustomError(poker, 'ShuffleStillPending');
+      // The commit window is still open, so nothing can be voided yet.
+      await expect(poker.connect(stack.owner).voidHand(TABLE_ID, handId))
+        .to.be.revertedWithCustomError(poker, 'ShuffleStillPending')
+        .withArgs(handId);
 
+      // Expire the FR-6.7 window; anyone may now void the shuffle, slashing the operator bond.
       await mineUpTo(BigInt(commitBlock) + 257n);
-      await expect(poker.connect(stack.players[0]!).voidInvalidAnchor(TABLE_ID, handId)).to.be.revertedWithCustomError(
-        poker,
-        'OwnableUnauthorizedAccount',
-      );
-      await expect(poker.connect(stack.owner).voidInvalidAnchor(TABLE_ID, handId))
+      const voidableFrom = BigInt(commitBlock) + 257n;
+      await expect(stack.shuffle.connect(stack.players[0]!).void(handId))
+        .to.emit(stack.shuffle, 'Voided')
+        .withArgs(handId, VOID_REASON.NoDeckCommitment, TEST_REQUIRED_BOND, voidableFrom + 1n);
+
+      // FR-5.6 / FR-6.7: the hand void is permissionless and restores every contribution.
+      await expect(poker.connect(stack.players[0]!).voidHand(TABLE_ID, handId))
         .to.emit(poker, 'HandVoided')
-        .withArgs(TABLE_ID, handId, ethers.parseEther('20'), ethers.encodeBytes32String('ANCHOR_INVALID'));
+        .withArgs(TABLE_ID, handId, ethers.parseEther('20'), ethers.encodeBytes32String('SHUFFLE_VOIDED'));
 
       expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(LEGAL_BUY_IN);
       expect(await poker.pendingHandsOf(TABLE_ID)).to.equal(0n);
 
-      // The reveal is still impossible, so the hand can never be settled afterwards.
-      await expect(stack.shuffle.connect(stack.operator).reveal(handId, seed)).to.be.revertedWithCustomError(
-        stack.shuffle,
-        'OutsideRevealWindow',
-      );
+      // The shuffle is still un-committable, so the hand can never be settled afterwards.
+      await expect(
+        stack.shuffle.connect(stack.operator).commitDeck(handId, ethers.ZeroHash, new Array(52).fill(ethers.ZeroHash)),
+      ).to.be.revertedWithCustomError(stack.shuffle, 'WrongPhase');
       await expect(
         poker.connect(stack.operator).settleHand(TABLE_ID, handId, [ethers.parseEther('20'), 0n], [0], [ethers.parseEther('20')], true),
       ).to.be.revertedWithCustomError(poker, 'HandNotOpen');
@@ -760,12 +759,11 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       // ...settlement is blocked...
       const handId = handIdOf('paused');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('paused-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await expect(poker.connect(stack.operator).openHand(TABLE_ID, handId, seats)).to.be.reverted;
       await poker.connect(stack.owner).unpause();
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('20'));
-      await revealHand(stack, handId, seed);
       await poker.connect(stack.owner).pause();
       await expect(
         poker.connect(stack.operator).settleHand(TABLE_ID, handId, [ethers.parseEther('20'), 0n], [0], [ethers.parseEther('20') - RAKE.cap], true),
@@ -835,7 +833,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await seatAll(seats);
       const handId = handIdOf('verifier-info');
       const seed = ethers.keccak256(ethers.toUtf8Bytes('verifier-seed'));
-      await commitHand(stack, handId, seed, 1n);
+      await commitHiddenDeck(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
       const [status, pot, seatCount, participants] = await poker.handInfoOf(TABLE_ID, handId);
       expect(status).to.equal(1n); // Open

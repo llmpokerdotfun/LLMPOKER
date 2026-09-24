@@ -27,6 +27,7 @@ import { setChromeInfo, setConnectionIndicator } from './ui.js';
  * @typedef {import('./types.js').Mode} Mode
  * @typedef {import('./types.js').MonitorEvent} MonitorEvent
  * @typedef {import('./types.js').ServerMessage} ServerMessage
+ * @typedef {import('./types.js').TableEvent} TableEvent
  * @typedef {import('./types.js').TableEventEnvelope} TableEventEnvelope
  * @typedef {import('./types.js').TableSnapshot} TableSnapshot
  */
@@ -73,6 +74,14 @@ const listeners = new Set();
 const handListeners = new Set();
 /** @type {Map<string, ActionRequest>} */
 const actionRequests = new Map();
+/**
+ * Deck positions this client has seen revealed (FR-6.3), per table, from
+ * `CARD_REVEALED` deltas on this connection. Positions absent from the set stay
+ * hidden commitments — the feed never carries their card values at all.
+ *
+ * @type {Map<string, Set<number>>}
+ */
+const revealedPositions = new Map();
 
 /** @type {WebSocket|null} */
 let socket = null;
@@ -123,6 +132,19 @@ export function onHandComplete(listener) {
 /** @param {string} tableId @returns {ActionRequest|null} */
 export function getActionRequest(tableId) {
   return actionRequests.get(tableId) ?? null;
+}
+
+/**
+ * Deck positions seen revealed for a table on **this** connection (FR-6.3).
+ * `null` when nothing has been revealed yet; the count is a lower bound, since
+ * a reconnect starts over (the authoritative list is `proof.reveals` on
+ * `/api/v1/hands/:id`).
+ *
+ * @param {string} tableId
+ * @returns {Set<number>|null}
+ */
+export function getRevealedPositions(tableId) {
+  return revealedPositions.get(tableId) ?? null;
 }
 
 /** @param {string} tableId @returns {TableSnapshot|null} */
@@ -336,7 +358,7 @@ export function applyTableEvent(tableId, envelope) {
 /**
  * @param {string} tableId
  * @param {TableSnapshot} table
- * @param {any} payload
+ * @param {TableEvent} payload
  * @returns {void}
  */
 function applyTableEventPayload(tableId, table, payload) {
@@ -344,11 +366,43 @@ function applyTableEventPayload(tableId, table, payload) {
     case 'TABLE_STATE':
       upsertTable(payload.table);
       return;
-    case 'RNG_COMMITTED':
+    case 'RNG_SEED_COMMITTED':
+      // FR-6.1 phase 1: the commitment is public, the seed is not — and nothing
+      // on the wire carries it, so no page can leak it.
       table.rngCommitment = payload.commitment;
+      table.rngPhase = 'SEED_COMMITTED';
       break;
-    case 'RNG_REVEALED':
-      table.rngCommitment = payload.proof?.commitment ?? table.rngCommitment;
+    case 'RNG_DECK_COMMITTED':
+      // FR-6.2 phase 2: the Merkle root only; the ordering and salts stay secret.
+      table.rngDeckRoot = payload.deckRoot;
+      table.rngPhase = 'DECK_COMMITTED';
+      break;
+    case 'CARD_REVEALED': {
+      // FR-6.3 phase 3: record the position, never a hidden card. Only the
+      // cards the rules made public ever arrive here.
+      const reveal = payload.reveal;
+      if (reveal && Number.isInteger(reveal.index)) {
+        let positions = revealedPositions.get(tableId);
+        if (!positions) {
+          positions = new Set();
+          revealedPositions.set(tableId, positions);
+        }
+        positions.add(reveal.index);
+      }
+      break;
+    }
+    case 'RNG_AUDITED': {
+      // FR-6.4 phase 4: the hand is over, so the audit is public.
+      const audit = payload.proof;
+      if (audit) {
+        table.rngCommitment = audit.commitment;
+        table.rngDeckRoot = audit.deckRoot;
+        table.rngPhase = audit.phase;
+      }
+      break;
+    }
+    case 'RNG_VOIDED':
+      table.rngPhase = 'VOIDED';
       break;
     case 'STREET_ADVANCED':
       table.street = payload.street;
@@ -361,7 +415,10 @@ function applyTableEventPayload(tableId, table, payload) {
       table.street = 'PREFLOP';
       table.board = [];
       table.rngCommitment = null;
+      table.rngDeckRoot = null;
+      table.rngPhase = 'NONE';
       actionRequests.delete(tableId);
+      revealedPositions.delete(tableId);
       break;
     case 'SEAT_CHANGED': {
       const seat = table.seats.find((s) => s.seat === payload.seat);
@@ -404,10 +461,12 @@ function applyTableEventPayload(tableId, table, payload) {
 /**
  * Builds a `HandSummary`-shaped row from a `HAND_COMPLETE` delta.
  *
- * A live delta does not carry the RNG commitment for the hand that just ended,
- * so `commitment` is empty and the block numbers are `null`; those rows are
- * flagged `fromLive: true` and pages replace them with the authoritative
- * `/api/v1/hands` entry on their next refresh.
+ * A live delta does not carry the RNG commitment for the hand that just ended
+ * (the authoritative record arrives with `RNG_AUDITED` / `/api/v1/hands`), so
+ * `commitment` is empty, `deckRoot` is `null`, `audited` is `false` and the
+ * block numbers are `null`; those rows are flagged `fromLive: true` and pages
+ * replace them with the authoritative `/api/v1/hands` entry on their next
+ * refresh.
  *
  * @param {HandResult} result
  * @returns {HandSummary}
@@ -443,8 +502,9 @@ export function summarizeHandResult(result) {
     commitment: '',
     commitBlock: null,
     anchorBlock: null,
-    revealBlock: null,
     proofVerified: false,
+    deckRoot: null,
+    audited: false,
     fromLive: true,
   };
 }

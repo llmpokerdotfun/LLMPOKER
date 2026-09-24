@@ -8,6 +8,7 @@
  */
 
 import type { Card } from './cards.js';
+import type { CardReveal } from './merkle.js';
 
 /** Chips are indivisible base units (1 token = 1e18). */
 export type Chips = bigint;
@@ -91,8 +92,12 @@ export interface TableSnapshot {
   toActSeat: number | null;
   /** Unix ms when the seat on the clock must have acted (FR-3.5). */
   actionDeadlineTs: number | null;
-  /** FR-6: commitment published for the in-flight hand, if any. */
+  /** FR-6.1: phase-1 seed commitment for the in-flight hand, if any. */
   rngCommitment: string | null;
+  /** FR-6.2: Merkle root of the salted deck, published at phase 2. */
+  rngDeckRoot: string | null;
+  /** How far the FR-6 lifecycle has progressed for the in-flight hand. */
+  rngPhase: RngPhase;
   startedAt: number;
   updatedAt: number;
 }
@@ -301,35 +306,71 @@ export interface HandHistory {
 }
 
 // ---------------------------------------------------------------------------
-// RNG proof (FR-6)
+// RNG proof (FR-6, patched: hidden cards)
 // ---------------------------------------------------------------------------
 
+/** Lifecycle of one verifiable-RNG hand, mirroring `IShuffle.Phase`. */
+export type RngPhase = 'NONE' | 'SEED_COMMITTED' | 'DECK_COMMITTED' | 'AUDITED' | 'VOIDED';
+
+export type RngVoidReason = 'NO_DECK_COMMITMENT' | 'AUDIT_STALLED' | 'AUDIT_FAILED';
+
+/**
+ * Everything a verifier needs about one hand's shuffle.
+ *
+ * The patched FR-6 invariant — *"the seed and full deck ordering MUST NEVER be
+ * published while a hand is live"* — is encoded in the shape of this type:
+ *
+ * * while `phase` is `SEED_COMMITTED` or `DECK_COMMITTED`, `deckSeed`, `entropy`,
+ *   `salts` are `null` and `deck` is empty. The only card values that may appear
+ *   are in `reveals`, one entry per card the rules actually made public, each
+ *   carrying a Merkle proof against `deckRoot`.
+ * * after the hand, `phase` is `AUDITED` and the full `deck`, `salts` and
+ *   `deckSeed` are published so the commitment can be proven permanently.
+ *
+ * `verifyRngProof` fails a proof that violates this, so a server cannot leak the
+ * deck early without the leak being detectable.
+ */
 export interface RngProof {
   handId: string;
   tableId: string;
   handNumber: number;
-  /** keccak256(seed ‖ nonce), 0x-prefixed 32 bytes. */
+  phase: RngPhase;
+
+  /** FR-6.1 phase 1: `keccak256(abi.encodePacked(bytes32 deckSeed, uint256 nonce))`. */
   commitment: string;
-  /** Revealed seed, 0x-prefixed 32 bytes. `null` until revealed. */
-  deckSeed: string | null;
   nonce: string;
   commitBlock: number | null;
   commitTxHash: string | null;
+
+  /** FR-6.2 phase 2: the anchor block and the Merkle root of the salted deck. */
   anchorBlock: number | null;
   anchorBlockHash: string | null;
-  revealBlock: number | null;
-  revealTxHash: string | null;
-  /** keccak256(seed ‖ anchorBlockHash). */
+  deckRoot: string | null;
+  deckRootBlock: number | null;
+  deckRootTxHash: string | null;
+
+  /** FR-6.3 phase 3: only the cards the rules required, each with its proof. */
+  reveals: CardReveal[];
+
+  /** FR-6.4 phase 4: the end-of-hand audit. All of these are `null`/empty while live. */
+  audited: boolean;
+  deckSeed: string | null;
   entropy: string | null;
-  /** The stored 52-card ordering, as card ids. */
+  /** 52 salts, published with the audit. */
+  salts: string[] | null;
+  /** The 52-card ordering, published with the audit. Empty while the hand is live. */
   deck: Card[];
-  /**
-   * Where the anchor came from. `ONCHAIN` is a public block hash; `LOCAL` is the
-   * simulated anchor used for free-mode play (FR-4.4) and for tests. A proof
-   * always states its own provenance so it can never be passed off as the other.
-   */
+  auditBlock: number | null;
+  auditTxHash: string | null;
+  /** Bond slashed because the audit proved a cheat (FR-6.5). */
+  slashed: string | null;
+
+  /** FR-6.7 liveness: why the hand was voided, if it was. */
+  voidedReason: RngVoidReason | null;
+
+  /** Where the anchor came from: a public chain block, or the free-mode simulator. */
   anchorSource: 'ONCHAIN' | 'LOCAL';
-  /** Confirmations the reveal must have over the anchor (FR-6.5). */
+  /** Confirmations the deck root must have had over the anchor (FR-6.5). */
   requiredConfirmations: number;
   verified: boolean;
   verifiedAt: number | null;
@@ -393,8 +434,11 @@ export type TableEvent =
   | { type: 'SHOWDOWN'; reveals: RevealedHand[] }
   | { type: 'POT_AWARDED'; award: PotAward }
   | { type: 'HAND_COMPLETE'; result: HandResult }
-  | { type: 'RNG_COMMITTED'; commitment: string; nonce: string }
-  | { type: 'RNG_REVEALED'; proof: RngProof }
+  | { type: 'RNG_SEED_COMMITTED'; commitment: string; nonce: string; commitBlock: number | null }
+  | { type: 'RNG_DECK_COMMITTED'; deckRoot: string; deckRootBlock: number | null; anchorBlock: number | null }
+  | { type: 'CARD_REVEALED'; reveal: CardReveal }
+  | { type: 'RNG_AUDITED'; proof: RngProof }
+  | { type: 'RNG_VOIDED'; reason: RngVoidReason }
   | { type: 'SEAT_CHANGED'; seat: number; status: SeatStatus; stack: ChipsJson }
   | { type: 'TABLE_STATE'; table: TableSnapshot };
 
@@ -518,9 +562,14 @@ export interface HandSummary {
   commitment: string;
   commitBlock: number | null;
   anchorBlock: number | null;
-  revealBlock: number | null;
+  /** FR-6.2: block in which the Merkle deck root was committed. */
+  deckRootBlock: number | null;
   /** FR-7.3 green/red badge. */
   proofVerified: boolean;
+  /** FR-6.2: the committed deck root for this hand. */
+  deckRoot: string | null;
+  /** FR-6.4: the end-of-hand audit passed, so the commitment is fully proven. */
+  audited: boolean;
 }
 
 export interface LeaderboardRow {

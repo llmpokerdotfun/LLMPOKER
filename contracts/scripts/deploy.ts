@@ -34,6 +34,10 @@ const DEFAULTS = {
   /** `0` = fixed supply, no post-launch minting (FR-9.7). */
   maxMintable: 0n,
   requiredConfirmations: 12n, // FR-6.5 DEFAULT_CONFIRMATIONS
+  /** FR-6.7: blocks allowed between the deck-root commitment and the end-of-hand audit. */
+  auditGraceBlocks: 7_200n, // ~24h at 12s blocks
+  /** FR-6.5: operator bond, sized to exceed the rake a single hand can earn. */
+  requiredBond: ethers.parseEther('100'),
   stakingBps: 5_000n, // FR-8.2 default split
   operationsBps: 5_000n, // FR-9.3 default split
   cooldownSeconds: 7n * 24n * 60n * 60n, // FR-9.5 UNSTAKE_COOLDOWN_SECONDS
@@ -71,6 +75,8 @@ async function main(): Promise<void> {
     supply: envBigInt('TOKEN_SUPPLY', DEFAULTS.supply),
     maxMintable: envBigInt('TOKEN_MAX_MINTABLE', DEFAULTS.maxMintable),
     requiredConfirmations: envBigInt('REQUIRED_CONFIRMATIONS', DEFAULTS.requiredConfirmations),
+    auditGraceBlocks: envBigInt('AUDIT_GRACE_BLOCKS', DEFAULTS.auditGraceBlocks),
+    requiredBond: envBigInt('REQUIRED_OPERATOR_BOND', DEFAULTS.requiredBond),
     stakingBps: envBigInt('STAKING_BPS', DEFAULTS.stakingBps),
     operationsBps: envBigInt('OPERATIONS_BPS', DEFAULTS.operationsBps),
     cooldownSeconds: envBigInt('UNSTAKE_COOLDOWN_SECONDS', DEFAULTS.cooldownSeconds),
@@ -120,10 +126,19 @@ async function main(): Promise<void> {
 
   const shuffle = await (
     await hre.ethers.getContractFactory('Shuffle', deployer)
-  ).deploy(deployerAddress, config.requiredConfirmations);
+  ).deploy(
+    tokenAddress,
+    deployerAddress,
+    config.requiredConfirmations,
+    config.auditGraceBlocks,
+    config.requiredBond,
+  );
   await shuffle.waitForDeployment();
   const shuffleAddress = await shuffle.getAddress();
-  console.log(`Shuffle        ${shuffleAddress}  (requiredConfirmations ${config.requiredConfirmations})`);
+  console.log(
+    `Shuffle        ${shuffleAddress}  (confirmations ${config.requiredConfirmations}, ` +
+      `auditGrace ${config.auditGraceBlocks} blocks, requiredBond ${config.requiredBond})`,
+  );
 
   const poker = await (
     await hre.ethers.getContractFactory('Poker', deployer)
@@ -175,7 +190,7 @@ async function main(): Promise<void> {
   console.log('');
   console.log('Next steps:');
   console.log(`  1. createTable(bytes32 tableId, TableConfig) as the owner on Poker ${pokerAddress}.`);
-  console.log('  2. Fund the operator key for commit/reveal gas.');
+  console.log('  2. Fund the operator key for gas and have it postBond(requiredBond) on Shuffle (FR-6.5).');
   console.log('  3. Verify the sources on the chain explorer (NFR-4).');
 }
 

@@ -10,19 +10,19 @@
 import { expect } from 'chai';
 import { ethers } from 'ethers';
 import hre from 'hardhat';
-import { mineUpTo } from '@nomicfoundation/hardhat-network-helpers';
 
 import {
   RAKE,
   TABLE_CONFIG,
   TABLE_ID,
-  commitHand,
+  commitHiddenDeck,
   createWagerTable,
-  revealHand,
+  derivedDeckFromHash,
   snapshotFixture,
   type PokerStack,
   type SnapshotFixture,
 } from './support/helpers';
+import { cardProof, commitmentForDeck } from './support/merkle';
 
 const LEGAL_BUY_IN = ethers.parseEther('20');
 
@@ -59,14 +59,13 @@ describe('Poker gas profile (NFR-3)', () => {
 
     const handId = handIdOf(label);
     const seed = ethers.keccak256(ethers.toUtf8Bytes(`${label}-seed`));
-    await commitHand(stack, handId, seed, 1n);
+    await commitHiddenDeck(stack, handId, seed, 1n);
     await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
 
     const contributions = seats.map(() => ethers.parseEther('10'));
     for (const [index, seat] of seats.entries()) {
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, seat, contributions[index]!);
     }
-    await revealHand(stack, handId, seed);
 
     const pot = contributions.reduce((a, b) => a + b, 0n);
     const rake = (pot * TABLE_CONFIG.rakeBps) / 10_000n > TABLE_CONFIG.rakeCap ? TABLE_CONFIG.rakeCap : (pot * TABLE_CONFIG.rakeBps) / 10_000n;
@@ -125,17 +124,30 @@ describe('Poker gas profile (NFR-3)', () => {
 
     const handId = handIdOf('gas-parts');
     const seed = ethers.keccak256(ethers.toUtf8Bytes('gas-parts-seed'));
-    const commitment = await (
-      await stack.shuffle.connect(stack.operator).commit(handId, ethers.keccak256(ethers.solidityPacked(['bytes32', 'uint256'], [seed, 1n])), 1n)
+    // Phase 1 only, so the gas of `commitSeed` can be reported on its own.
+    const commitSeedReceipt = await (
+      await stack.shuffle
+        .connect(stack.operator)
+        .commitSeed(handId, ethers.keccak256(ethers.solidityPacked(['bytes32', 'uint256'], [seed, 1n])), 1n)
     ).wait();
-    const openReceipt = await (
-      await poker.connect(stack.operator).openHand(TABLE_ID, handId, [0, 1])
-    ).wait();
+    const openReceipt = await (await poker.connect(stack.operator).openHand(TABLE_ID, handId, [0, 1])).wait();
     const commitReceipt = await (
       await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('10'))
     ).wait();
-    await mineUpTo(BigInt(commitment!.blockNumber) + 3n);
-    const revealReceipt = await (await stack.shuffle.connect(stack.operator).reveal(handId, seed)).wait();
+
+    // Phase 2 needs the anchor hash of block N+1; by now the chain is well past it, and the two
+    // intervening transactions already cover the confirmation requirement.
+    const anchorBlock = await hre.ethers.provider.getBlock(commitSeedReceipt!.blockNumber + 1);
+    const { deck, salts, leaves, root } = commitmentForDeck(
+      handId,
+      await derivedDeckFromHash(stack, seed, anchorBlock!.hash!),
+    );
+    const commitDeckReceipt = await (
+      await stack.shuffle.connect(stack.operator).commitDeck(handId, root, leaves)
+    ).wait();
+    const revealCardReceipt = await (
+      await stack.shuffle.connect(stack.operator).revealCard(handId, 0, deck[0]!, salts[0]!, cardProof({ deck, salts, leaves, root }, 0))
+    ).wait();
 
     // Settle so seat 1 (a participant with unspent escrow) can cash out, then cash out.
     await poker
@@ -149,17 +161,21 @@ describe('Poker gas profile (NFR-3)', () => {
       depositReceipt!.gasUsed.toString(),
       'openHand=',
       openReceipt!.gasUsed.toString(),
-      'commitHand=',
+      'commitHand(pot)=',
       commitReceipt!.gasUsed.toString(),
-      'reveal(52-card shuffle+store)=',
-      revealReceipt!.gasUsed.toString(),
+      'commitSeed=',
+      commitSeedReceipt!.gasUsed.toString(),
+      'commitDeck(52-leaf Merkle root)=',
+      commitDeckReceipt!.gasUsed.toString(),
+      'revealCard(1 Merkle proof)=',
+      revealCardReceipt!.gasUsed.toString(),
       'cashOut=',
       cashOutReceipt!.gasUsed.toString(),
     );
 
-    // The whole on-chain shuffle — 13 keccak words plus a 52-byte storage write — fits in a
-    // transaction with room to spare.
-    expect(revealReceipt!.gasUsed).to.be.lessThan(1_500_000n);
+    // The deck commitment hashes a 64-leaf tree; the per-card reveal checks one path of 10 nodes.
+    expect(commitDeckReceipt!.gasUsed).to.be.lessThan(1_500_000n);
+    expect(revealCardReceipt!.gasUsed).to.be.lessThan(1_500_000n);
     expect(cashOutReceipt!.gasUsed).to.be.lessThan(150_000n);
   });
 });

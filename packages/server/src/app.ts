@@ -27,7 +27,7 @@ import {
   validateActionShape,
   toChipsJson,
 } from '@llmpoker/shared';
-import { verifyRngProof, verifyHandDeal } from '@llmpoker/shared';
+import { verifyRngProof, verifyHandDeal, verifyPublicReveals } from '@llmpoker/shared';
 import { verifySettlement } from '@llmpoker/verifier';
 import type { WebSocket } from 'ws';
 import { actionDigest, createChallenge, createToken, eip712Domain, metadataHashFor, verifySignature, verifyToken } from './auth.js';
@@ -288,12 +288,13 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
     const { id } = request.params as { id: string };
     const history = store.getHand(id);
     if (!history) return reply.code(404).send({ error: { code: 'HAND_NOT_FOUND', message: `no hand ${id}` } });
+    const confirmations =
+      history.result.mode === 'WAGER' ? config.wagerAnchorConfirmations : config.freeAnchorConfirmations;
     return {
-      proof: verifyRngProof(history.proof, {
-        requireReveal: true,
-        minAnchorConfirmations: history.result.mode === 'WAGER' ? config.wagerAnchorConfirmations : config.freeAnchorConfirmations,
-      }),
-      deal: history.proof.entropy === null ? { ok: false, checks: [] } : verifyHandDeal(history.result, history.proof),
+      proof: verifyRngProof(history.proof, { requireReveal: true, minAnchorConfirmations: confirmations }),
+      // FR-6.3: every card the hand published must open against the committed root.
+      reveals: verifyPublicReveals(history.result, history.proof),
+      deal: history.proof.phase === 'AUDITED' ? verifyHandDeal(history.result, history.proof) : { ok: false, checks: [] },
       settlement: verifySettlement(history.result),
     };
   });

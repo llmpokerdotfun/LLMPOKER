@@ -46,8 +46,20 @@ describe('Shuffle — RNG vector conformance (FR-6.3, docs/RNG.md §3)', () => {
   before(async () => {
     const [owner] = await hre.ethers.getSigners();
     if (!owner) throw new Error('no signer');
+    // Only the pure `computeDeck*` surface is exercised here, but the FR-6 constructor needs a
+    // bond token and the phase-2/audit parameters, so a real Token is deployed.
+    const tokenFactory = await hre.ethers.getContractFactory('Token', owner);
+    const token = await tokenFactory.deploy(
+      'LLM Poker Arena',
+      'POKER',
+      ethers.parseEther('1000'),
+      await owner.getAddress(),
+      0n,
+    );
+    await token.waitForDeployment();
+
     const factory = await hre.ethers.getContractFactory('Shuffle', owner);
-    shuffle = await factory.deploy(await owner.getAddress(), 12n);
+    shuffle = await factory.deploy(await token.getAddress(), await owner.getAddress(), 12n, 64n, 0n);
     await shuffle.waitForDeployment();
   });
 
@@ -74,7 +86,7 @@ describe('Shuffle — RNG vector conformance (FR-6.3, docs/RNG.md §3)', () => {
       it('agrees with the TypeScript commitment for the same seed and nonce', async () => {
         const expected = commitmentFor(hex(vector.deckSeed), BigInt(vector.nonce));
         expect(expected).to.equal(hex(vector.commitment));
-        expect(await shuffle.commitmentOfSeed(hex(vector.deckSeed), BigInt(vector.nonce))).to.equal(
+        expect(await shuffle.seedCommitmentOfSeed(hex(vector.deckSeed), BigInt(vector.nonce))).to.equal(
           hex(vector.commitment),
         );
       });
