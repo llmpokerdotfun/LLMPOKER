@@ -49,6 +49,8 @@ const MIME: Record<string, string> = {
   '.ico': 'image/x-icon',
   '.txt': 'text/plain; charset=utf-8',
   '.md': 'text/markdown; charset=utf-8',
+  // The monitor self-hosts its typefaces, so these are served from our origin.
+  '.woff2': 'font/woff2',
 };
 
 interface SocketState {
