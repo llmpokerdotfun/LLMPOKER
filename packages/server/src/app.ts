@@ -35,6 +35,7 @@ import { AGENT_ACTION_TYPES, AGENT_REGISTRATION_TYPES } from '@llmpoker/shared';
 import { wagerEnabled, type ServerConfig } from './config.js';
 import type { Orchestrator } from './orchestrator.js';
 import { toPublicAgent, type AgentRecord, type Store } from './store.js';
+import { ServiceUnavailableError, createChainServices, type ChainServices, type StakingAction } from './token.js';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -62,6 +63,8 @@ export interface AppDeps {
   config: ServerConfig;
   store: Store;
   orchestrator: Orchestrator;
+  /** Wallet-facing chain reads/writes. Defaults to the live or disabled implementation. */
+  chainServices?: ChainServices;
   log?: (level: 'info' | 'warn' | 'error' | 'debug', message: string, extra?: unknown) => void;
 }
 
@@ -107,6 +110,7 @@ export function stringifyJson(value: unknown): string {
 
 export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
   const { config, store, orchestrator } = deps;
+  const chainServices = deps.chainServices ?? createChainServices(config);
   const log = deps.log ?? (() => {});
   const app = Fastify({ logger: false, trustProxy: true, bodyLimit: 256 * 1024 });
   app.setReplySerializer((payload: unknown) => (typeof payload === 'string' ? payload : stringifyJson(payload)));
@@ -163,6 +167,12 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
   const handleError = (error: unknown, reply: FastifyReply, context: string): void => {
     if (error instanceof EngineError) {
       void reply.code(400).send({ error: { code: error.code, message: error.message } });
+      return;
+    }
+    // Wallet-facing services: "not deployed yet" is 503, a refused gate is 403.
+    if (error instanceof ServiceUnavailableError) {
+      const status = error.code === 'TOKEN_GATE' ? 403 : 503;
+      void reply.code(status).send({ error: { code: error.code, message: error.message } });
       return;
     }
     const message = error instanceof Error ? error.message : String(error);
@@ -245,7 +255,99 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
     rngAnchor: orchestrator.anchor.kind,
     settlement: orchestrator.settlement.kind,
     wagerEnabled: wagerEnabled(config),
+    // Everything the landing page needs to render honestly: null addresses mean
+    // "not live yet" and the UI says so rather than inventing a contract.
+    chain: config.chain,
+    contracts: config.contracts,
+    tokenomics: {
+      tokenSymbol: config.tokenomics.tokenSymbol,
+      tokenDecimals: config.tokenomics.tokenDecimals,
+      buybackBps: config.tokenomics.buybackBps,
+      stakerBps: config.tokenomics.stakerBps,
+      freeGameMinTokens: config.tokenomics.freeGameMinTokens.toString(),
+      /** Wager tables accept these; either may be null until deployed. */
+      wagerCurrencies: [
+        { symbol: config.tokenomics.tokenSymbol, address: config.contracts.token, decimals: config.tokenomics.tokenDecimals },
+        { symbol: 'USDG', address: config.contracts.usdg, decimals: config.usdgDecimals },
+      ],
+    },
+    freeGate: {
+      enabled: config.freeGateEnabled,
+      minTokens: config.tokenomics.freeGameMinTokens.toString(),
+      token: config.contracts.token,
+    },
+    walletServices: chainServices.available,
   }));
+
+  // -- wallet-facing services (landing page + staking UI) -------------------
+
+  app.get('/api/v1/gate', async (request, reply) => {
+    const query = request.query as { wallet?: string };
+    if (!query.wallet || !/^0x[0-9a-fA-F]{40}$/.test(query.wallet)) {
+      return reply.code(400).send({ error: { code: 'INVALID_WALLET', message: 'wallet must be a 20-byte hex address' } });
+    }
+    try {
+      const status = await chainServices.gate(query.wallet);
+      return {
+        ...status,
+        balance: status.balance === null ? null : status.balance.toString(),
+        required: status.required.toString(),
+      };
+    } catch (error) {
+      return handleError(error, reply, 'gate');
+    }
+  });
+
+  app.get('/api/v1/staking/summary', async (request, reply) => {
+    const query = request.query as { wallet?: string };
+    if (!query.wallet || !/^0x[0-9a-fA-F]{40}$/.test(query.wallet)) {
+      return reply.code(400).send({ error: { code: 'INVALID_WALLET', message: 'wallet must be a 20-byte hex address' } });
+    }
+    try {
+      const summary = await chainServices.stakingSummary(query.wallet);
+      return {
+        ...summary,
+        staked: summary.staked.toString(),
+        pendingRewards: summary.pendingRewards.toString(),
+        totalStaked: summary.totalStaked.toString(),
+        minStake: summary.minStake.toString(),
+        totalRewardsNotified: summary.totalRewardsNotified.toString(),
+        cooldown: summary.cooldown
+          ? { ...summary.cooldown, amount: summary.cooldown.amount.toString() }
+          : null,
+      };
+    } catch (error) {
+      return handleError(error, reply, 'stakingSummary');
+    }
+  });
+
+  /** Returns calldata for the *wallet* to send; the server never signs or holds keys. */
+  app.get('/api/v1/staking/tx', async (request, reply) => {
+    const query = request.query as { wallet?: string; action?: string; amount?: string };
+    if (!query.wallet || !/^0x[0-9a-fA-F]{40}$/.test(query.wallet)) {
+      return reply.code(400).send({ error: { code: 'INVALID_WALLET', message: 'wallet must be a 20-byte hex address' } });
+    }
+    const actions: StakingAction[] = ['approve', 'stake', 'unstake', 'cancel', 'claim'];
+    if (!query.action || !actions.includes(query.action as StakingAction)) {
+      return reply
+        .code(400)
+        .send({ error: { code: 'INVALID_ACTION', message: `action must be one of ${actions.join(', ')}` } });
+    }
+    let amount = 0n;
+    if (query.action === 'approve' || query.action === 'stake' || query.action === 'unstake') {
+      if (!query.amount || !/^[0-9]+$/.test(query.amount)) {
+        return reply
+          .code(400)
+          .send({ error: { code: 'INVALID_AMOUNT', message: 'amount is required and must be an integer in base units' } });
+      }
+      amount = BigInt(query.amount);
+    }
+    try {
+      return await chainServices.stakingTx(query.wallet, query.action as StakingAction, amount);
+    } catch (error) {
+      return handleError(error, reply, 'stakingTx');
+    }
+  });
 
   app.get('/api/v1/monitor/agents', async () => ({
     agents: orchestrator.listAgentSnapshots(),
@@ -691,6 +793,7 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
   app.get('/agents', page('agents.html'));
   app.get('/tables', page('tables.html'));
   app.get('/hands', page('hands.html'));
+  app.get('/stake', page('stake.html'));
   app.get('/assets/*', async (request, reply) => {
     const wildcard = (request.params as Record<string, string>)['*'] ?? '';
     return serveStatic(reply, join(config.monitorDir, 'assets'), wildcard);

@@ -66,6 +66,12 @@ export interface TableConfig {
   /** Buy-in escrow requirement for wager tables (FR-5.1). */
   escrowRequired: boolean;
   /**
+   * Wager tables settle in exactly one ERC-20, fixed when the table is created
+   * on-chain: `TOKEN` (LLMPOKER) or `USDG`. `null` for free tables, which use
+   * play chips that never touch a chain.
+   */
+  settlementCurrency: 'TOKEN' | 'USDG' | null;
+  /**
    * Free mode only (FR-4.2): when a seat busts it is topped back up to this
    * amount so play can continue. `null` disables top-ups (wager tables).
    */

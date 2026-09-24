@@ -9,6 +9,7 @@
  * markup; every interpolation there goes through it.
  */
 
+import { CHIP_DECIMALS, EXPECTED_CHAIN_ID } from './constants.js';
 import {
   EM_DASH,
   cardIsRed,
@@ -18,6 +19,7 @@ import {
   formatRelative,
   formatTokens,
 } from './format.js';
+import { NO_WALLET_MESSAGE, connect, restore, shortAddress, subscribeWallet, walletState } from './wallet.js';
 
 /** @type {Record<string, string>} */
 const HTML_ESCAPES = {
@@ -308,12 +310,15 @@ export function faceDownCards(count) {
  * base-unit string so no precision is ever hidden from a verifier.
  *
  * @param {unknown} chips
- * @param {{maxFractionDigits?: number, signed?: boolean, className?: string}} [options]
+ * @param {{maxFractionDigits?: number, signed?: boolean, className?: string, decimals?: number}} [options]
+ *   `decimals` overrides the default 18 for a token that reports its own
+ *   decimals (gate/staking responses); it is never used to round the value.
  * @returns {HTMLElement}
  */
 export function moneyEl(chips, options = {}) {
-  const exact = chipsToTokenString(chips);
-  const shown = formatTokens(chips, { maxFractionDigits: options.maxFractionDigits });
+  const decimals = typeof options.decimals === 'number' ? options.decimals : undefined;
+  const exact = chipsToTokenString(chips, decimals ?? CHIP_DECIMALS);
+  const shown = formatTokens(chips, { maxFractionDigits: options.maxFractionDigits, decimals });
   const value = options.signed && shown !== EM_DASH && !shown.startsWith('-') ? `+${shown}` : shown;
   const classes = ['money'];
   if (shown.startsWith('-')) classes.push('money-neg');
@@ -321,17 +326,17 @@ export function moneyEl(chips, options = {}) {
   return h('span', {
     class: classes.join(' '),
     text: value,
-    title: `${exact} chips (base units, 18 decimals)`,
+    title: `${exact} chips (base units, ${decimals ?? CHIP_DECIMALS} decimals)`,
   });
 }
 
 /**
  * @param {unknown} chips
- * @param {{maxFractionDigits?: number}} [options]
+ * @param {{maxFractionDigits?: number, decimals?: number}} [options]
  * @returns {string} token amount as plain text.
  */
 export function moneyText(chips, options = {}) {
-  return formatTokens(chips, { maxFractionDigits: options.maxFractionDigits });
+  return formatTokens(chips, options);
 }
 
 // ---------------------------------------------------------------------------
@@ -393,16 +398,148 @@ export function errorBanner(err, context) {
 
 /** @type {{href: string, label: string}[]} */
 const NAV = [
-  { href: '/', label: 'Dashboard' },
+  { href: '/', label: 'Home' },
+  { href: '/stake', label: 'Stake' },
   { href: '/agents', label: 'Agents' },
   { href: '/tables', label: 'Tables' },
   { href: '/hands', label: 'Hands' },
 ];
 
 /**
- * Renders the shared header nav and footer into `#site-header` / `#site-footer`.
+ * Only `http(s)` URLs may become `href`s. Server-provided `explorerUrl` values
+ * go through this so a hostile/broken API cannot inject a `javascript:` link.
  *
- * @param {string} activePath one of `/`, `/agents`, `/tables`, `/hands`
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+export function safeExternalUrl(value) {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const trimmed = value.trim();
+  return /^https?:\/\//i.test(trimmed) ? trimmed : null;
+}
+
+/** @type {boolean} */
+let walletWired = false;
+
+/**
+ * Chain id the connected wallet is expected to be on. Defaults to the
+ * documented settlement chain; a page that has read `/api/v1/health` overrides
+ * it with the chain the server actually reports.
+ *
+ * @type {number|null}
+ */
+let expectedChainId = null;
+
+/**
+ * @param {number|null|undefined} chainId
+ * @returns {void}
+ */
+export function setExpectedChainId(chainId) {
+  if (typeof chainId === 'number' && Number.isFinite(chainId)) {
+    expectedChainId = Math.trunc(chainId);
+    renderWalletButton();
+  }
+}
+
+/**
+ * Renders the header wallet control: a connect button when disconnected, the
+ * truncated address (linking to `/stake`) when connected, and an explicit
+ * "no wallet detected" control when the browser injects no EIP-1193 provider.
+ *
+ * @returns {void}
+ */
+function renderWalletButton() {
+  const slot = document.getElementById('wallet-slot');
+  if (!slot) return;
+  clearNode(slot);
+  const state = walletState;
+  const expected = expectedChainId ?? EXPECTED_CHAIN_ID;
+
+  if (state.connected && state.address) {
+    const wrongChain = typeof state.chainId === 'number' && state.chainId !== expected;
+    slot.appendChild(
+      h('a', {
+        class: `button button-wallet${wrongChain ? ' button-wallet-warn' : ''}`,
+        href: '/stake',
+        title: `Wallet ${state.address} — open the staking page`,
+        text: shortAddress(state.address),
+      }),
+    );
+    slot.appendChild(
+      h('span', {
+        class: `wallet-note${wrongChain ? ' warn-text' : ' muted'}`,
+        text: wrongChain ? `wrong network (${state.chainId}) — expected ${expected}` : `chain ${state.chainId ?? '\u2014'}`,
+      }),
+    );
+    return;
+  }
+
+  if (!state.available) {
+    slot.appendChild(
+      h('button', {
+        class: 'button button-wallet',
+        type: 'button',
+        disabled: true,
+        title: NO_WALLET_MESSAGE,
+        text: 'Connect wallet',
+      }),
+    );
+    slot.appendChild(h('span', { class: 'wallet-note muted', text: 'no wallet detected' }));
+    return;
+  }
+
+  slot.appendChild(
+    h('button', {
+      class: 'button button-wallet',
+      type: 'button',
+      disabled: state.connecting,
+      title: 'Connect an EIP-1193 wallet to check free-play eligibility and stake',
+      text: state.connecting ? 'Connecting…' : 'Connect wallet',
+      onclick: () => void connectFromHeader(),
+    }),
+  );
+  slot.appendChild(h('span', { class: 'wallet-note muted', text: state.connecting ? 'check your wallet' : 'EIP-1193' }));
+}
+
+/**
+ * `connect()` never throws — "no wallet" and "user rejected" land in
+ * `walletState.error`, which is announced through the header live region.
+ *
+ * @returns {Promise<void>}
+ */
+async function connectFromHeader() {
+  const result = await connect();
+  announce(result ? `Wallet connected: ${result.address}` : walletState.error ?? 'Wallet not connected.');
+}
+
+/**
+ * @param {string} message
+ * @returns {void}
+ */
+function announce(message) {
+  const live = document.getElementById('wallet-live');
+  if (live) live.textContent = message;
+}
+
+/**
+ * Wires the header wallet control once (state subscription + a silent
+ * `eth_accounts` restore that never prompts).
+ *
+ * @returns {void}
+ */
+export function mountWalletButton() {
+  renderWalletButton();
+  if (walletWired) return;
+  walletWired = true;
+  subscribeWallet(renderWalletButton);
+  void restore();
+}
+
+/**
+ * Renders the shared header nav and footer into `#site-header` / `#site-footer`,
+ * including the connect-wallet control.
+ *
+ * @param {string} activePath one of `/`, `/stake`, `/agents`, `/tables`, `/hands`
  * @returns {void}
  */
 export function renderChrome(activePath) {
@@ -418,11 +555,11 @@ export function renderChrome(activePath) {
           { class: 'brand', href: '/' },
           h('span', { class: 'brand-mark', text: '\u2660' }),
           h('span', { class: 'brand-name', text: 'LLM Poker Arena' }),
-          h('span', { class: 'brand-sub', text: 'public monitor' }),
+          h('span', { class: 'brand-sub', text: 'agent-only poker on-chain' }),
         ),
         h(
           'nav',
-          { class: 'nav', 'aria-label': 'Monitor sections' },
+          { class: 'nav', 'aria-label': 'Sections' },
           NAV.map((item) =>
             h('a', {
               class: 'nav-link',
@@ -435,6 +572,8 @@ export function renderChrome(activePath) {
         h(
           'div',
           { class: 'header-meta' },
+          h('div', { class: 'wallet-slot', id: 'wallet-slot' }),
+          h('span', { class: 'visually-hidden', id: 'wallet-live', role: 'status', 'aria-live': 'polite' }),
           h('span', {
             class: 'conn',
             id: 'conn-indicator',
@@ -446,6 +585,7 @@ export function renderChrome(activePath) {
         ),
       ),
     );
+    mountWalletButton();
   }
 
   const footer = document.getElementById('site-footer');
@@ -458,16 +598,25 @@ export function renderChrome(activePath) {
         h('p', {
           class: 'footer-line',
           text:
-            'LLM Poker Arena — agent-only no-limit Texas Hold\u2019em. This monitor is public and ' +
-            'read-only: no wallet, no login, no keys.',
+            'LLM Poker Arena — agent-only no-limit Texas Hold\u2019em, settled on-chain with a shuffle you can ' +
+            'verify yourself. Reading this site needs no wallet; connecting one is only for staking, and the site ' +
+            'never holds a key or signs anything for you.',
         }),
         h(
           'p',
           { class: 'footer-line' },
+          h('a', { href: '/tables', text: '/tables' }),
+          ' \u00b7 ',
+          h('a', { href: '/agents', text: '/agents' }),
+          ' \u00b7 ',
+          h('a', { href: '/hands', text: '/hands' }),
+          ' \u00b7 ',
+          h('a', { href: '/stake', text: '/stake' }),
+          ' \u00b7 ',
           h('a', { href: '/llm.txt', text: '/llm.txt' }),
-          ' — the machine-readable agent contract. ',
+          ' (the machine-readable agent contract; ',
           h('a', { href: '/llms.txt', text: '/llms.txt' }),
-          ' is the same document.',
+          ' is the same document)',
         ),
         h(
           'p',

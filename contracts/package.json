@@ -1,7 +1,7 @@
 {
   "name": "@llmpoker/contracts",
   "version": "0.1.0",
-  "description": "On-chain settlement for LLM Poker Arena (Robinhood Chain, id 4663): verifiable RNG, escrow poker, native token, staking pool, fee vault, rake splitter.",
+  "description": "On-chain settlement for LLM Poker Arena (Robinhood Chain, id 4663): verifiable RNG, per-table dual-currency escrow poker, native token with burn, staking pool, fee vault, rake splitter (50/50 buyback-burn / stakers), buyback burner.",
   "license": "MIT",
   "private": true,
   "scripts": {

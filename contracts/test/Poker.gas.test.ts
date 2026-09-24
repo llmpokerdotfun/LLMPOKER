@@ -15,10 +15,14 @@ import {
   RAKE,
   TABLE_CONFIG,
   TABLE_ID,
+  USDG_TABLE_CONFIG,
+  USDG_TABLE_ID,
   commitHiddenDeck,
+  createUsdgWagerTable,
   createWagerTable,
   derivedDeckFromHash,
   snapshotFixture,
+  usdg,
   type PokerStack,
   type SnapshotFixture,
 } from './support/helpers';
@@ -114,6 +118,62 @@ describe('Poker gas profile (NFR-3)', () => {
     // Monotone in the seat count (each seat is real work).
     expect(gasFour).to.be.greaterThan(gasTwo);
     expect(gasSix).to.be.greaterThan(gasFour);
+  });
+
+  /** Seat `count` players at the USDG table, run a hand and return the measured settlement gas. */
+  async function measureUsdgSettlement(count: number, label: string): Promise<bigint> {
+    await fixture.reset();
+    await createUsdgWagerTable(stack);
+
+    const seats = Array.from({ length: count }, (_, i) => i);
+    const perSeat = usdg('10');
+    for (const seat of seats) {
+      await poker.connect(stack.players[seat]!).deposit(USDG_TABLE_ID, seat, perSeat);
+    }
+
+    const handId = handIdOf(label);
+    const seed = ethers.keccak256(ethers.toUtf8Bytes(`${label}-seed`));
+    await commitHiddenDeck(stack, handId, seed, 1n);
+    await poker.connect(stack.operator).openHand(USDG_TABLE_ID, handId, seats);
+
+    const contributions = seats.map(() => perSeat);
+    for (const [index, seat] of seats.entries()) {
+      await poker.connect(stack.operator).commitHand(USDG_TABLE_ID, handId, seat, contributions[index]!);
+    }
+
+    const pot = perSeat * BigInt(seats.length);
+    const bpsRake = (pot * USDG_TABLE_CONFIG.rakeBps) / 10_000n;
+    const rake = bpsRake > USDG_TABLE_CONFIG.rakeCap ? USDG_TABLE_CONFIG.rakeCap : bpsRake;
+
+    const tx = await poker
+      .connect(stack.operator)
+      .settleHand(USDG_TABLE_ID, handId, contributions, [0], [pot - rake], true);
+    const receipt = await tx.wait();
+    return receipt!.gasUsed as bigint;
+  }
+
+  it('settles a 6-seat USDG (6-decimal) hand for the same gas as LLMPOKER', async () => {
+    const llmpokerGas = await measureSettlement(6, 'gas-6max-dual-llm');
+    const usdgGas = await measureUsdgSettlement(6, 'gas-6max-dual-usdg');
+    const blockGasLimit = BigInt(
+      await hre.network.provider
+        .send('eth_getBlockByNumber', ['latest', false])
+        .then((b: any) => BigInt(b.gasLimit)),
+    );
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[NFR-3] 6-seat settleHand gas: LLMPOKER (18 decimals) = ${llmpokerGas.toString()}, ` +
+        `USDG (6 decimals) = ${usdgGas.toString()} (block gas limit ${blockGasLimit.toString()})`,
+    );
+
+    // The settlement path is decimal-agnostic: the per-table token is one extra storage read and
+    // the per-token escrow running total is one extra write, so the two currencies must land
+    // within a small constant of each other rather than scaling with the amount.
+    expect(usdgGas).to.be.lessThan(1_000_000n);
+    expect(usdgGas).to.be.greaterThan(llmpokerGas - 60_000n);
+    expect(usdgGas).to.be.lessThan(llmpokerGas + 60_000n);
+    expect(usdgGas).to.be.lessThan(blockGasLimit / 4n);
   });
 
   it('reports the gas of the other wager entry points for the record', async () => {

@@ -129,7 +129,43 @@ this is asserted by the engine's own event-stream privacy test.
 | GET | `/api/v1/verify/hands/{id}` | the server's own `{ proof, reveals, deal, settlement }` verdicts |
 | GET | `/api/v1/monitor/agents` | `{ agents: AgentSnapshot[], updatedAt }` |
 | GET | `/api/v1/leaderboards?mode=FREE\|WAGER` | `{ rows }` |
-| GET | `/api/v1/health` | chain, anchor kind, settlement kind, table/agent/hand counts |
+| GET | `/api/v1/health` | chain, contracts, tokenomics, gate state, anchor/settlement kinds, counts |
+
+`/api/v1/health` carries everything the site needs to render honestly, with `null`
+for anything not deployed yet:
+
+```jsonc
+{
+  "chain": { "chainId": 4663, "name": "Robinhood Chain", "rpcUrl": null, "explorerUrl": null,
+             "nativeCurrency": { "name": "Ether", "symbol": "ETH", "decimals": 18 } },
+  "contracts": { "token": null, "usdg": null, "poker": null, "shuffle": null, "staking": null,
+                 "vault": null, "rakeSplitter": null, "buybackBurner": null, "router": null },
+  "tokenomics": { "tokenSymbol": "LLMPOKER", "tokenDecimals": 18, "buybackBps": 5000,
+                  "stakerBps": 5000, "freeGameMinTokens": "50000",
+                  "wagerCurrencies": [ { "symbol": "LLMPOKER", … }, { "symbol": "USDG", … } ] },
+  "freeGate": { "enabled": false, "minTokens": "50000", "token": null },
+  "walletServices": false
+}
+```
+
+## 5. Wallet services (landing page and staking)
+
+These are read-only for the server and **never sign anything**: the write path
+returns pre-encoded calldata for the visitor's own wallet to submit.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/v1/gate?wallet=0x…` | `{ enabled, eligible, balance, required, requiredTokens, symbol, decimals, token }` |
+| GET | `/api/v1/staking/summary?wallet=0x…` | staked, pending rewards, cooldown, pool total, min stake |
+| GET | `/api/v1/staking/tx?wallet=0x…&action=approve\|stake\|unstake\|cancel\|claim&amount=<base units>` | `{ to, data, value, chainId, action, summary }` |
+
+* `eligible: null` means the gate is not active yet — deliberately not `true`.
+* Free seating with an insufficient balance returns `403 TOKEN_GATE`; an unreadable
+  balance returns `503 GATE_UNAVAILABLE` (the gate fails closed).
+* While the token or staking address is `null`, the staking endpoints return
+  `503 STAKING_NOT_CONFIGURED`, which the site renders as "staking opens at token
+  launch" rather than as an error.
+* `amount` is always in base units (LLMPOKER has 18 decimals, USDG 6).
 
 `RngProof` fields and what each check proves are specified in `docs/RNG.md`.
 A client should compare its own recomputation against `/api/v1/verify/hands/{id}`

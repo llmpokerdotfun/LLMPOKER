@@ -14,6 +14,7 @@ import {
 } from '@llmpoker/shared';
 import { verifyHandHistory } from '@llmpoker/verifier';
 import { LocalChain, LocalEscrow, type AnchorProvider } from '../src/chain.js';
+import { ServiceUnavailableError, type ChainServices } from '../src/token.js';
 import { loadConfig } from '../src/config.js';
 import { buildApp } from '../src/app.js';
 import { Orchestrator } from '../src/orchestrator.js';
@@ -40,7 +41,10 @@ let harness: Harness;
 let dataDir: string;
 const tempDirs: string[] = [];
 
-async function buildHarness(env: NodeJS.ProcessEnv = {}): Promise<Harness> {
+async function buildHarness(
+  env: NodeJS.ProcessEnv = {},
+  options: { chainServices?: ChainServices; freeTableAccess?: (wallet: string) => Promise<void> } = {},
+): Promise<Harness> {
   let clock = 1_760_000_000_000;
   dataDir = mkdtempSync(join(tmpdir(), 'llmpoker-test-'));
   tempDirs.push(dataDir);
@@ -64,10 +68,16 @@ async function buildHarness(env: NodeJS.ProcessEnv = {}): Promise<Harness> {
     store,
     anchor: chain,
     settlement,
+    freeTableAccess: options.freeTableAccess,
     now: () => clock,
   });
   orchestrator.init();
-  const { app, close } = await buildApp({ config, store, orchestrator });
+  const { app, close } = await buildApp({
+    config,
+    store,
+    orchestrator,
+    chainServices: options.chainServices,
+  });
   return {
     app,
     store,
@@ -1046,6 +1056,227 @@ describe('LLM Poker Arena server', () => {
         expect(reorging.store.handCount()).toBe(0);
       } finally {
         await orchestrator.stop();
+      }
+    });
+  });
+
+  describe('token gate and wallet services (landing page)', () => {
+    const TOKEN = '0x1111111111111111111111111111111111111111';
+    const STAKING = '0x2222222222222222222222222222222222222222';
+    const WALLET = '0x3333333333333333333333333333333333333333';
+    const REQUIRED = 50_000n * 10n ** 18n;
+
+    function fakeServices(overrides: Partial<ChainServices> = {}): ChainServices {
+      return {
+        available: true,
+        gate: async () => ({
+          enabled: true,
+          eligible: true,
+          balance: REQUIRED * 2n,
+          required: REQUIRED,
+          requiredTokens: '50000',
+          symbol: 'LLMPOKER',
+          decimals: 18,
+          token: TOKEN,
+        }),
+        requireFreeTableAccess: async () => {},
+        stakingSummary: async (wallet: string) => ({
+          wallet,
+          token: TOKEN,
+          symbol: 'LLMPOKER',
+          decimals: 18,
+          staked: 1_000n * 10n ** 18n,
+          pendingRewards: 5n * 10n ** 18n,
+          cooldown: { amount: 10n ** 18n, unlockAt: Date.now() + 86_400_000, claimable: false },
+          totalStaked: 9_000n * 10n ** 18n,
+          cooldownSeconds: 604_800,
+          minStake: 10n ** 18n,
+          totalRewardsNotified: 42n * 10n ** 18n,
+        }),
+        stakingTx: async (_wallet, action, amount) => ({
+          to: action === 'approve' ? TOKEN : STAKING,
+          data: '0xdeadbeef',
+          value: '0',
+          chainId: 4663,
+          action,
+          summary: `${action} ${amount}`,
+        }),
+        close: async () => {},
+        ...overrides,
+      };
+    }
+
+    it('reports chain, contracts, tokenomics and the gate state on /health', async () => {
+      const h = await buildHarness();
+      const health = (await h.app.inject({ method: 'GET', url: '/api/v1/health' })).json() as Record<string, any>;
+      expect(health.chain.chainId).toBe(4663);
+      expect(health.chain.name).toBe('Robinhood Chain');
+      // Nothing is deployed yet, so every address is null rather than invented.
+      expect(health.contracts.token).toBeNull();
+      expect(health.contracts.usdg).toBeNull();
+      expect(health.tokenomics.tokenSymbol).toBe('LLMPOKER');
+      expect(health.tokenomics.buybackBps).toBe(5_000);
+      expect(health.tokenomics.stakerBps).toBe(5_000);
+      expect(health.tokenomics.freeGameMinTokens).toBe('50000');
+      expect(health.freeGate.enabled).toBe(false);
+      expect(health.walletServices).toBe(false);
+      expect(health.tokenomics.wagerCurrencies.map((c: { symbol: string }) => c.symbol)).toEqual(['LLMPOKER', 'USDG']);
+    });
+
+    it('reflects configured tokenomics and the enabled gate', async () => {
+      const h = await buildHarness({
+        LLMPOKER_TOKEN_ADDRESS: TOKEN,
+        LLMPOKER_USDG_ADDRESS: '0x4444444444444444444444444444444444444444',
+        LLMPOKER_FREE_GATE_MIN_TOKENS: '75000',
+        LLMPOKER_BUYBACK_BPS: '6000',
+        LLMPOKER_STAKER_BPS: '4000',
+      });
+      const health = (await h.app.inject({ method: 'GET', url: '/api/v1/health' })).json() as Record<string, any>;
+      // A token address implies the gate, unless it is explicitly disabled.
+      expect(health.freeGate.enabled).toBe(true);
+      expect(health.tokenomics.freeGameMinTokens).toBe('75000');
+      expect(health.tokenomics.buybackBps).toBe(6_000);
+      expect(health.tokenomics.stakerBps).toBe(4_000);
+    });
+
+    it('answers the gate query and marks eligibility honestly when disabled', async () => {
+      const h = await buildHarness();
+      const disabled = (
+        await h.app.inject({ method: 'GET', url: `/api/v1/gate?wallet=${WALLET}` })
+      ).json() as Record<string, unknown>;
+      expect(disabled.enabled).toBe(false);
+      // Not "eligible: true" — the gate simply is not active yet.
+      expect(disabled.eligible).toBeNull();
+      expect(disabled.requiredTokens).toBe('50000');
+
+      const fake = await buildHarness({}, { chainServices: fakeServices() });
+      const enabled = (
+        await fake.app.inject({ method: 'GET', url: `/api/v1/gate?wallet=${WALLET}` })
+      ).json() as Record<string, string>;
+      expect(enabled.enabled).toBe(true);
+      expect(enabled.eligible).toBe(true);
+      expect(enabled.balance).toBe((REQUIRED * 2n).toString());
+
+      const bad = await fake.app.inject({ method: 'GET', url: '/api/v1/gate?wallet=nope' });
+      expect(bad.statusCode).toBe(400);
+    });
+
+    it('refuses a free-table seat below the holding requirement, and allows one above it', async () => {
+      const ineligible: ChainServices = fakeServices({
+        requireFreeTableAccess: async () => {
+          throw new ServiceUnavailableError('TOKEN_GATE', 'a free-table seat requires at least 50000 LLMPOKER');
+        },
+      });
+      const blocked = await buildHarness(
+        {},
+        {
+          chainServices: ineligible,
+          freeTableAccess: (wallet) => ineligible.requireFreeTableAccess(wallet),
+        },
+      );
+      const agent = await createAgentOn(blocked, 'Gated');
+      const refused = await blocked.app.inject({
+        method: 'POST',
+        url: '/api/v1/tables/free-0-1/seat',
+        headers: { authorization: `Bearer ${agent.apiKey}` },
+        payload: { buyIn: '200' },
+      });
+      expect(refused.statusCode).toBe(403);
+      expect((refused.json() as { error: { code: string } }).error.code).toBe('TOKEN_GATE');
+
+      const eligible = fakeServices();
+      const allowed = await buildHarness(
+        {},
+        {
+          chainServices: eligible,
+          freeTableAccess: (wallet) => eligible.requireFreeTableAccess(wallet),
+        },
+      );
+      const holder = await createAgentOn(allowed, 'Holder');
+      const seated = await allowed.app.inject({
+        method: 'POST',
+        url: '/api/v1/tables/free-0-1/seat',
+        headers: { authorization: `Bearer ${holder.apiKey}` },
+        payload: { buyIn: '200' },
+      });
+      expect(seated.statusCode, seated.body).toBe(201);
+    });
+
+    it('fails closed when the balance cannot be read', async () => {
+      const broken = fakeServices({
+        requireFreeTableAccess: async () => {
+          throw new ServiceUnavailableError('GATE_UNAVAILABLE', 'the token balance could not be read');
+        },
+      });
+      const h = await buildHarness(
+        {},
+        { chainServices: broken, freeTableAccess: (wallet) => broken.requireFreeTableAccess(wallet) },
+      );
+      const agent = await createAgentOn(h, 'Unreadable');
+      const refused = await h.app.inject({
+        method: 'POST',
+        url: '/api/v1/tables/free-0-1/seat',
+        headers: { authorization: `Bearer ${agent.apiKey}` },
+        payload: { buyIn: '200' },
+      });
+      expect(refused.statusCode).toBe(503);
+      expect((refused.json() as { error: { code: string } }).error.code).toBe('GATE_UNAVAILABLE');
+    });
+
+    it('serves the staking summary and returns unsigned calldata for the wallet', async () => {
+      const h = await buildHarness({}, { chainServices: fakeServices() });
+      const summary = (
+        await h.app.inject({ method: 'GET', url: `/api/v1/staking/summary?wallet=${WALLET}` })
+      ).json() as Record<string, any>;
+      expect(summary.staked).toBe((1_000n * 10n ** 18n).toString());
+      expect(summary.pendingRewards).toBe((5n * 10n ** 18n).toString());
+      expect(summary.cooldown.amount).toBe((10n ** 18n).toString());
+      expect(summary.cooldown.claimable).toBe(false);
+      expect(summary.cooldownSeconds).toBe(604_800);
+
+      for (const action of ['approve', 'stake', 'unstake', 'cancel', 'claim'] as const) {
+        const needsAmount = action === 'approve' || action === 'stake' || action === 'unstake';
+        const url = `/api/v1/staking/tx?wallet=${WALLET}&action=${action}${needsAmount ? '&amount=1000' : ''}`;
+        const response = await h.app.inject({ method: 'GET', url });
+        expect(response.statusCode, `${action}: ${response.body}`).toBe(200);
+        const tx = response.json() as { to: string; data: string; value: string; chainId: number };
+        expect(tx.to).toMatch(/^0x[0-9a-fA-F]{40}$/);
+        expect(tx.data.startsWith('0x')).toBe(true);
+        expect(tx.chainId).toBe(4663);
+        // The server never returns a signed transaction: only calldata.
+        expect(Object.keys(tx)).not.toContain('signature');
+      }
+
+      const missingAmount = await h.app.inject({
+        method: 'GET',
+        url: `/api/v1/staking/tx?wallet=${WALLET}&action=stake`,
+      });
+      expect(missingAmount.statusCode).toBe(400);
+      const badAction = await h.app.inject({
+        method: 'GET',
+        url: `/api/v1/staking/tx?wallet=${WALLET}&action=drain`,
+      });
+      expect(badAction.statusCode).toBe(400);
+    });
+
+    it('says "not live yet" (503) for staking while no token is deployed', async () => {
+      const h = await buildHarness();
+      const summary = await h.app.inject({ method: 'GET', url: `/api/v1/staking/summary?wallet=${WALLET}` });
+      expect(summary.statusCode).toBe(503);
+      expect((summary.json() as { error: { code: string } }).error.code).toBe('STAKING_NOT_CONFIGURED');
+      const tx = await h.app.inject({
+        method: 'GET',
+        url: `/api/v1/staking/tx?wallet=${WALLET}&action=claim`,
+      });
+      expect(tx.statusCode).toBe(503);
+    });
+
+    it('serves the landing and staking pages', async () => {
+      const h = await buildHarness();
+      for (const path of ['/', '/stake']) {
+        const response = await h.app.inject({ method: 'GET', url: path });
+        expect(response.statusCode, path).toBe(200);
+        expect(response.headers['content-type']).toContain('text/html');
       }
     });
   });

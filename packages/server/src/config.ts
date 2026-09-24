@@ -8,11 +8,37 @@ export type AnchorMode = 'local' | 'onchain';
 
 export interface ContractAddresses {
   token: string | null;
+  /** Stablecoin accepted at wager tables alongside the native token. */
+  usdg: string | null;
   poker: string | null;
   shuffle: string | null;
   staking: string | null;
   vault: string | null;
   rakeSplitter: string | null;
+  /** Receives the buyback half of the house edge and burns LLMPOKER. */
+  buybackBurner: string | null;
+  /** DEX router the buyback uses to convert fees into LLMPOKER. */
+  router: string | null;
+}
+
+/** Token parameters, needed to render amounts before the token is deployed. */
+export interface TokenomicsConfig {
+  tokenSymbol: string;
+  tokenDecimals: number;
+  /** Share of the house edge that buys back and burns the token, in basis points. */
+  buybackBps: number;
+  /** Share airdropped to stakers, in basis points. */
+  stakerBps: number;
+  /** LLMPOKER a free-table agent must hold before it may sit down. */
+  freeGameMinTokens: bigint;
+}
+
+export interface ChainMetadata {
+  chainId: number;
+  name: string;
+  rpcUrl: string | null;
+  explorerUrl: string | null;
+  nativeCurrency: { name: string; symbol: string; decimals: number };
 }
 
 export interface ServerConfig {
@@ -36,6 +62,17 @@ export interface ServerConfig {
   rngAnchor: AnchorMode;
   settlement: SettlementMode;
   contracts: ContractAddresses;
+  tokenomics: TokenomicsConfig;
+  /** Chain metadata the site uses to offer add/switch-chain in a wallet. */
+  chain: ChainMetadata;
+  /**
+   * Free-table token gate. `true` by default whenever a token address is set:
+   * an agent must hold `tokenomics.freeGameMinTokens` to sit at a free table.
+   * Set `LLMPOKER_FREE_GATE=false` to disable it explicitly.
+   */
+  freeGateEnabled: boolean;
+  /** USDG decimals, for display only : contracts handle base units. */
+  usdgDecimals: number;
   operatorAddress: string | null;
   /** Enables the operator-only admin surface (FR-10.5). Unset ⇒ admin routes 403. */
   operatorToken: string | null;
@@ -51,6 +88,8 @@ export interface ServerConfig {
   /** Tables created at boot. */
   freeTables: number;
   wagerTables: number;
+  /** USDG-denominated wager tables (0 unless a USDG address is configured). */
+  usdgWagerTables: number;
   freeTableTier: number;
   wagerTableTier: number;
   /** FR-10.1 rate limiting. */
@@ -106,12 +145,37 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     settlement,
     contracts: {
       token: env.LLMPOKER_TOKEN_ADDRESS ?? null,
+      usdg: env.LLMPOKER_USDG_ADDRESS ?? null,
       poker: env.LLMPOKER_POKER_ADDRESS ?? null,
       shuffle: env.LLMPOKER_SHUFFLE_ADDRESS ?? null,
       staking: env.LLMPOKER_STAKING_ADDRESS ?? null,
       vault: env.LLMPOKER_VAULT_ADDRESS ?? null,
       rakeSplitter: env.LLMPOKER_RAKE_SPLITTER_ADDRESS ?? null,
+      buybackBurner: env.LLMPOKER_BUYBACK_BURNER_ADDRESS ?? null,
+      router: env.LLMPOKER_ROUTER_ADDRESS ?? null,
     },
+    tokenomics: {
+      tokenSymbol: env.LLMPOKER_TOKEN_SYMBOL ?? 'LLMPOKER',
+      tokenDecimals: num(env.LLMPOKER_TOKEN_DECIMALS, 18),
+      buybackBps: num(env.LLMPOKER_BUYBACK_BPS, 5_000),
+      stakerBps: num(env.LLMPOKER_STAKER_BPS, 5_000),
+      freeGameMinTokens: BigInt(env.LLMPOKER_FREE_GATE_MIN_TOKENS ?? '50000'),
+    },
+    chain: {
+      chainId: num(env.LLMPOKER_CHAIN_ID, CHAIN_ID),
+      name: env.LLMPOKER_CHAIN_NAME ?? 'Robinhood Chain',
+      rpcUrl: env.LLMPOKER_RPC_URL?.trim() || env.RH_RPC_URL?.trim() || null,
+      explorerUrl: env.LLMPOKER_EXPLORER_URL?.trim() || null,
+      nativeCurrency: {
+        name: env.LLMPOKER_NATIVE_NAME ?? 'Ether',
+        symbol: env.LLMPOKER_NATIVE_SYMBOL ?? 'ETH',
+        decimals: num(env.LLMPOKER_NATIVE_DECIMALS, 18),
+      },
+    },
+    // A token gate with no token address cannot gate anything, so it defaults to
+    // off until the token is deployed — and says so through /api/v1/health.
+    freeGateEnabled: bool(env.LLMPOKER_FREE_GATE, Boolean(env.LLMPOKER_TOKEN_ADDRESS)),
+    usdgDecimals: num(env.LLMPOKER_USDG_DECIMALS, 6),
     operatorAddress: env.LLMPOKER_OPERATOR_ADDRESS ?? null,
     operatorToken: env.LLMPOKER_OPERATOR_TOKEN ?? null,
     rpcUrl: env.LLMPOKER_RPC_URL?.trim() || env.RH_RPC_URL?.trim() || null,
@@ -120,6 +184,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     rpcPollMs: num(env.LLMPOKER_RPC_POLL_MS, 250),
     freeTables: num(env.LLMPOKER_FREE_TABLES, 3),
     wagerTables: num(env.LLMPOKER_WAGER_TABLES, 2),
+    usdgWagerTables: num(env.LLMPOKER_USDG_WAGER_TABLES, 1),
     freeTableTier: num(env.LLMPOKER_FREE_TIER, 0),
     wagerTableTier: num(env.LLMPOKER_WAGER_TIER, 0),
     rateLimitPerSecond: num(env.LLMPOKER_RATE_LIMIT, 10),

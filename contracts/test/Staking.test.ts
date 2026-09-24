@@ -33,7 +33,7 @@ describe('Staking (FR-9.4–9.6)', () => {
   /** Move rake to the splitter and then credit it, exactly as `Poker.settleHand` does. */
   async function pushRake(amount: bigint): Promise<any> {
     await stack.token.connect(poker).transfer(stack.splitterAddress, amount);
-    return stack.splitter.connect(poker).receiveRake(amount);
+    return stack.splitter.connect(poker).receiveRake(stack.tokenAddress, amount);
   }
 
   let poker: any;
@@ -82,7 +82,7 @@ describe('Staking (FR-9.4–9.6)', () => {
 
     const reward = ethers.parseEther('40');
     await expect(pushRake(reward)).to.emit(stack.splitter, 'RakeDistributed');
-    await expect(stack.splitter.connect(stack.owner).sweepAll()).to.emit(staking, 'RewardsNotified');
+    await expect(stack.splitter.connect(stack.owner).sweepAll(stack.tokenAddress)).to.emit(staking, 'RewardsNotified');
 
     // 25 % / 75 % of the 40 staking leg (the splitter sends 50 % of the rake to staking).
     const stakingLeg = reward / 2n;
@@ -94,7 +94,7 @@ describe('Staking (FR-9.4–9.6)', () => {
   it('pays a claim and emits Claimed (FR-9.4, FR-9.6)', async () => {
     await staking.connect(stack.players[0]).stake(ethers.parseEther('100'));
     await pushRake(ethers.parseEther('10'));
-    await stack.splitter.connect(stack.owner).sweepStaking(ethers.parseEther('5'));
+    await stack.splitter.connect(stack.owner).sweepStaking(stack.tokenAddress, ethers.parseEther('5'));
 
     const alice = stack.playerAddresses[0]!;
     const before = await stack.token.balanceOf(alice);
@@ -118,7 +118,7 @@ describe('Staking (FR-9.4–9.6)', () => {
     // means the distribution cannot be captured retroactively.
     await staking.connect(stack.players[1]).stake(ethers.parseEther('1000'));
     await pushRake(ethers.parseEther('100'));
-    await stack.splitter.connect(stack.owner).sweepStaking(ethers.parseEther('50'));
+    await stack.splitter.connect(stack.owner).sweepStaking(stack.tokenAddress, ethers.parseEther('50'));
 
     const first = await staking.pendingRewards(stack.playerAddresses[0]!);
     const second = await staking.pendingRewards(stack.playerAddresses[1]!);
@@ -170,7 +170,7 @@ describe('Staking (FR-9.4–9.6)', () => {
     await staking.connect(stack.players[0]).requestUnstake(ethers.parseEther('100'));
 
     await pushRake(ethers.parseEther('10'));
-    await stack.splitter.connect(stack.owner).sweepStaking(ethers.parseEther('5'));
+    await stack.splitter.connect(stack.owner).sweepStaking(stack.tokenAddress, ethers.parseEther('5'));
 
     // Alice earned nothing: only Bob's 100 was in the pool when the yield landed.
     expect(await staking.pendingRewards(alice)).to.equal(0n);
@@ -212,14 +212,14 @@ describe('Staking (FR-9.4–9.6)', () => {
 
     // A 1-wei staking leg is below one share of the accumulator, so it cannot be represented.
     await pushRake(2n);
-    await stack.splitter.connect(stack.owner).sweepStaking(1n);
+    await stack.splitter.connect(stack.owner).sweepStaking(stack.tokenAddress, 1n);
     expect(await staking.undistributedRewards()).to.equal(1n);
     expect(await staking.pendingRewards(stack.playerAddresses[0]!)).to.equal(0n);
     expect(await staking.pendingRewards(stack.playerAddresses[1]!)).to.equal(0n);
 
     // The dust is carried into the next distribution rather than stranded.
     await pushRake(ethers.parseEther('2'));
-    await stack.splitter.connect(stack.owner).sweepStaking(ethers.parseEther('1'));
+    await stack.splitter.connect(stack.owner).sweepStaking(stack.tokenAddress, ethers.parseEther('1'));
 
     const alice = await staking.pendingRewards(stack.playerAddresses[0]!);
     const bob = await staking.pendingRewards(stack.playerAddresses[1]!);
@@ -237,7 +237,7 @@ describe('Staking (FR-9.4–9.6)', () => {
 
   it('books a distribution as undistributed when the pool is empty (no silent loss)', async () => {
     await pushRake(ethers.parseEther('10'));
-    await expect(stack.splitter.connect(stack.owner).sweepStaking(ethers.parseEther('5')))
+    await expect(stack.splitter.connect(stack.owner).sweepStaking(stack.tokenAddress, ethers.parseEther('5')))
       .to.emit(staking, 'UndistributedCarried')
       .withArgs(ethers.parseEther('5'), ethers.parseEther('5'));
     expect(await staking.undistributedRewards()).to.equal(ethers.parseEther('5'));
@@ -245,7 +245,7 @@ describe('Staking (FR-9.4–9.6)', () => {
     // The carried amount is folded into the next distribution to real stakers.
     await staking.connect(stack.players[0]).stake(ethers.parseEther('100'));
     await pushRake(ethers.parseEther('10'));
-    await stack.splitter.connect(stack.owner).sweepStaking(ethers.parseEther('5'));
+    await stack.splitter.connect(stack.owner).sweepStaking(stack.tokenAddress, ethers.parseEther('5'));
     expect(await staking.pendingRewards(stack.playerAddresses[0]!)).to.equal(ethers.parseEther('10'));
     expect(await staking.undistributedRewards()).to.equal(0n);
   });
@@ -290,7 +290,7 @@ describe('Staking (FR-9.4–9.6)', () => {
     const alice = stack.playerAddresses[0]!;
     await staking.connect(stack.players[0]).stake(ethers.parseEther('100'));
     await pushRake(ethers.parseEther('10'));
-    await stack.splitter.connect(stack.owner).sweepStaking(ethers.parseEther('5'));
+    await stack.splitter.connect(stack.owner).sweepStaking(stack.tokenAddress, ethers.parseEther('5'));
     await staking.connect(stack.players[0]).requestUnstake(ethers.parseEther('100'));
 
     const [rewards, principal, claimableAt, total] = await staking.previewClaim(alice);
@@ -309,7 +309,7 @@ describe('Staking (FR-9.4–9.6)', () => {
       await staking.connect(stack.players[index]!).stake(amount);
     }
     await pushRake(ethers.parseEther('21'));
-    await stack.splitter.connect(stack.owner).sweepAll();
+    await stack.splitter.connect(stack.owner).sweepAll(stack.tokenAddress);
 
     const leg = ethers.parseEther('10.5');
     const claimable =

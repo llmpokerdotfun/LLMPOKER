@@ -14,13 +14,17 @@ import {
   TABLE_CONFIG,
   TABLE_ID,
   TEST_REQUIRED_BOND,
+  USDG_TABLE_CONFIG,
+  USDG_TABLE_ID,
   VOID_REASON,
   commitHiddenDeck,
   commitSeedPhase,
+  createUsdgWagerTable,
   createWagerTable,
   expectedRake,
   seatKey,
   snapshotFixture,
+  usdg,
   type PokerStack,
   type SnapshotFixture,
 } from './support/helpers';
@@ -99,15 +103,45 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
 
     it('only lets the owner create wager tables (FR-10.3)', async () => {
       await expect(
-        poker.connect(stack.operator).createTable(ethers.encodeBytes32String('x'), TABLE_CONFIG),
+        poker.connect(stack.operator).createTable(ethers.encodeBytes32String('x'), TABLE_CONFIG, stack.tokenAddress),
       ).to.be.revertedWithCustomError(poker, 'OwnableUnauthorizedAccount');
     });
 
     it('rejects a duplicate table id', async () => {
-      await expect(poker.connect(stack.owner).createTable(TABLE_ID, TABLE_CONFIG)).to.be.revertedWithCustomError(
-        poker,
-        'TableExists',
-      );
+      await expect(
+        poker.connect(stack.owner).createTable(TABLE_ID, TABLE_CONFIG, stack.tokenAddress),
+      ).to.be.revertedWithCustomError(poker, 'TableExists');
+    });
+
+    it('requires a non-zero settlement token and records it per table (FR-5.1)', async () => {
+      const freshId = ethers.encodeBytes32String('no-token');
+      await expect(
+        poker.connect(stack.owner).createTable(freshId, TABLE_CONFIG, ethers.ZeroAddress),
+      ).to.be.revertedWithCustomError(poker, 'InvalidSettlementToken');
+
+      expect(await poker.settlementTokenOf(TABLE_ID)).to.equal(stack.tokenAddress);
+      // A second currency is accepted and stays distinct.
+      await expect(
+        poker.connect(stack.owner).createTable(USDG_TABLE_ID, USDG_TABLE_CONFIG, stack.usdgAddress),
+      )
+        .to.emit(poker, 'TableCreated')
+        .withArgs(
+          USDG_TABLE_ID,
+          stack.usdgAddress,
+          [
+            USDG_TABLE_CONFIG.smallBlind,
+            USDG_TABLE_CONFIG.bigBlind,
+            USDG_TABLE_CONFIG.minBuyIn,
+            USDG_TABLE_CONFIG.maxBuyIn,
+            USDG_TABLE_CONFIG.rakeBps,
+            USDG_TABLE_CONFIG.rakeCap,
+            USDG_TABLE_CONFIG.maxSeats,
+          ],
+          stack.operatorAddress,
+        );
+      expect(await poker.settlementTokenOf(USDG_TABLE_ID)).to.equal(stack.usdgAddress);
+      // An unknown table has no currency to report.
+      await expect(poker.settlementTokenOf(freshId)).to.be.revertedWithCustomError(poker, 'UnknownTable');
     });
 
     it('enforces the config bounds, including the 1000 bps rake cap (FR-8.1)', async () => {
@@ -122,7 +156,9 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       ];
       for (const [label, override, reason] of cases) {
         await expect(
-          poker.connect(stack.owner).createTable(ethers.encodeBytes32String(label), { ...TABLE_CONFIG, ...override }),
+          poker
+            .connect(stack.owner)
+            .createTable(ethers.encodeBytes32String(label), { ...TABLE_CONFIG, ...override }, stack.tokenAddress),
         )
           .to.be.revertedWithCustomError(poker, 'InvalidTableConfig')
           .withArgs(reason);
@@ -278,6 +314,272 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
     });
   });
 
+  describe('per-table settlement currency (FR-5.1, FR-8.2)', () => {
+    /**
+     * Open a hand at `tableId`, commit `perSeat` from every seat, and settle it to `winner`.
+     * `tableConfig` is the currency's own config: the rake schedule differs per denomination, so
+     * the expectation must be computed against the table that is actually settling.
+     */
+    async function playCustomHand(options: {
+      tableId: string;
+      handId: string;
+      seats: number[];
+      perSeat: bigint;
+      winner: number;
+      tableConfig: { rakeBps: bigint; rakeCap: bigint };
+      sawFlop?: boolean;
+    }): Promise<{ pot: bigint; rake: bigint; award: bigint }> {
+      const { tableId, handId, seats, perSeat, winner, tableConfig } = options;
+      const sawFlop = options.sawFlop ?? true;
+      const contributions = seats.map(() => perSeat);
+      const seed = ethers.keccak256(ethers.toUtf8Bytes(`${handId}-seed`));
+      await commitHiddenDeck(stack, handId, seed, 1n);
+      await poker.connect(stack.operator).openHand(tableId, handId, seats);
+      for (const [index, seat] of seats.entries()) {
+        await poker.connect(stack.operator).commitHand(tableId, handId, seat, contributions[index]!);
+      }
+      const pot = perSeat * BigInt(seats.length);
+      const rake = expectedRake(pot, tableConfig.rakeBps, tableConfig.rakeCap, sawFlop);
+      const award = pot - rake;
+      await poker.connect(stack.operator).settleHand(tableId, handId, contributions, [winner], [award], sawFlop);
+      return { pot, rake, award };
+    }
+
+    it('settles a USDG table end to end in USDG (6 decimals) and leaves LLMPOKER untouched', async () => {
+      await createUsdgWagerTable(stack);
+      const seats = [0, 1, 2];
+      const perSeat = usdg('20');
+
+      for (const seat of seats) {
+        await poker.connect(stack.players[seat]!).deposit(USDG_TABLE_ID, seat, perSeat);
+      }
+      expect(await poker.totalEscrowObserved(stack.usdgAddress)).to.equal(usdg('60'));
+      // Nothing was pulled in LLMPOKER, and the LLMPOKER table is untouched.
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(0n);
+      expect(await poker.totalEscrowObserved(stack.tokenAddress)).to.equal(0n);
+
+      const { pot, rake, award } = await playCustomHand({
+        tableId: USDG_TABLE_ID,
+        handId: handIdOf('usdg-hand'),
+        seats,
+        perSeat,
+        winner: 1,
+        tableConfig: USDG_TABLE_CONFIG,
+      });
+
+      expect(pot).to.equal(usdg('60'));
+      expect(rake).to.equal(usdg('0.5')); // cap binds: 250 bps of 60 USDG = 1.5 USDG
+      expect(award).to.equal(usdg('59.5'));
+
+      // Escrow moved for USDG only, and conserves to `balanceOf(Poker)`. The rake was never part
+      // of escrow (chips leave escrow when they are committed), so the running total equals the
+      // post-settlement escrow as well as the contract's USDG balance.
+      expect(await poker.escrowBalanceOf(USDG_TABLE_ID, 0)).to.equal(0n);
+      expect(await poker.escrowBalanceOf(USDG_TABLE_ID, 1)).to.equal(award);
+      expect(await poker.escrowBalanceOf(USDG_TABLE_ID, 2)).to.equal(0n);
+      expect(await poker.totalEscrowObserved(stack.usdgAddress)).to.equal(award);
+      expect(await stack.usdg.balanceOf(stack.pokerAddress)).to.equal(award);
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(0n);
+    });
+
+    it('pushes USDG rake to RakeSplitter in USDG and splits it 50/50 (FR-8.2)', async () => {
+      await createUsdgWagerTable(stack);
+      const seats = [0, 1];
+      const perSeat = usdg('20');
+      for (const seat of seats) {
+        await poker.connect(stack.players[seat]!).deposit(USDG_TABLE_ID, seat, perSeat);
+      }
+
+      const { pot, rake } = await playCustomHand({
+        tableId: USDG_TABLE_ID,
+        handId: handIdOf('usdg-rake'),
+        seats,
+        perSeat,
+        winner: 0,
+        tableConfig: USDG_TABLE_CONFIG,
+      });
+
+      // 250 bps of 40 USDG = 1.0 USDG, above the 0.5 USDG cap, so the cap is what leaves escrow.
+      expect(pot).to.equal(usdg('40'));
+      expect(rake).to.equal(usdg('0.5'));
+      expect(await stack.usdg.balanceOf(stack.splitterAddress)).to.equal(rake);
+      // The splitter booked the rake in USDG, not in LLMPOKER.
+      expect(await stack.splitter.receivedOf(stack.usdgAddress)).to.equal(rake);
+      expect(await stack.splitter.receivedOf(stack.tokenAddress)).to.equal(0n);
+      expect(await stack.splitter.pendingOf(stack.usdgAddress, stack.stakingAddress)).to.equal(rake / 2n);
+      expect(await stack.splitter.pendingOf(stack.usdgAddress, stack.buybackBurnerAddress)).to.equal(rake / 2n);
+      // The vault gets no part of the rake any more (FR-9.2 covers DEX fees only).
+      expect(await stack.usdg.balanceOf(stack.vaultAddress)).to.equal(0n);
+
+      // Sweeping the buyback leg delivers USDG to the burner, where it waits for a router.
+      await stack.splitter.connect(stack.players[2]!).sweepBuyback(stack.usdgAddress, rake / 2n);
+      expect(await stack.usdg.balanceOf(stack.buybackBurnerAddress)).to.equal(rake / 2n);
+      expect(await stack.buybackBurner.pendingOf(stack.usdgAddress)).to.equal(rake / 2n);
+      expect(await stack.token.balanceOf(stack.buybackBurnerAddress)).to.equal(0n);
+    });
+
+    it('does not mix a USDG table and an LLMPOKER table, even with the same player and seat', async () => {
+      await createUsdgWagerTable(stack);
+      const player = stack.players[0]!;
+      const playerAddress = stack.playerAddresses[0]!;
+
+      await poker.connect(player).deposit(TABLE_ID, 0, LEGAL_BUY_IN);
+      await poker.connect(player).deposit(USDG_TABLE_ID, 0, usdg('20'));
+
+      expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(LEGAL_BUY_IN);
+      expect(await poker.escrowBalanceOf(USDG_TABLE_ID, 0)).to.equal(usdg('20'));
+      expect(await poker.totalEscrowObserved(stack.tokenAddress)).to.equal(LEGAL_BUY_IN);
+      expect(await poker.totalEscrowObserved(stack.usdgAddress)).to.equal(usdg('20'));
+      expect(await poker.tableEscrowOf(TABLE_ID, stack.tokenAddress)).to.equal(LEGAL_BUY_IN);
+      expect(await poker.tableEscrowOf(USDG_TABLE_ID, stack.usdgAddress)).to.equal(usdg('20'));
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(LEGAL_BUY_IN);
+      expect(await stack.usdg.balanceOf(stack.pokerAddress)).to.equal(usdg('20'));
+
+      // Asking for the wrong currency is rejected, so a monitor cannot read a misleading zero.
+      await expect(poker.totalEscrowObserved(stack.vaultAddress)).to.be.revertedWithCustomError(
+        poker,
+        'UnsupportedToken',
+      );
+      await expect(poker.tableEscrowOf(TABLE_ID, stack.usdgAddress)).to.be.revertedWithCustomError(
+        poker,
+        'UnsupportedToken',
+      );
+
+      // Cash out the USDG seat: only the USDG ledger moves.
+      await poker.connect(player).cashOut(USDG_TABLE_ID, 0);
+      expect(await poker.escrowBalanceOf(USDG_TABLE_ID, 0)).to.equal(0n);
+      expect(await poker.totalEscrowObserved(stack.usdgAddress)).to.equal(0n);
+      expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(LEGAL_BUY_IN);
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(LEGAL_BUY_IN);
+      expect(await stack.usdg.balanceOf(stack.pokerAddress)).to.equal(0n);
+
+      // The seat at the other table (and the same player) is untouched by that cash-out.
+      expect(await poker.occupantOf(TABLE_ID, 0)).to.equal(playerAddress);
+      expect(await poker.occupantOf(USDG_TABLE_ID, 0)).to.equal(ethers.ZeroAddress);
+    });
+
+    it('keeps both currencies solvent at once across two live tables', async () => {
+      await createUsdgWagerTable(stack);
+      for (const seat of [0, 1]) {
+        await poker.connect(stack.players[seat]!).deposit(TABLE_ID, seat, LEGAL_BUY_IN);
+        await poker.connect(stack.players[seat]!).deposit(USDG_TABLE_ID, seat, usdg('20'));
+      }
+      const { rake: llmRake } = await playCustomHand({
+        tableId: TABLE_ID,
+        handId: handIdOf('both-llm'),
+        seats: [0, 1],
+        perSeat: ethers.parseEther('20'),
+        winner: 0,
+        tableConfig: TABLE_CONFIG,
+      });
+      const { rake: usdgRake } = await playCustomHand({
+        tableId: USDG_TABLE_ID,
+        handId: handIdOf('both-usdg'),
+        seats: [0, 1],
+        perSeat: usdg('20'),
+        winner: 1,
+        tableConfig: USDG_TABLE_CONFIG,
+      });
+
+      // Each token's balance equals its own escrow total — the per-currency solvency claim.
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(
+        await poker.totalEscrowObserved(stack.tokenAddress),
+      );
+      expect(await stack.usdg.balanceOf(stack.pokerAddress)).to.equal(
+        await poker.totalEscrowObserved(stack.usdgAddress),
+      );
+      expect(await stack.token.balanceOf(stack.splitterAddress)).to.equal(llmRake);
+      expect(await stack.usdg.balanceOf(stack.splitterAddress)).to.equal(usdgRake);
+      expect(llmRake).to.not.equal(usdgRake);
+    });
+
+    it('carries USDG rake all the way to an LLMPOKER burn once a router exists (FR-8.2, FR-9.2)', async () => {
+      // The full money path with the tokenomics wired end to end: USDG pot → USDG rake to the
+      // splitter → USDG buyback leg to the burner → swap → LLMPOKER burned (supply falls).
+      await createUsdgWagerTable(stack);
+      const seats = [0, 1];
+      const perSeat = usdg('20');
+      for (const seat of seats) {
+        await poker.connect(stack.players[seat]!).deposit(USDG_TABLE_ID, seat, perSeat);
+      }
+
+      const { rake } = await playCustomHand({
+        tableId: USDG_TABLE_ID,
+        handId: handIdOf('usdg-to-burn'),
+        seats,
+        perSeat,
+        winner: 0,
+        tableConfig: USDG_TABLE_CONFIG,
+      });
+      expect(rake).to.equal(usdg('0.5'));
+
+      // The router needs LLMPOKER to pay the swap out; the burner approves its own USDG balance
+      // inside `execute`, so no test-side approval is required.
+      const routerFactory = await hre.ethers.getContractFactory('MockV2Router', stack.owner);
+      const router: any = await routerFactory.deploy(stack.ownerAddress, ethers.parseEther('1000'));
+      await router.waitForDeployment();
+      await stack.token.connect(stack.owner).transfer(await router.getAddress(), ethers.parseEther('10000'));
+
+      // The deployment starts inert: the burner holds the fee token and says so.
+      await stack.splitter.connect(stack.players[2]!).sweepBuyback(stack.usdgAddress, rake / 2n);
+      await expect(
+        stack.buybackBurner.connect(stack.players[2]!).execute(stack.usdgAddress, [], 0n, 0n, 0n),
+      )
+        .to.emit(stack.buybackBurner, 'BuybackPending')
+        .withArgs(stack.usdgAddress, rake / 2n, ethers.encodeBytes32String('NO_ROUTER'));
+
+      // Pin the route, then any keeper can turn the held USDG into a burn.
+      await stack.buybackBurner
+        .connect(stack.owner)
+        .setRouterAndRoute(await router.getAddress(), stack.usdgAddress, [stack.usdgAddress, stack.tokenAddress]);
+      const expectedOut = await router.quote(stack.usdgAddress, stack.tokenAddress, rake / 2n);
+      const supplyBefore = await stack.token.totalSupply();
+
+      await expect(
+        stack.buybackBurner
+          .connect(stack.players[3]!)
+          .execute(stack.usdgAddress, [stack.usdgAddress, stack.tokenAddress], 0n, 0n, 0n),
+      )
+        .to.emit(stack.buybackBurner, 'Burned')
+        .withArgs(stack.usdgAddress, expectedOut, stack.playerAddresses[3]!);
+
+      expect(await stack.token.totalSupply()).to.equal(supplyBefore - expectedOut);
+      expect(await stack.buybackBurner.totalBurned()).to.equal(expectedOut);
+      expect(await stack.usdg.balanceOf(stack.buybackBurnerAddress)).to.equal(0n);
+
+      // The staking half is still held as USDG for the pool.
+      expect(await stack.splitter.pendingOf(stack.usdgAddress, stack.stakingAddress)).to.equal(rake / 2n);
+    });
+
+    it('refunds a voided USDG hand in USDG (FR-5.6)', async () => {
+      await createUsdgWagerTable(stack);
+      const seats = [0, 1];
+      const perSeat = usdg('20');
+      for (const seat of seats) {
+        await poker.connect(stack.players[seat]!).deposit(USDG_TABLE_ID, seat, perSeat);
+      }
+
+      const handId = handIdOf('usdg-void');
+      const seed = ethers.keccak256(ethers.toUtf8Bytes('usdg-void-seed'));
+      // Phase 1 only: the reveal window expires and anyone may void the shuffle (FR-6.7).
+      const { commitBlock } = await commitSeedPhase(stack, handId, seed, 1n);
+      await poker.connect(stack.operator).openHand(USDG_TABLE_ID, handId, seats);
+      await poker.connect(stack.operator).commitHand(USDG_TABLE_ID, handId, 0, perSeat);
+      expect(await poker.totalEscrowObserved(stack.usdgAddress)).to.equal(perSeat);
+
+      await mineUpTo(BigInt(commitBlock) + 257n);
+      await stack.shuffle.connect(stack.players[3]!).void(handId);
+      await expect(poker.connect(stack.players[3]!).voidHand(USDG_TABLE_ID, handId))
+        .to.emit(poker, 'HandVoided')
+        .withArgs(USDG_TABLE_ID, handId, perSeat, ethers.encodeBytes32String('SHUFFLE_VOIDED'));
+
+      expect(await poker.escrowBalanceOf(USDG_TABLE_ID, 0)).to.equal(perSeat);
+      expect(await poker.totalEscrowObserved(stack.usdgAddress)).to.equal(perSeat * 2n);
+      expect(await stack.usdg.balanceOf(stack.pokerAddress)).to.equal(perSeat * 2n);
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(0n);
+    });
+  });
+
   describe('hand lifecycle and settlement (FR-5.2, FR-5.3, FR-8)', () => {
     it('requires an on-chain commitment before a hand can open (FR-6)', async () => {
       await seatAll();
@@ -332,10 +634,11 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       expect(totalEscrow).to.equal(LEGAL_BUY_IN * 3n - rake);
       expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(totalEscrow);
 
-      // Rake left escrow into the splitter (FR-8.2) and was split 50/50.
+      // Rake left escrow into the splitter (FR-8.2) and was split 50/50 buyback/stakers, in the
+      // table's own settlement token.
       expect(await stack.token.balanceOf(stack.splitterAddress)).to.equal(rake);
-      expect(await stack.splitter.pendingStaking()).to.equal(rake / 2n);
-      expect(await stack.splitter.pendingVault()).to.equal(rake / 2n);
+      expect(await stack.splitter.pendingOf(stack.tokenAddress, stack.buybackBurnerAddress)).to.equal(rake / 2n);
+      expect(await stack.splitter.pendingOf(stack.tokenAddress, stack.stakingAddress)).to.equal(rake / 2n);
       expect(await poker.pendingHandsOf(TABLE_ID)).to.equal(0n);
     });
 
@@ -384,7 +687,7 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
 
       // 250 bps of 40 = 1.0 token would be charged, but the cap is 0.05.
       expect(await stack.token.balanceOf(stack.splitterAddress)).to.equal(RAKE.cap);
-      expect(await stack.splitter.pendingStaking()).to.equal(RAKE.cap / 2n);
+      expect(await stack.splitter.pendingOf(stack.tokenAddress, stack.buybackBurnerAddress)).to.equal(RAKE.cap / 2n);
     });
 
     it('rejects a settlement whose contributions do not match what was committed', async () => {
@@ -805,7 +1108,6 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await expect(
         factory.deploy(
           ethers.ZeroAddress,
-          stack.shuffleAddress,
           stack.splitterAddress,
           stack.ownerAddress,
           stack.operatorAddress,
@@ -813,7 +1115,14 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       ).to.be.revertedWithCustomError(factory, 'ZeroAddress');
       await expect(
         factory.deploy(
-          stack.tokenAddress,
+          stack.shuffleAddress,
+          ethers.ZeroAddress,
+          stack.ownerAddress,
+          stack.operatorAddress,
+        ),
+      ).to.be.revertedWithCustomError(factory, 'ZeroAddress');
+      await expect(
+        factory.deploy(
           stack.shuffleAddress,
           stack.splitterAddress,
           stack.ownerAddress,
@@ -840,8 +1149,15 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       expect(pot).to.equal(0n);
       expect(seatCount).to.equal(3n);
       expect(participants.slice(0, 3)).to.deep.equal([0n, 1n, 2n]);
-      // `totalEscrowObserved` makes the solvency claim checkable by anyone.
-      expect(await poker.totalEscrowObserved()).to.equal(await stack.token.balanceOf(stack.pokerAddress));
+      // `totalEscrowObserved(token)` makes the per-currency solvency claim checkable by anyone.
+      expect(await poker.totalEscrowObserved(stack.tokenAddress)).to.equal(
+        await stack.token.balanceOf(stack.pokerAddress),
+      );
+      // A currency no table settles in is rejected rather than silently reported as zero.
+      await expect(poker.totalEscrowObserved(stack.usdgAddress)).to.be.revertedWithCustomError(
+        poker,
+        'UnsupportedToken',
+      );
     });
   });
 });

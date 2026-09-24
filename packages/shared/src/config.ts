@@ -71,11 +71,17 @@ export function defaultFreeTableConfig(id: string, name: string, tierIndex = 0):
     autoStart: true,
     handIntervalMs: 3_000,
     escrowRequired: false,
+    settlementCurrency: null,
     autoTopUp: FREE_STARTING_CHIPS,
   };
 }
 
-export function defaultWagerTableConfig(id: string, name: string, tierIndex = 0): TableConfig {
+export function defaultWagerTableConfig(
+  id: string,
+  name: string,
+  tierIndex = 0,
+  currency: 'TOKEN' | 'USDG' = 'TOKEN',
+): TableConfig {
   const t = WAGER_TIERS[tierIndex] ?? WAGER_TIERS[0]!;
   return {
     id,
@@ -95,6 +101,7 @@ export function defaultWagerTableConfig(id: string, name: string, tierIndex = 0)
     autoStart: true,
     handIntervalMs: 5_000,
     escrowRequired: true,
+    settlementCurrency: currency,
     autoTopUp: null,
   };
 }
@@ -158,6 +165,12 @@ export function validateTableConfig(config: TableConfig): string[] {
   if (config.rakeBps < 0 || config.rakeBps > 1_000) errors.push('rakeBps must be 0..1000');
   if (config.rakeCap < 0n) errors.push('rakeCap cannot be negative');
   if (config.mode === 'FREE' && config.escrowRequired) errors.push('free tables cannot require escrow');
+  if (config.mode === 'FREE' && config.settlementCurrency !== null) {
+    errors.push('free tables settle in play chips, so settlementCurrency must be null');
+  }
+  if (config.mode === 'WAGER' && config.settlementCurrency === null) {
+    errors.push('wager tables must name a settlement currency (TOKEN or USDG)');
+  }
   return errors;
 }
 

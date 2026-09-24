@@ -5,6 +5,7 @@ import { createAnchor, createSettlement } from './chain.js';
 import { buildApp } from './app.js';
 import { Orchestrator } from './orchestrator.js';
 import { Store } from './store.js';
+import { createChainServices } from './token.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -21,12 +22,21 @@ async function main(): Promise<void> {
   const store = new Store({ dataDir: config.dataDir, persist: config.persist });
   const anchor = createAnchor(config);
   const settlement = createSettlement(config);
-  const orchestrator = new Orchestrator({ config, store, anchor, settlement, log });
+  // Wallet-facing chain services: also the free-table token gate (FR-4, revised).
+  const chainServices = createChainServices(config);
+  const orchestrator = new Orchestrator({
+    config,
+    store,
+    anchor,
+    settlement,
+    freeTableAccess: (wallet) => chainServices.requireFreeTableAccess(wallet),
+    log,
+  });
   orchestrator.init();
   // On-chain mode: agents deposit before seating, so the tables must exist first.
   await orchestrator.ensureTables();
 
-  const { app, close } = await buildApp({ config, store, orchestrator, log });
+  const { app, close } = await buildApp({ config, store, orchestrator, chainServices, log });
   orchestrator.start();
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -46,6 +56,10 @@ async function main(): Promise<void> {
     freeTables: orchestrator.listTables().filter((t) => t.state.config.mode === 'FREE').length,
     wagerTables: orchestrator.listTables().filter((t) => t.state.config.mode === 'WAGER').length,
     dataDir: config.dataDir,
+    freeGate: config.freeGateEnabled
+      ? `on (>= ${config.tokenomics.freeGameMinTokens} ${config.tokenomics.tokenSymbol})`
+      : 'off',
+    walletServices: chainServices.available,
   });
 }
 

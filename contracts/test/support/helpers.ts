@@ -3,7 +3,11 @@
  *
  * Deploys the whole on-chain stack against the in-process Hardhat network (no fork, no live
  * RPC) so every test file gets the same wiring: Token → Vault → Staking → RakeSplitter →
- * Shuffle → Poker.
+ * BuybackBurner → Shuffle → Poker.
+ *
+ * The fixture also deploys a **USDG stand-in** (`MockDecimalsToken`, 6 decimals) so the suite can
+ * prove that per-table settlement currencies never mix, and it wires the buyback leg end to end
+ * (`splitter.setBuyback(burner)`, `burner.setSplitter(splitter)`).
  */
 
 import { ethers } from 'ethers';
@@ -14,6 +18,14 @@ import { mineUpTo, takeSnapshot } from '@nomicfoundation/hardhat-network-helpers
 import { cardProof, commitmentForDeck, type DeckCommitment } from './merkle';
 
 const BPS_DENOMINATOR = 10_000n;
+
+/** `USDG` decimals — the whole point of the dual-currency tests (SRS §6, FR-5.1). */
+export const USDG_DECIMALS = 6n;
+
+/** One USDG in base units (`1e6`), as opposed to `ethers.parseEther` for LLMPOKER. */
+export function usdg(amount: string): bigint {
+  return ethers.parseUnits(amount, Number(USDG_DECIMALS));
+}
 
 /** Rake defaults mirrored from `packages/shared/src/config.ts` and `Poker.DEFAULT_*`. */
 export const RAKE = {
@@ -39,15 +51,19 @@ export interface PokerStack {
   operator: Signer;
   players: Signer[];
   token: any;
+  usdg: any;
   vault: any;
   staking: any;
   splitter: any;
+  buybackBurner: any;
   shuffle: any;
   poker: any;
   tokenAddress: Address;
+  usdgAddress: Address;
   vaultAddress: Address;
   stakingAddress: Address;
   splitterAddress: Address;
+  buybackBurnerAddress: Address;
   shuffleAddress: Address;
   pokerAddress: Address;
   playerAddresses: Address[];
@@ -66,7 +82,23 @@ export const TABLE_CONFIG = {
   maxSeats: 6,
 } as const;
 
+/**
+ * The USDG-denominated table: the same 6-max shape, expressed in 6-decimal base units.
+ * `5_000_000n` is 5 USDG (not 5e18), which is exactly the decimal-agnosticism the contract
+ * claims: only the off-chain amounts change.
+ */
+export const USDG_TABLE_CONFIG = {
+  smallBlind: 50_000n, // 0.05 USDG
+  bigBlind: 100_000n, // 0.10 USDG
+  minBuyIn: 5_000_000n, // 5 USDG
+  maxBuyIn: 25_000_000n, // 25 USDG
+  rakeBps: RAKE.bps,
+  rakeCap: 500_000n, // 0.5 USDG (250 bps of a 60 USDG pot = 1.5, so the cap binds)
+  maxSeats: 6,
+} as const;
+
 export const TABLE_ID = ethers.encodeBytes32String('low-1');
+export const USDG_TABLE_ID = ethers.encodeBytes32String('usdg-1');
 
 /** `keccak256(abi.encodePacked(bytes32 tableId, uint8 seat))`, mirroring `Poker._seatKey`. */
 export function seatKey(tableId: TableId, seat: number): string {
@@ -129,6 +161,12 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   const vault = await vaultFactory.deploy(await token.getAddress(), await owner.getAddress(), 5_000n);
   await vault.waitForDeployment();
 
+  // USDG stand-in: a 6-decimal stablecoin. The real address is supply-time configuration
+  // (`USDG_ADDRESS`); nothing in `src/` hard-codes one, which is what this fixture proves.
+  const usdgFactory = await hre.ethers.getContractFactory('MockDecimalsToken', owner);
+  const usdgToken = await usdgFactory.deploy('USDG', 'USDG', Number(USDG_DECIMALS));
+  await usdgToken.waitForDeployment();
+
   const stakingFactory = await hre.ethers.getContractFactory('Staking', owner);
   const staking = await stakingFactory.deploy(
     await token.getAddress(),
@@ -140,13 +178,17 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
 
   const splitterFactory = await hre.ethers.getContractFactory('RakeSplitter', owner);
   const splitter = await splitterFactory.deploy(
-    await token.getAddress(),
     await staking.getAddress(),
     await vault.getAddress(),
     await owner.getAddress(),
     5_000n,
   );
   await splitter.waitForDeployment();
+
+  // The buyback-and-burn leg: no router configured, which is the expected pre-launch state.
+  const burnerFactory = await hre.ethers.getContractFactory('BuybackBurner', owner);
+  const buybackBurner = await burnerFactory.deploy(await token.getAddress(), await owner.getAddress(), 0n);
+  await buybackBurner.waitForDeployment();
 
   const shuffleFactory = await hre.ethers.getContractFactory('Shuffle', owner);
   const shuffle = await shuffleFactory.deploy(
@@ -160,7 +202,6 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
 
   const pokerFactory = await hre.ethers.getContractFactory('Poker', owner);
   const poker = await pokerFactory.deploy(
-    await token.getAddress(),
     await shuffle.getAddress(),
     await splitter.getAddress(),
     await owner.getAddress(),
@@ -168,8 +209,9 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   );
   await poker.waitForDeployment();
 
-  // Wiring: the splitter may only be pushed by Poker (FR-8.2), and the staking pool only
-  // accrues when the splitter says so (FR-9.6).
+  // Wiring: the splitter may only be pushed by Poker (FR-8.2), the staking pool only accrues
+  // when the splitter says so (FR-9.6), and the buyback leg is credited to the burner, which in
+  // turn only accepts fees from the splitter (FR-8.2).
   //
   // `getContractFactory().deploy()` is typed as `BaseContract`, which does not expose the
   // generated `Contract` index signature, so the wiring calls go through `ethers.Contract`
@@ -178,7 +220,11 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   const stakingContract = staking as ethers.Contract;
   const shuffleContract = shuffle as ethers.Contract;
   const tokenContract = token as ethers.Contract;
+  const usdgContract = usdgToken as ethers.Contract;
+  const burnerContract = buybackBurner as ethers.Contract;
   await splitterContract.setPoker!(await poker.getAddress());
+  await splitterContract.setBuyback!(await buybackBurner.getAddress());
+  await burnerContract.setSplitter!(await splitter.getAddress());
   await stakingContract.grantRole!(
     (await stakingContract.REWARDS_NOTIFIER_ROLE!()) as string,
     await splitter.getAddress(),
@@ -196,7 +242,10 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   );
   await (shuffleContract.connect(operator) as ethers.Contract).postBond!(TEST_REQUIRED_BOND);
 
-  // Fund the players and let Poker/Staking/Vault pull.
+  // The deployer holds both currencies too, so tests can act as an external fee source.
+  await (usdgContract.connect(owner) as ethers.Contract).mint!(await owner.getAddress(), usdg('1000000'));
+
+  // Fund the players with both currencies and let Poker/Staking/Vault/Splitter pull.
   const spenders = [
     await poker.getAddress(),
     await splitter.getAddress(),
@@ -206,8 +255,11 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   for (const player of players) {
     const address = await player.getAddress();
     await (tokenContract.connect(owner) as ethers.Contract).transfer!(address, ethers.parseEther('2000'));
+    // 1,000,000 USDG (6 decimals) per player is plenty for every wager test.
+    await (usdgContract.connect(owner) as ethers.Contract).mint!(address, usdg('1000000'));
     for (const spender of spenders) {
       await (tokenContract.connect(player) as ethers.Contract).approve!(spender, ethers.MaxUint256);
+      await (usdgContract.connect(player) as ethers.Contract).approve!(spender, ethers.MaxUint256);
     }
   }
 
@@ -216,15 +268,19 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
     operator,
     players,
     token,
+    usdg: usdgToken,
     vault,
     staking,
     splitter,
+    buybackBurner,
     shuffle,
     poker,
     tokenAddress: await token.getAddress(),
+    usdgAddress: await usdgToken.getAddress(),
     vaultAddress: await vault.getAddress(),
     stakingAddress: await staking.getAddress(),
     splitterAddress: await splitter.getAddress(),
+    buybackBurnerAddress: await buybackBurner.getAddress(),
     shuffleAddress: await shuffle.getAddress(),
     pokerAddress: await poker.getAddress(),
     playerAddresses: await Promise.all(players.map((p) => p.getAddress())),
@@ -233,13 +289,25 @@ export async function deployStack(requiredConfirmations: bigint = 12n): Promise<
   };
 }
 
-/** Create the shared wager table (FR-5.1). */
+/** Create the shared LLMPOKER wager table (FR-5.1). */
 export async function createWagerTable(
   stack: PokerStack,
   tableId: string = TABLE_ID,
   config: typeof TABLE_CONFIG = TABLE_CONFIG,
+  settlementToken?: string,
 ): Promise<void> {
-  await stack.poker.connect(stack.owner).createTable(tableId, config);
+  await stack.poker
+    .connect(stack.owner)
+    .createTable(tableId, config, settlementToken ?? stack.tokenAddress);
+}
+
+/** Create the USDG-denominated wager table (FR-5.1, dual-currency). */
+export async function createUsdgWagerTable(
+  stack: PokerStack,
+  tableId: string = USDG_TABLE_ID,
+  config: typeof USDG_TABLE_CONFIG = USDG_TABLE_CONFIG,
+): Promise<void> {
+  await stack.poker.connect(stack.owner).createTable(tableId, config, stack.usdgAddress);
 }
 
 /**

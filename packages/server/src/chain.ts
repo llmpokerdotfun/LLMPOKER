@@ -528,7 +528,7 @@ export class LocalEscrow implements SettlementAdapter {
 
 /** The `Poker.sol` surface the operator drives, mirroring `contracts/src/Poker.sol`. */
 interface PokerContract {
-  createTable(tableId: string, config: Record<string, unknown>): Promise<{ hash: string }>;
+  createTable(tableId: string, config: Record<string, unknown>, settlementToken: string): Promise<{ hash: string }>;
   openHand(tableId: string, handId: string, seats: number[]): Promise<{ hash: string }>;
   commitHand(tableId: string, handId: string, seat: number, amount: bigint): Promise<{ hash: string }>;
   settleHand(
@@ -541,7 +541,9 @@ interface PokerContract {
   ): Promise<{ hash: string }>;
   voidHand(tableId: string, handId: string): Promise<{ hash: string }>;
   tableConfigOf(tableId: string): Promise<{ maxSeats: bigint } & unknown[]>;
+  settlementTokenOf(tableId: string): Promise<string>;
   escrowBalanceOf(tableId: string, seat: number): Promise<bigint>;
+  totalEscrowObserved(settlementToken: string): Promise<bigint>;
   computeRake(
     pot: bigint,
     rakeBps: bigint,
@@ -570,12 +572,12 @@ export class OnChainSettlement implements SettlementAdapter {
   constructor(
     private readonly rpcUrl: string,
     private readonly privateKey: string,
-    private readonly addresses: { poker: string; token: string },
+    private readonly addresses: { poker: string; token: string | null; usdg: string | null },
     private readonly rpcPollMs = 250,
   ) {
     if (!rpcUrl || !privateKey) throw new Error('on-chain settlement requires an RPC URL and an operator key');
-    if (!addresses.poker || !addresses.token) {
-      throw new Error('on-chain settlement requires LLMPOKER_POKER_ADDRESS and LLMPOKER_TOKEN_ADDRESS');
+    if (!addresses.poker) {
+      throw new Error('on-chain settlement requires LLMPOKER_POKER_ADDRESS');
     }
   }
 
@@ -599,7 +601,7 @@ export class OnChainSettlement implements SettlementAdapter {
       const { Contract, Wallet } = await this.ethers();
       const provider = await this.getProvider();
       const abi = [
-        'function createTable(bytes32 tableId, (uint256 smallBlind,uint256 bigBlind,uint256 minBuyIn,uint256 maxBuyIn,uint16 rakeBps,uint256 rakeCap,uint8 maxSeats) config)',
+        'function createTable(bytes32 tableId, (uint256 smallBlind,uint256 bigBlind,uint256 minBuyIn,uint256 maxBuyIn,uint16 rakeBps,uint256 rakeCap,uint8 maxSeats) config, address settlementToken)',
         'function openHand(bytes32 tableId, bytes32 handId, uint8[] seats)',
         'function commitHand(bytes32 tableId, bytes32 handId, uint8 seat, uint256 amount)',
         'function settleHand(bytes32 tableId, bytes32 handId, uint256[] contributions, uint8[] winners, uint256[] awards, bool sawFlop)',
@@ -651,18 +653,48 @@ export class OnChainSettlement implements SettlementAdapter {
       return null;
     }
 
-    const tx = await poker.createTable(tableId, {
-      smallBlind: config.smallBlind,
-      bigBlind: config.bigBlind,
-      minBuyIn: config.minBuyIn,
-      maxBuyIn: config.maxBuyIn,
-      rakeBps: config.rakeBps,
-      rakeCap: config.rakeCap,
-      maxSeats: config.maxSeats,
-    });
+    const settlementToken = this.settlementTokenFor(config);
+    const tx = await poker.createTable(
+      tableId,
+      {
+        smallBlind: config.smallBlind,
+        bigBlind: config.bigBlind,
+        minBuyIn: config.minBuyIn,
+        maxBuyIn: config.maxBuyIn,
+        rakeBps: config.rakeBps,
+        rakeCap: config.rakeCap,
+        maxSeats: config.maxSeats,
+      },
+      settlementToken,
+    );
     const receipt = await this.mined(tx.hash);
     this.knownTables.add(config.id);
-    return { ...receipt, note: `createTable:${config.id}` };
+    return { ...receipt, note: `createTable:${config.id} (${config.settlementCurrency})` };
+  }
+
+  /**
+   * The ERC-20 a table settles in, fixed at creation on-chain. A table whose
+   * currency has no deployed address cannot be created, so it is refused here
+   * with the env var that would fix it rather than sending a zero address.
+   */
+  private settlementTokenFor(config: TableConfig): string {
+    const currency = config.settlementCurrency;
+    if (currency === null) {
+      throw new Error(`table ${config.id} is a free table and has no on-chain settlement token`);
+    }
+    const address = currency === 'USDG' ? this.addresses.usdg : this.addresses.token;
+    if (!address || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+      const envVar = currency === 'USDG' ? 'LLMPOKER_USDG_ADDRESS' : 'LLMPOKER_TOKEN_ADDRESS';
+      throw new Error(`table ${config.id} settles in ${currency} but ${envVar} is not set`);
+    }
+    return address;
+  }
+
+  /** On-chain escrow held for one table's currency (FR-5.1). */
+  async escrowOfTable(tableId: string): Promise<bigint> {
+    const poker = await this.getPoker();
+    const token = await poker.settlementTokenOf(await this.id32(tableId));
+    return poker.totalEscrowObserved(token);
   }
 
   async openHand(tableId: string, handId: string, seats: number[]): Promise<SettlementReceipt | null> {
@@ -759,7 +791,7 @@ export function createSettlement(config: ServerConfig): SettlementAdapter {
     return new OnChainSettlement(
       config.rpcUrl,
       config.operatorPrivateKey,
-      { poker: config.contracts.poker, token: config.contracts.token },
+      { poker: config.contracts.poker, token: config.contracts.token, usdg: config.contracts.usdg },
       config.rpcPollMs,
     );
   }

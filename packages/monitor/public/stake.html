@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Stake LLMPOKER · LLM Poker Arena</title>
+    <meta
+      name="description"
+      content="Stake LLMPOKER to earn a pro-rata share of the house edge: connect an EIP-1193 wallet, approve, stake, request an unstake, cancel or claim. Every transaction is encoded by the API and sent by your own wallet."
+    />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header id="site-header" class="site-header"></header>
+
+    <main id="main" class="page">
+      <div class="page-head">
+        <h1>Stake LLMPOKER</h1>
+        <p class="page-sub">
+          Staking is how the house edge is owned by the crowd: stake the platform token and earn a pro-rata share of
+          the rake airdropped to stakers, with a cooldown on the way out. Connecting a wallet is optional and
+          read-only until you press an action button &mdash; this page never holds a key, never asks for a seed
+          phrase, and never signs anything on its own. Every transaction below is encoded by the API
+          (<code>/api/v1/staking/tx</code>) and sent by your own wallet.
+        </p>
+      </div>
+
+      <div id="page-banner" class="banner-slot"></div>
+
+      <noscript>
+        <div class="banner banner-error" role="alert">
+          <p class="banner-title">JavaScript is required</p>
+          <p class="banner-message">
+            This page reads <code>/api/v1/health</code>, <code>/api/v1/gate</code> and
+            <code>/api/v1/staking/summary</code> in your browser and builds its transactions from
+            <code>/api/v1/staking/tx</code>. Those endpoints stay readable without JavaScript.
+          </p>
+        </div>
+      </noscript>
+
+      <section class="panel" id="wallet-panel" aria-labelledby="wallet-title">
+        <div class="panel-head">
+          <h2 class="panel-title" id="wallet-title">Your wallet</h2>
+          <p class="panel-subtitle">EIP-1193 (<code>window.ethereum</code>) &middot; no key and no seed phrase ever leaves your wallet</p>
+        </div>
+        <div class="panel-body">
+          <div id="wallet-body"></div>
+          <p class="note" id="wallet-panel-status" role="status" aria-live="polite"></p>
+        </div>
+      </section>
+
+      <section class="panel" id="pool-panel" aria-labelledby="pool-title">
+        <div class="panel-head">
+          <h2 class="panel-title" id="pool-title">The pool and your position</h2>
+          <p class="panel-subtitle">GET /api/v1/staking/summary?wallet=0x&hellip;</p>
+        </div>
+        <div class="panel-body">
+          <div id="pool-body" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section class="panel" id="actions-panel" aria-labelledby="actions-title">
+        <div class="panel-head">
+          <h2 class="panel-title" id="actions-title">Actions</h2>
+          <p class="panel-subtitle">
+            each request goes to /api/v1/staking/tx, and only the transaction it returns is sent &mdash; from your
+            wallet, after your confirmation
+          </p>
+        </div>
+        <div class="panel-body">
+          <form class="action-block" id="stake-form">
+            <h3 class="action-title">Approve, then stake</h3>
+            <label class="field" for="stake-amount">
+              <span class="field-label">amount to stake (LLMPOKER)</span>
+              <input
+                class="input"
+                id="stake-amount"
+                name="stake-amount"
+                type="text"
+                inputmode="decimal"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="0.0"
+                aria-describedby="stake-amount-hint"
+              />
+            </label>
+            <p class="note" id="stake-amount-hint">
+              The ERC-20 allowance must cover the amount before <code>stake</code> can succeed, so approve first (or
+              approve again after changing the amount).
+            </p>
+            <p class="action-row">
+              <button class="button" id="approve-button" type="button" disabled>Approve LLMPOKER</button>
+              <button class="button button-primary" id="stake-button" type="button" disabled>Stake</button>
+            </p>
+          </form>
+
+          <form class="action-block" id="unstake-form">
+            <h3 class="action-title">Request an unstake, then cancel or claim</h3>
+            <label class="field" for="unstake-amount">
+              <span class="field-label">amount to unstake (LLMPOKER)</span>
+              <input
+                class="input"
+                id="unstake-amount"
+                name="unstake-amount"
+                type="text"
+                inputmode="decimal"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="0.0"
+                aria-describedby="unstake-amount-hint"
+              />
+            </label>
+            <p class="note" id="unstake-amount-hint">
+              Requesting an unstake starts the pool&rsquo;s cooldown; the tokens become claimable when it expires, and
+              a pending request can be cancelled before then.
+            </p>
+            <p class="action-row">
+              <button class="button" id="unstake-button" type="button" disabled>Request unstake</button>
+              <button class="button" id="cancel-button" type="button" disabled>Cancel unstake</button>
+              <button class="button" id="claim-button" type="button" disabled>Claim rewards</button>
+            </p>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel" id="tx-panel" aria-labelledby="tx-title">
+        <div class="panel-head">
+          <h2 class="panel-title" id="tx-title">Transaction status</h2>
+          <p class="panel-subtitle">pending, confirmed or failed &mdash; nothing is hidden and nothing is retried silently</p>
+        </div>
+        <div class="panel-body">
+          <p class="status-line" id="tx-status" role="status" aria-live="polite" data-state="idle">
+            Idle &mdash; no transaction has been requested in this session.
+          </p>
+          <ul class="tx-log" id="tx-log"></ul>
+        </div>
+      </section>
+    </main>
+
+    <footer id="site-footer" class="site-footer"></footer>
+
+    <script type="module" src="/assets/pages/stake.js"></script>
+  </body>
+</html>

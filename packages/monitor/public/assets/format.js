@@ -131,6 +131,96 @@ export function formatSignedTokens(value, options = {}) {
 }
 
 /**
+ * Parses a **user-entered token amount** (what a human types in a form, e.g.
+ * `"1500.25"`) into chip base units, exactly.
+ *
+ * Returns `null` — never a rounded value — when the text is not a plain
+ * non-negative decimal, when it has more fraction digits than the token has
+ * decimals, or when it is absurdly long. Refusing beats silently sending a
+ * different amount than the user typed.
+ *
+ * @param {string} text
+ * @param {number} [decimals]
+ * @returns {bigint|null}
+ */
+export function parseTokenInput(text, decimals = CHIP_DECIMALS) {
+  if (typeof text !== 'string') return null;
+  if (typeof decimals !== 'number' || !Number.isInteger(decimals) || decimals < 0 || decimals > 36) return null;
+  const trimmed = text.replace(/[,\s_]/g, '');
+  if (trimmed === '' || trimmed.length > 80) return null;
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
+  const dot = trimmed.indexOf('.');
+  const whole = dot === -1 ? trimmed : trimmed.slice(0, dot);
+  const frac = dot === -1 ? '' : trimmed.slice(dot + 1);
+  if (frac.length > decimals) return null;
+  const padded = frac.padEnd(decimals, '0');
+  const base = 10n ** BigInt(decimals);
+  try {
+    return BigInt(whole) * base + BigInt(padded === '' ? '0' : padded);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Chip base units for one of the API's **minimum/threshold** fields.
+ *
+ * Ambiguity, stated honestly: `llm.txt` says every chip amount is an 18-decimal
+ * base-unit string, but the published `/api/v1/health` example shows
+ * `freeGameMinTokens: "50000"`, which reads as *whole tokens*. Instead of ever
+ * `Number()`-rounding a balance, the reading is chosen by digit count: a value
+ * with at least `decimals` digits is base units, a shorter bare integer is whole
+ * tokens. Callers should always show the raw server string in a `title`, so a
+ * visitor can see exactly what the API published.
+ *
+ * @param {unknown} value
+ * @param {number} [decimals]
+ * @returns {bigint|null} `null` when the value is not parseable at all
+ */
+export function minimumToChips(value, decimals = CHIP_DECIMALS) {
+  const normalized = typeof value === 'string' ? value.replace(/[,\s_]/g, '') : value;
+  const parsed = parseChips(normalized);
+  if (parsed === null) return null;
+  if (typeof decimals !== 'number' || !Number.isInteger(decimals) || decimals < 0 || decimals > 36) return null;
+  if (parsed < 0n) return parsed;
+  if (/^\d+$/.test(String(normalized)) && String(normalized).length < decimals) {
+    return parsed * 10n ** BigInt(decimals);
+  }
+  return parsed;
+}
+
+/**
+ * Renders a minimum/threshold field with {@link minimumToChips} + {@link formatTokens}.
+ *
+ * @param {unknown} value
+ * @param {number} [decimals]
+ * @returns {string} e.g. `"50,000"`, or an em dash when the value is unusable
+ */
+export function formatMinimumTokens(value, decimals = CHIP_DECIMALS) {
+  const chips = minimumToChips(value, decimals);
+  if (chips === null) return EM_DASH;
+  return formatTokens(chips, { decimals, maxFractionDigits: 0 });
+}
+
+/**
+ * Reads a Unix timestamp and normalises it to **milliseconds**.
+ *
+ * Documented guess: project convention (`llm.txt`) is milliseconds, but an
+ * on-chain `unlockAt` is usually seconds. A value below `1e12` (i.e. before the
+ * year 33658 in ms, but a plausible seconds timestamp) is therefore read as
+ * seconds. Returns `null` for anything unusable, so a countdown renders as an
+ * em dash instead of 1970.
+ *
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+export function toTimestampMs(value) {
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed < 1e12 ? parsed * 1000 : parsed;
+}
+
+/**
  * Win rate as a percentage string.
  *
  * Shape guess (documented): the wire type is a bare `number` with no unit, so a

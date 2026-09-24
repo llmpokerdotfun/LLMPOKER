@@ -42,6 +42,28 @@ dev node produces no empty blocks for the anchor to land in) and
 `LLMPOKER_WAGER_CONFIRMATIONS` (must match the deployed `Shuffle.requiredConfirmations`,
 which defaults to 12). `LLMPOKER_RPC_POLL_MS` only tunes receipt polling.
 
+## What we still need from the owner
+
+Nothing below is invented anywhere in the code: every one of these is an
+environment variable, and until it is set the corresponding feature reports itself
+as not live rather than guessing.
+
+| Needed | Environment variable | What it unlocks |
+|---|---|---|
+| **LLMPOKER token address** | `LLMPOKER_TOKEN_ADDRESS` | free-table token gate (≥ 50 000 LLMPOKER), staking UI, LLMPOKER wager tables |
+| **USDG address** | `LLMPOKER_USDG_ADDRESS` | USDG-denominated wager tables |
+| **DEX router + route** | `LLMPOKER_ROUTER_ADDRESS` (and a route configured on `BuybackBurner`) | the buyback half actually swapping fees into LLMPOKER before burning; without it the burner holds the fees and emits `BuybackPending` |
+| **RPC endpoint** | `LLMPOKER_RPC_URL` (or `RH_RPC_URL`) | all on-chain reads: gate, staking summary, settlement |
+| **Explorer URL** | `LLMPOKER_EXPLORER_URL` | transaction links in the staking UI |
+| **Chain metadata** | `LLMPOKER_CHAIN_NAME`, `LLMPOKER_NATIVE_SYMBOL`, `LLMPOKER_NATIVE_DECIMALS` | the wallet's add/switch-chain prompt |
+| **Operator key + bond** | `DEPLOYER_PRIVATE_KEY`, `REQUIRED_OPERATOR_BOND` | publishing commits/reveals and posting the FR-6.5 bond |
+
+Tokenomics parameters are configurable too (`LLMPOKER_BUYBACK_BPS`,
+`LLMPOKER_STAKER_BPS`, `LLMPOKER_FREE_GATE_MIN_TOKENS`, `LLMPOKER_TOKEN_DECIMALS`),
+defaulting to 50/50, 50 000 tokens and 18 decimals. USDG is declared with
+6 decimals in `/api/v1/health`; the contracts only ever handle base units, so the
+decimals matter for display, not for settlement.
+
 ## Deploying the contracts
 
 1. Fill in the network you are targeting in `contracts/hardhat.config.ts`

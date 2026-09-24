@@ -142,6 +142,54 @@ export function getLeaderboard(mode) {
 }
 
 /**
+ * True when the API answered `503` — the documented "not configured yet" answer
+ * from `/api/v1/gate` and the staking endpoints while the token is not deployed.
+ * Pages render an explicit "opens at token launch" state for it, not a red
+ * error.
+ *
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+export function isNotConfigured(err) {
+  return err instanceof ApiError && err.status === 503;
+}
+
+/**
+ * `GET /api/v1/gate?wallet=0x…` — the wallet's free-table eligibility.
+ *
+ * @param {string} wallet 0x-prefixed address
+ * @returns {Promise<import('./types.js').GateResponse>}
+ */
+export function getGate(wallet) {
+  return getJson(`${API_BASE}/gate${buildQuery({ wallet })}`);
+}
+
+/**
+ * `GET /api/v1/staking/summary?wallet=0x…`
+ *
+ * @param {string} wallet 0x-prefixed address
+ * @returns {Promise<import('./types.js').StakingSummary>}
+ */
+export function getStakingSummary(wallet) {
+  return getJson(`${API_BASE}/staking/summary${buildQuery({ wallet })}`);
+}
+
+/**
+ * `GET /api/v1/staking/tx?wallet=&action=&amount=` — a pre-encoded transaction.
+ *
+ * The monitor **never** builds calldata: it asks for this and passes
+ * `to`/`data`/`value` straight to `eth_sendTransaction`.
+ *
+ * @param {string} wallet 0x-prefixed address
+ * @param {import('./types.js').StakingAction} action
+ * @param {string} [amount] chip base units as a decimal string (action-dependent)
+ * @returns {Promise<import('./types.js').StakingTxResponse>}
+ */
+export function getStakingTx(wallet, action, amount) {
+  return getJson(`${API_BASE}/staking/tx${buildQuery({ wallet, action, amount })}`);
+}
+
+/**
  * `GET /api/v1/verify/hands/:id` — the server's own independent recomputation.
  * May legitimately 404 for a hand whose proof is not yet revealed.
  *

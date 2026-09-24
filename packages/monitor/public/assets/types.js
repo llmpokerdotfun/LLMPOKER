@@ -393,6 +393,123 @@
  * @property {string} [message]
  */
 
+// ---------------------------------------------------------------------------
+// Chain, contracts, tokenomics and the wallet-facing endpoints (landing + /stake)
+// ---------------------------------------------------------------------------
+
+/**
+ * The settlement chain, as reported by `GET /api/v1/health`.
+ *
+ * `rpcUrl` and `explorerUrl` are `null` until a public endpoint is published:
+ * a wallet that does not know this chain can then not be switched to it
+ * automatically, and there is no explorer link to render. The UI says so
+ * instead of inventing a URL.
+ *
+ * @typedef {Object} ChainMetadata
+ * @property {number} chainId
+ * @property {string} name
+ * @property {string|null} rpcUrl
+ * @property {string|null} explorerUrl
+ * @property {{name: string, symbol: string, decimals: number}} nativeCurrency
+ */
+
+/**
+ * Contract addresses from `GET /api/v1/health`.
+ *
+ * **Every field may be `null`, and that is the expected state today**: the
+ * token is not deployed yet. `null` means "not live yet" and must never be
+ * replaced by a placeholder address in the UI.
+ *
+ * @typedef {Object} ContractAddresses
+ * @property {string|null} token
+ * @property {string|null} usdg
+ * @property {string|null} poker
+ * @property {string|null} shuffle
+ * @property {string|null} staking
+ * @property {string|null} vault
+ * @property {string|null} rakeSplitter
+ * @property {string|null} buybackBurner
+ * @property {string|null} router
+ */
+
+/**
+ * @typedef {Object} Tokenomics
+ * @property {string} tokenSymbol
+ * @property {number} tokenDecimals
+ * @property {number} buybackBps share of the house edge buying back and burning the token, in basis points
+ * @property {number} stakerBps share airdropped to stakers, in basis points
+ * @property {ChipsJson} freeGameMinTokens minimum holding for a free-table seat
+ * @property {{symbol: string, address?: string|null, decimals?: number}[]} [wagerCurrencies]
+ *   currencies a wager table may settle in (`LLMPOKER`, `USDG`, …)
+ */
+
+/**
+ * @typedef {Object} FreeGate
+ * @property {boolean} enabled
+ * @property {ChipsJson} minTokens
+ * @property {string|null} token
+ */
+
+/**
+ * `GET /api/v1/gate?wallet=0x…` — the visitor's own free-table eligibility.
+ *
+ * @typedef {Object} GateResponse
+ * @property {boolean} enabled the gate is active (false until the token is live)
+ * @property {boolean|null} eligible may this wallet sit at a free table; `null`
+ *   when the gate is not active — the honest answer is "not determined", never
+ *   "not eligible"
+ * @property {ChipsJson} balance the wallet's LLMPOKER balance
+ * @property {ChipsJson} required the threshold, base units
+ * @property {ChipsJson} requiredTokens the same threshold, whole tokens
+ * @property {string} symbol
+ * @property {number} decimals
+ * @property {string|null} token
+ */
+
+/**
+ * @typedef {Object} StakingCooldown
+ * @property {ChipsJson} amount
+ * @property {number} unlockAt when the cooldown expires
+ * @property {boolean} [claimable] the server's own verdict; preferred over a
+ *   local clock comparison when present
+ */
+
+/**
+ * `GET /api/v1/staking/summary?wallet=0x…`
+ *
+ * @typedef {Object} StakingSummary
+ * @property {string} wallet
+ * @property {string|null} token
+ * @property {string} symbol
+ * @property {number} decimals
+ * @property {ChipsJson} staked
+ * @property {ChipsJson} pendingRewards
+ * @property {string|null} rewardToken
+ * @property {string} rewardSymbol
+ * @property {StakingCooldown|null} cooldown
+ * @property {ChipsJson} totalStaked the whole pool
+ * @property {number} cooldownSeconds
+ * @property {ChipsJson} minStake
+ */
+
+/** @typedef {'approve'|'stake'|'unstake'|'cancel'|'claim'} StakingAction */
+
+/**
+ * `GET /api/v1/staking/tx?wallet=&action=&amount=` — a transaction the server
+ * has already encoded.
+ *
+ * The monitor never builds calldata itself: it hands `to`/`data`/`value` to
+ * `eth_sendTransaction` unchanged, so a UI bug can never redirect a stake.
+ *
+ * @typedef {Object} StakingTxResponse
+ * @property {string} to
+ * @property {string} data
+ * @property {number} chainId
+ * @property {ChipsJson} value
+ * @property {StakingAction} action
+ * @property {string} summary human-readable description of what the transaction does
+ */
+
 /**
  * @typedef {Object} HealthResponse
  * @property {boolean} ok
@@ -403,6 +520,10 @@
  * @property {number} wagerTables
  * @property {number} agents
  * @property {number} hands
+ * @property {ChainMetadata|null} [chain] absent on an older server — treat as unknown
+ * @property {ContractAddresses|null} [contracts] every address may be `null` (not deployed yet)
+ * @property {Tokenomics|null} [tokenomics]
+ * @property {FreeGate|null} [freeGate]
  */
 
 /**

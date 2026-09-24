@@ -29,6 +29,15 @@ import { IRakeSplitter } from "./interfaces/IRakeSplitter.sol";
  *      on-chain* — that contributions sum to the pot, that awards sum to pot minus the
  *      contract-computed rake, that the seats exist, and that the hand was opened against a
  *      revealed shuffle for which every participant actually moved chips.
+ *
+ *      **Per-table settlement currency.** A wager table settles in the ERC-20 it was created
+ *      with (`createTable(..., IERC20 settlementToken)`): USDG for stable-currency tables and
+ *      LLMPOKER for token tables. There is no global settlement token, so `deposit`, `cashOut`,
+ *      `settleHand` (including the rake transfer) and `voidHand` all use the table's own token,
+ *      and two tables with different tokens can never mix funds. `USDG` has **6 decimals** and
+ *      `LLMPOKER` has **18**; this contract deals exclusively in base units and never scales or
+ *      converts, so it does not care which is which — only the off-chain engine and the deploy
+ *      script are responsible for choosing per-denomination blind and buy-in amounts.
  */
 contract Poker is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -72,6 +81,8 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
 
     struct Table {
         TableConfig config;
+        /// @dev Settlement currency of this table, fixed at creation (FR-5.1).
+        IERC20 settlementToken;
         uint256 seatCount;
         uint256 pendingHands;
         bool exists;
@@ -85,9 +96,6 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         uint8[6] participants;
     }
 
-    /// @notice Stake token escrowed by this contract (FR-5.1).
-    IERC20 public immutable token;
-
     /// @notice Verifiable-RNG contract that gates every hand (FR-6).
     IShuffle public immutable shuffle;
 
@@ -99,6 +107,15 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
 
     /// @dev `tableId => table`.
     mapping(bytes32 => Table) private _tables;
+
+    /// @dev `settlement token => was ever used by a table`. Gates the per-token escrow view.
+    mapping(address => bool) private _settlementTokenSeen;
+
+    /// @notice Running total of escrow this contract owes per settlement token (FR-5.1, NFR-4).
+    /// @dev Updated at every mutation of `escrowOf`, so it is exactly `sum(escrowOf[key])` over
+    ///      every table settling in that token, and it equals the contract's balance of that
+    ///      token because the rake leaves the contract in the same transaction it is taken.
+    mapping(address => uint256) public escrowTotalOf;
 
     /// @dev `keccak256(tableId, seat) => player address`.
     mapping(bytes32 => address) public seatOwner;
@@ -116,7 +133,7 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     mapping(bytes32 => mapping(bytes32 => mapping(uint8 => uint256))) public contributionOf;
 
     /// @notice Emitted when a wager table is created (FR-5.1).
-    event TableCreated(bytes32 indexed tableId, TableConfig config, address operator);
+    event TableCreated(bytes32 indexed tableId, address indexed settlementToken, TableConfig config, address operator);
     /// @notice Emitted when the operator is rotated (FR-10.3).
     event OperatorUpdated(address indexed previous, address indexed current);
     /// @notice Emitted on every escrow deposit (FR-5.1).
@@ -186,24 +203,27 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     error AwardsMismatch(uint256 expected, uint256 actual);
     /// @notice A zero-address argument was supplied.
     error ZeroAddress();
+    /// @notice A zero settlement token was supplied for a table (FR-5.1).
+    error InvalidSettlementToken();
+    /// @notice No table settles in this token, so a per-token aggregate is meaningless.
+    error UnsupportedToken(address token);
 
     /**
-     * @param token_ Stake token (the platform ERC-20).
      * @param shuffle_ Verifiable-RNG contract (FR-6).
-     * @param rakeSplitter_ Rake recipient (FR-8.2).
+     * @param rakeSplitter_ Rake recipient (FR-8.2). It receives the rake in each table's own
+     *        settlement token, so it must accept more than one currency.
      * @param initialOwner Owner: table creation authority, pause authority, operator rotation.
      * @param initialOperator Off-chain engine address (FR-10.3).
      */
-    constructor(IERC20 token_, IShuffle shuffle_, IRakeSplitter rakeSplitter_, address initialOwner, address initialOperator)
+    constructor(IShuffle shuffle_, IRakeSplitter rakeSplitter_, address initialOwner, address initialOperator)
         Ownable(initialOwner)
     {
         if (
-            address(token_) == address(0) || address(shuffle_) == address(0) || address(rakeSplitter_) == address(0)
-                || initialOwner == address(0) || initialOperator == address(0)
+            address(shuffle_) == address(0) || address(rakeSplitter_) == address(0) || initialOwner == address(0)
+                || initialOperator == address(0)
         ) {
             revert ZeroAddress();
         }
-        token = IERC20(token_);
         shuffle = IShuffle(shuffle_);
         rakeSplitter = IRakeSplitter(rakeSplitter_);
         operator = initialOperator;
@@ -214,22 +234,30 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     /**
-     * @notice Create a wager table.
+     * @notice Create a wager table that settles in `settlementToken`.
      * @dev FR-5.1, FR-8.1, FR-10.3. Only the owner may create wager tables, and the same
      *      address can never deposit at one (see `deposit`), which is what makes "the
      *      operator cannot seat at its own tables" enforceable on-chain.
+     *
+     *      The settlement currency is per table and fixed at creation: USDG (6 decimals) or
+     *      LLMPOKER (18 decimals). The token is validated as non-zero; nothing else about it is
+     *      assumed, and no token address is hard-coded anywhere.
      * @param tableId Off-chain-stable table identifier.
      * @param config Blinds, buy-in bounds, rake schedule and seat count.
+     * @param settlementToken ERC-20 this table escrows, settles and rakes in.
      */
-    function createTable(bytes32 tableId, TableConfig calldata config) external onlyOwner {
+    function createTable(bytes32 tableId, TableConfig calldata config, IERC20 settlementToken) external onlyOwner {
         if (tableId == bytes32(0)) revert ZeroAddress();
+        if (address(settlementToken) == address(0)) revert InvalidSettlementToken();
         if (_tables[tableId].exists) revert TableExists(tableId);
         _validateTableConfig(config);
 
         _tables[tableId].config = config;
+        _tables[tableId].settlementToken = settlementToken;
         _tables[tableId].exists = true;
+        _settlementTokenSeen[address(settlementToken)] = true;
 
-        emit TableCreated(tableId, config, operator);
+        emit TableCreated(tableId, address(settlementToken), config, operator);
     }
 
     /**
@@ -248,14 +276,16 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     /**
-     * @notice Take `seat` at `tableId` with `amount` token, held in escrow by this contract.
+     * @notice Take `seat` at `tableId` with `amount` of the table's settlement token.
      * @dev FR-5.1, FR-5.3, FR-10.3. Top-ups are allowed and the *resulting* balance must stay
      *      within `[minBuyIn, maxBuyIn]`, so the buy-in range is enforced across deposits.
      *      Deliberately blocked while paused: money must not enter escrow while settlement is
-     *      halted (FR-10.5 halts wager flow, and `cashOut` stays open regardless).
+     *      halted (FR-10.5 halts wager flow, and `cashOut` stays open regardless). The token
+     *      pulled is the table's own currency, so a USDG table can never be funded with
+     *      LLMPOKER (or vice versa).
      * @param tableId Table identifier.
      * @param seat Seat index, `0..maxSeats-1`.
-     * @param amount Token amount to deposit.
+     * @param amount Amount of the table's settlement token, in base units.
      */
     function deposit(bytes32 tableId, uint8 seat, uint256 amount) external nonReentrant whenNotPaused {
         Table storage table = _tables[tableId];
@@ -274,12 +304,13 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
             revert SeatOccupied(seat, occupant);
         }
 
-        token.safeTransferFrom(msg.sender, address(this), amount);
+        table.settlementToken.safeTransferFrom(msg.sender, address(this), amount);
         uint256 balance = escrowOf[key] + amount;
         if (balance < table.config.minBuyIn || balance > table.config.maxBuyIn) {
             revert BuyInOutOfRange(balance, table.config.minBuyIn, table.config.maxBuyIn);
         }
         escrowOf[key] = balance;
+        escrowTotalOf[address(table.settlementToken)] += amount;
 
         emit Deposited(tableId, seat, msg.sender, amount, balance);
     }
@@ -288,7 +319,7 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
      * @notice Withdraw the escrowed balance for a seat and give the seat up.
      * @dev FR-5.5, FR-10.5. **Never gated by `whenNotPaused`**: pausing halts wager settlement
      *      and must never trap already-settled escrow. Reverts only while a hand this seat has
-     *      contributed to is still open.
+     *      contributed to is still open. Paid in the table's own settlement token.
      * @param tableId Table identifier.
      * @param seat Seat index owned by the caller.
      */
@@ -314,8 +345,9 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         if (table.seatCount != 0) {
             table.seatCount -= 1;
         }
+        escrowTotalOf[address(table.settlementToken)] -= amount;
 
-        token.safeTransfer(msg.sender, amount);
+        table.settlementToken.safeTransfer(msg.sender, amount);
 
         emit CashedOut(tableId, seat, msg.sender, amount);
         emit SeatReleased(tableId, seat, msg.sender);
@@ -396,6 +428,7 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         uint256 balance = escrowOf[key];
         if (amount > balance) revert ContributionExceedsEscrow(seat, amount, balance);
         escrowOf[key] = balance - amount;
+        escrowTotalOf[address(table.settlementToken)] -= amount;
 
         hand.pot += amount;
         contributionOf[tableId][handId][seat] += amount;
@@ -414,7 +447,8 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
      *      membership, per-seat contribution bounds against escrow, `sum(contributions) == pot`,
      *      `sum(awards) == pot - rake`, and the rake itself. Not verified (and not verifiable)
      *      on-chain: who won the pot, and the hole-card/board mapping — the latter is
-     *      recomputable from `Shuffle.sol` (FR-6.3).
+     *      recomputable from `Shuffle.sol` (FR-6.3). The pot, the awards and the rake are all in
+     *      the table's settlement token, in base units.
      * @param tableId Table identifier.
      * @param handId Open hand.
      * @param contributions Seat-by-seat chips moved into the pot.
@@ -470,12 +504,17 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         // (4) Credit the winners. The contributors' chips were already moved out of escrow by
         // `commitHand`, so `creditSum == pot - rake <= balance` holds by construction and no
         // award can ever be paid out of another seat's escrow.
-        _applySettlement(tableId, winners, awards, table.config.maxSeats);
+        _applySettlement(tableId, winners, awards, table.config.maxSeats, table.settlementToken);
 
-        // (5) Rake leaves escrow atomically into the splitter (FR-8.2).
+        // (5) Rake leaves the contract for the splitter (FR-8.2), in the table's own settlement
+        // token, so a USDG table's rake arrives at `RakeSplitter` as USDG and a LLMPOKER table's
+        // rake arrives as LLMPOKER. It was never part of `escrowTotalOf`: the chips were debited
+        // from escrow by `commitHand`, and only `pot - rake` is credited back to the winners, so
+        // `escrowTotalOf(token)` and the contract's balance both fall by exactly `rake` here.
         if (rake != 0) {
-            token.safeTransfer(address(rakeSplitter), rake);
-            rakeSplitter.receiveRake(rake);
+            IERC20 settlementToken = table.settlementToken;
+            settlementToken.safeTransfer(address(rakeSplitter), rake);
+            rakeSplitter.receiveRake(settlementToken, rake);
         }
 
         emit HandSettled(tableId, handId, pot, rake, sawFlop ? 1 : 0, winners, awards);
@@ -512,6 +551,7 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
             contributionOf[tableId][handId][seat] = 0;
             restored += amount;
         }
+        escrowTotalOf[address(table.settlementToken)] += restored;
         hand.status = HandStatus.Voided;
         table.pendingHands -= 1;
 
@@ -597,13 +637,44 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @notice Total escrow this contract owes across every table and seat.
-     * @dev NFR-4: `token.balanceOf(this) == totalEscrow + rake in flight` is checkable by any
-     *      verifier, which is the strongest statement the contract can make about solvency when
-     *      escrow is stored per seat rather than per contract balance.
+     * @notice Total escrow this contract owes in `settlementToken`.
+     * @dev NFR-4: maintained as a running per-token total, so the view is O(1) and never iterates
+     *      user data (NFR-3). The invariant it reports is
+     *      `escrowTotalOf(token) == settlementToken.balanceOf(this)`, because the rake leaves the
+     *      contract in the same transaction it is taken (FR-8.2) — so any verifier can check
+     *      solvency per currency in two calls.
+     *
+     *      It is **per token** on purpose: a single cross-token aggregate would be meaningless,
+     *      since USDG (6 decimals) and LLMPOKER (18 decimals) base units are not commensurable.
+     *      Reverts for a token no table settles in, so "no escrow" cannot be mistaken for
+     *      "unsupported currency".
+     * @param settlementToken Token to total.
      */
-    function totalEscrowObserved() external view returns (uint256) {
-        return token.balanceOf(address(this));
+    function totalEscrowObserved(IERC20 settlementToken) external view returns (uint256) {
+        if (!_settlementTokenSeen[address(settlementToken)]) revert UnsupportedToken(address(settlementToken));
+        return escrowTotalOf[address(settlementToken)];
+    }
+
+    /**
+     * @notice Escrow owed in `settlementToken` at one table (FR-5.1).
+     * @dev Reads the same running per-token total guarded by the table's currency, so it is O(1)
+     *      and the view a per-table monitor should use.
+     * @param tableId Table identifier.
+     * @param settlementToken Token to check against the table's currency.
+     */
+    function tableEscrowOf(bytes32 tableId, IERC20 settlementToken) external view returns (uint256) {
+        Table storage table = _tables[tableId];
+        if (!table.exists) revert UnknownTable(tableId);
+        if (address(table.settlementToken) != address(settlementToken)) {
+            revert UnsupportedToken(address(settlementToken));
+        }
+        return escrowTotalOf[address(settlementToken)];
+    }
+
+    /// @notice The settlement currency of a table, fixed at creation (FR-5.1).
+    function settlementTokenOf(bytes32 tableId) external view returns (IERC20) {
+        if (!_tables[tableId].exists) revert UnknownTable(tableId);
+        return _tables[tableId].settlementToken;
     }
 
     // ---------------------------------------------------------------------
@@ -644,19 +715,24 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     /**
      * @dev FR-5.2: credit the winners. The losers' chips were already debited from escrow in
      *      `commitHand`, so this loop only ever creates credits that are fully collateralised by
-     *      the chips this contract is holding.
+     *      the chips this contract is holding. `escrowTotalOf` moves with `escrowOf` so the
+     *      per-token running total stays exact (NFR-4).
      */
     function _applySettlement(
         bytes32 tableId,
         uint8[] calldata winners,
         uint256[] calldata awards,
-        uint8 maxSeats
+        uint8 maxSeats,
+        IERC20 settlementToken
     ) private {
+        uint256 credited = 0;
         for (uint256 i = 0; i < winners.length; ++i) {
             uint8 seat = winners[i];
             if (seat >= maxSeats) revert InvalidSeat(seat, maxSeats);
             escrowOf[_seatKey(tableId, seat)] += awards[i];
+            credited += awards[i];
         }
+        escrowTotalOf[address(settlementToken)] += credited;
     }
 
     function _seatKey(bytes32 tableId, uint8 seat) private pure returns (bytes32) {

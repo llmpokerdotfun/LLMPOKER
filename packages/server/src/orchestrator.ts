@@ -110,6 +110,12 @@ export interface OrchestratorOptions {
   store: Store;
   anchor: AnchorProvider;
   settlement: SettlementAdapter;
+  /**
+   * Optional gate for free tables: an agent must pass this before it may sit
+   * down (the LLMPOKER holding requirement). Throws to refuse. Injected so the
+   * orchestrator stays chain-agnostic and testable without a node.
+   */
+  freeTableAccess?: (wallet: string) => Promise<void>;
   /** Injected clock so tests control time. */
   now?: () => number;
   log?: (level: 'info' | 'warn' | 'error' | 'debug', message: string, extra?: unknown) => void;
@@ -123,6 +129,7 @@ export class Orchestrator extends EventEmitter {
   readonly tables = new Map<string, ManagedTable>();
   private readonly now: () => number;
   private readonly log: NonNullable<OrchestratorOptions['log']>;
+  private readonly freeTableAccess: ((wallet: string) => Promise<void>) | undefined;
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
 
@@ -134,6 +141,7 @@ export class Orchestrator extends EventEmitter {
     this.settlement = options.settlement;
     this.now = options.now ?? (() => Date.now());
     this.log = options.log ?? (() => {});
+    this.freeTableAccess = options.freeTableAccess;
   }
 
   // -- lifecycle ------------------------------------------------------------
@@ -149,8 +157,19 @@ export class Orchestrator extends EventEmitter {
     if (wagerEnabled(this.config)) {
       for (let i = 0; i < this.config.wagerTables; i++) {
         const tableId = `wager-${this.config.wagerTableTier}-${i + 1}`;
-        const config = defaultWagerTableConfig(tableId, `Wager Table ${i + 1}`, this.config.wagerTableTier);
+        const config = defaultWagerTableConfig(tableId, `Wager Table ${i + 1}`, this.config.wagerTableTier, 'TOKEN');
         this.addTable(config);
+      }
+      // USDG-denominated tables: the currency is fixed per table on-chain, so a
+      // USDG table needs the address before it can exist at all.
+      if (this.config.usdgWagerTables > 0 && this.config.contracts.usdg) {
+        for (let i = 0; i < this.config.usdgWagerTables; i++) {
+          const tableId = `wager-usdg-${i + 1}`;
+          const config = defaultWagerTableConfig(tableId, `USDG Wager Table ${i + 1}`, this.config.wagerTableTier, 'USDG');
+          this.addTable(config);
+        }
+      } else if (this.config.usdgWagerTables > 0) {
+        this.log('warn', 'USDG wager tables skipped: set LLMPOKER_USDG_ADDRESS to enable them');
       }
     } else {
       this.log('warn', 'wager tables disabled: no settlement path configured');
@@ -662,6 +681,13 @@ export class Orchestrator extends EventEmitter {
     }
 
     const buyIn = options.buyIn ?? config.minBuyIn;
+
+    // Free tables are token-gated: an agent must hold the required LLMPOKER
+    // balance. The hook throws with a machine code when it refuses, and fails
+    // closed if the balance cannot be read off-chain.
+    if (config.mode === 'FREE' && this.freeTableAccess) {
+      await this.freeTableAccess(agent.wallet);
+    }
 
     // FR-10.3: the operator account must never take a seat at its own wager table.
     if (config.mode === 'WAGER' && this.config.operatorAddress) {

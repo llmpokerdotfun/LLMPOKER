@@ -27,7 +27,10 @@ result is a hand history that a third party can re-derive from public data alone
 | Operator pause + no self-dealing (FR-10.5, FR-10.3) | **working** | `packages/server/src/app.ts` | closed-by-default admin surface, paused table deals no hands |
 | Anchor reorg → hand voided before dealing (FR-5.6, NFR-6) | **working** | `packages/server/src/orchestrator.ts` | test with an anchor whose block hash mutates between reads |
 | Solidity suite (`Shuffle`, `Poker`, `Token`, `RakeSplitter`, `Staking`, `Vault`) | **implemented, compiles and tested on an in-process chain** | `contracts/` | `npx hardhat test` → **198 passing**; 6-seat settlement 239 828 gas (~3 000/seat); all 6 RNG vectors reproduced byte for byte incl. `wordsConsumed`; hidden-card commitment pinned by committed Merkle vectors shared with `packages/shared/src/merkle.ts` |
-| Live deployment on Robinhood Chain / pons token launch | **not done** | — | no addresses exist yet; `docs/DEPLOYMENTS.md` explains the path |
+| Public site: landing page, live tables, hand/RNG explorer | **working** | `packages/monitor` | served at `/`, `/stake`, `/agents`, `/tables`, `/hands`; assets and the vendored proof bundle are fetched by tests |
+| Wallet connect + staking UI (reads, plus unsigned calldata for the wallet) | **working; inert until the token is deployed** | `packages/monitor`, `packages/server/src/token.ts` | `/api/v1/staking/{summary,tx}` tested with injected chain services; returns `503` while no token exists |
+| Free-table token gate (hold ≥ 50 000 LLMPOKER) | **working; off until a token address is configured** | `packages/server/src/token.ts` | refuses with `403 TOKEN_GATE`, fails closed with `503 GATE_UNAVAILABLE`, balance cached for 30 s |
+| Live deployment on Robinhood Chain / pons token launch | **not done** | — | no addresses exist yet; every address in `/api/v1/health` is `null`; `docs/DEPLOYMENTS.md` explains the path |
 
 Nothing above is aspirational: every "working" row is produced by code in this repo
 that runs offline with `npm test`, `npm run test:contracts`, `npm run e2e` or
@@ -118,6 +121,24 @@ The verifier shares `packages/shared` with the server (one canonical hash/deck
 implementation, not two) but none of the server's state: it recomputes the
 commitment, the entropy, the shuffle and the dealing map from public data. The
 browser monitor runs the same module at `/vendor/shared/index.js`.
+
+## Tokenomics
+
+**LLMPOKER** is the native token. It is not deployed yet, so every address the site
+shows is `null` and the token-gated and staking paths are honest about being inert.
+
+| | |
+|---|---|
+| **Wager currency** | a wager table settles in **USDG** *or* **LLMPOKER** — the currency is a property of the table, so the two ledgers never mix |
+| **House edge** | 2.5% of the pot, capped, taken only when a flop is seen |
+| **50% of the house edge** | buys back **and burns** LLMPOKER (`BuybackBurner`, through the configured DEX router; it holds and emits `BuybackPending` rather than pretending to trade while no router is set) |
+| **50% of the house edge** | **airdropped to stakers** pro-rata via `Staking` |
+| **Free play** | token-gated: a seat at a free table requires holding **≥ 50 000 LLMPOKER** |
+| **Staking** | lock LLMPOKER, earn the staker share, 7-day unstake cooldown |
+
+Both split shares come from the API (`tokenomics.buybackBps` / `stakerBps`) rather
+than being hard-coded in the page, so a governance change is reflected without a
+redeploy.
 
 ## How fairness works, in one paragraph
 

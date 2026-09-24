@@ -47,7 +47,7 @@ interface PokerAbi {
   deposit(tableId: string, seat: number, amount: bigint): Promise<Tx>;
   cashOut(tableId: string, seat: number): Promise<Tx>;
   escrowBalanceOf(tableId: string, seat: number): Promise<bigint>;
-  totalEscrowObserved(): Promise<bigint>;
+  totalEscrowObserved(settlementToken: string): Promise<bigint>;
   pendingHandsOf(tableId: string): Promise<bigint>;
 }
 interface ShuffleAbi {
@@ -73,7 +73,7 @@ const POKER_ABI = [
   'function deposit(bytes32 tableId, uint8 seat, uint256 amount)',
   'function cashOut(bytes32 tableId, uint8 seat)',
   'function escrowBalanceOf(bytes32 tableId, uint8 seat) view returns (uint256)',
-  'function totalEscrowObserved() view returns (uint256)',
+  'function totalEscrowObserved(address settlementToken) view returns (uint256)',
   'function pendingHandsOf(bytes32 tableId) view returns (uint256)',
 ];
 const SHUFFLE_ABI = [
@@ -339,7 +339,7 @@ async function main(): Promise<void> {
       log(`  ${label} mined in block ${receipt.blockNumber} (gas ${receipt.gasUsed})`);
     }
 
-    const escrowObserved = await poker.totalEscrowObserved();
+    const escrowObserved = await poker.totalEscrowObserved(addresses.token);
     log(`  escrow observed on-chain after settlement: ${escrowObserved}`);
     if (escrowObserved === 0n) throw new Error('the contract holds no escrow after settlement');
 

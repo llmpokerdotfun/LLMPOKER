@@ -77,6 +77,20 @@ contract Token is ERC20, ERC20Permit, Ownable {
     }
 
     /**
+     * @notice Burn `amount` from the caller's own balance, reducing `totalSupply()`.
+     * @dev FR-9.2: the buyback leg of the rake is burned by `BuybackBurner.sol`, and a real burn
+     *      needs a real supply reduction. Only the holder can burn — there is no allowance path
+     *      and no privileged caller — so this cannot touch anyone else's tokens. The only values
+     *      that change are the caller's balance and `totalSupply()`; no mint is possible, so the
+     *      burn is irreversible. Emits the standard `Transfer(caller, address(0), amount)` via
+     *      `_burn`, which is what makes the burn visible to ordinary ERC-20 indexers.
+     * @param amount Amount to burn, in base units (1 token = 1e18).
+     */
+    function burn(uint256 amount) external {
+        _burn(msg.sender, amount);
+    }
+
+    /**
      * @notice Human-readable description of the deployed minting policy.
      * @dev FR-9.7 transparency: lets a verifier read the policy in one call.
      * @return fixedSupply True when no further minting is possible.
