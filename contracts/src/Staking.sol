@@ -136,6 +136,7 @@ contract Staking is IStaking, AccessControl, ReentrancyGuard {
         if (initialCooldownSeconds == 0 || initialCooldownSeconds > 365 days) {
             revert InvalidCooldown(initialCooldownSeconds);
         }
+        token = IERC20(token_);
         cooldownSeconds = initialCooldownSeconds;
         minStake = initialMinStake;
         _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);

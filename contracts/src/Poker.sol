@@ -201,9 +201,9 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         ) {
             revert ZeroAddress();
         }
-        token = token_;
-        shuffle = shuffle_;
-        rakeSplitter = rakeSplitter_;
+        token = IERC20(token_);
+        shuffle = IShuffle(shuffle_);
+        rakeSplitter = IRakeSplitter(rakeSplitter_);
         operator = initialOperator;
     }
 

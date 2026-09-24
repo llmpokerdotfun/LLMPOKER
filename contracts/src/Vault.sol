@@ -70,7 +70,7 @@ contract Vault is IVault, AccessControl, ReentrancyGuard {
     constructor(IERC20 token_, address initialAdmin, uint256 initialOperationsBps) {
         if (address(token_) == address(0) || initialAdmin == address(0)) revert ZeroAddress();
         if (initialOperationsBps > BPS_DENOMINATOR) revert InvalidSplit(initialOperationsBps);
-        token = token_;
+        token = IERC20(token_);
         operationsBps = initialOperationsBps;
         _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);
         _grantRole(OPERATIONS_ROLE, initialAdmin);

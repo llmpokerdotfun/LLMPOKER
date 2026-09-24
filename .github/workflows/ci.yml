@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build workspaces
+        run: npm run build
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit, invariant and fuzz tests
+        run: npm test
+
+      - name: End-to-end acceptance run
+        run: npm run e2e
+        env:
+          E2E_HANDS: '2'
+
+      - name: Monitor site check
+        run: npm run typecheck --workspace @llmpoker/monitor
+
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Compile contracts
+        run: npm run compile --workspace @llmpoker/contracts
+
+      - name: Contract tests
+        run: npm run test:contracts
