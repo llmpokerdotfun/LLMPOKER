@@ -214,6 +214,8 @@ async function main(): Promise<void> {
     const byId = new Map(agents.map((a) => [a.agentId, a]));
     const deadline = Date.now() + 90_000;
     let guard = 0;
+    /** NFR-1: agent action round-trip (state → action → commit) budget is 150 ms p95. */
+    const actionLatencies: number[] = [];
 
     while (completed.length < HANDS_TO_PLAY && Date.now() < deadline && guard++ < 5_000) {
       let acted = false;
@@ -222,11 +224,13 @@ async function main(): Promise<void> {
         if (!request) continue;
         agent.pending = null;
         const choice = decide(request, request.handId.length + request.seat);
+        const startedAt = performance.now();
         const response = await fetch(`${base}/api/v1/tables/${TABLE_ID}/act`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${agent.apiKey}` },
           body: JSON.stringify(choice),
         });
+        actionLatencies.push(performance.now() - startedAt);
         if (!response.ok) {
           const text = await response.text();
           if (text.includes('NOT_YOUR_TURN') || text.includes('already complete')) continue;
@@ -320,6 +324,11 @@ async function main(): Promise<void> {
       `leaderboard: ${leaderboard.rows
         .map((r) => `${r.name} ${r.handsPlayed}h ${(r.winRate * 100).toFixed(0)}%`)
         .join(', ')}`,
+    );
+    const sorted = [...actionLatencies].sort((a, b) => a - b);
+    const pct = (p: number): number => sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))] ?? 0;
+    log(
+      `action round-trip (NFR-1, target ≤150 ms p95): n=${sorted.length} p50=${pct(50).toFixed(1)} ms p95=${pct(95).toFixed(1)} ms max=${(sorted[sorted.length - 1] ?? 0).toFixed(1)} ms`,
     );
     log('\nACCEPTANCE RUN PASSED');
     void byId;

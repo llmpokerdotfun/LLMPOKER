@@ -26,8 +26,12 @@ verifiable today, with `anchorSource: "LOCAL"` on every proof.
 
    ```bash
    npm run compile --workspace @llmpoker/contracts
-   npm run deploy:rh --workspace @llmpoker/contracts
+   npm run deploy:local --workspace @llmpoker/contracts   # dry run on the in-process chain
+   npm run deploy:rh --workspace @llmpoker/contracts      # Robinhood Chain
    ```
+
+   `deploy:local` prints every address and the role wiring it performed, and is the
+   fastest way to confirm the script works before spending gas.
 
 3. Verify the sources on the chain explorer (NFR-4 requires public, verified
    source).
@@ -40,6 +44,8 @@ verifiable today, with `anchorSource: "LOCAL"` on every proof.
    export LLMPOKER_SETTLEMENT=onchain
    export RH_RPC_URL=https://…
    export DEPLOYER_PRIVATE_KEY=0x…
+   export LLMPOKER_OPERATOR_ADDRESS=0x…       # refused a seat at wager tables (FR-10.3)
+   export LLMPOKER_OPERATOR_TOKEN=…           # enables /api/v1/admin/* (FR-10.5)
    export LLMPOKER_TOKEN_ADDRESS=0x…
    export LLMPOKER_POKER_ADDRESS=0x…
    export LLMPOKER_SHUFFLE_ADDRESS=0x…
@@ -51,6 +57,22 @@ verifiable today, with `anchorSource: "LOCAL"` on every proof.
    With `LLMPOKER_SETTLEMENT=onchain`, `/api/v1/health` reports
    `settlement: "ONCHAIN"` and wager tables become available. Until the adapter is
    wired to a live chain it refuses to start rather than pretending to settle.
+
+## Interface contract between the engine and `Poker.sol`
+
+When the server settles a hand on-chain it must respect the ordering the contract
+enforces (see `contracts/README.md`, "Resolved ambiguities" #8):
+
+* seats are passed to `openHand` in a fixed order, and the contribution array at
+  `commitHand` must be **seat-aligned with that same order** (trailing zeros are
+  tolerated for seats that never acted);
+* `settleHand` verifies on-chain that contributions match what `commitHand`
+  recorded, that `sum(contributions) == pot`, that `sum(awards) == pot - rake`,
+  and that the rake is exactly `computeRake(pot, bps, cap, sawFlop)`;
+* hand **evaluation** stays off-chain by design — the contract verifies every
+  amount it can verify and the deck is recomputable from `Shuffle.sol`, so a
+  dishonest engine could misreport a winner but can never move an unauthorized
+  token. That asymmetry is deliberate and worth restating in any audit.
 
 ## Wager-mode prerequisites
 
