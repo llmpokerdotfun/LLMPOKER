@@ -9,13 +9,13 @@ import { IVault } from "./interfaces/IVault.sol";
 
 /**
  * @title Vault
- * @notice Fee custody and allocation for the platform (SRS Â§6, FR-9.2â€“9.3): every inflow is
+ * @notice Fee custody and allocation for the platform (SRS §6, FR-9.2–9.3): every inflow is
  *         split between the **operations** bucket (gas, engine infra, agent bounties) and the
  *         **trading-rewards** bucket (LP/trader incentives).
  *
- * @dev FR-9.2 explicitly leaves the pons fee infrastructure open (SRS Â§11), so the DEX fee
+ * @dev FR-9.2 explicitly leaves the pons fee infrastructure open (SRS §11), so the DEX fee
  *      route is implemented as an explicit `notifyFees` hook: anything that can move
- *      tokens â€” a pons fee-splitter, a buyback-transfer, or a keeper â€” calls it and the split
+ *      tokens — a pons fee-splitter, a buyback-transfer, or a keeper — calls it and the split
  *      is applied on-chain with an event. Nothing about the hook presumes a specific DEX.
  *
  *      Default split is 50/50 (FR-9.3) and the admin may move `operationsBps` anywhere in

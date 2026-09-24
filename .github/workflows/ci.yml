@@ -25,6 +25,9 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Guard against encoding damage
+        run: npx tsx scripts/fix-encoding.ts --check
+
       - name: Unit, invariant and fuzz tests
         run: npm test
 

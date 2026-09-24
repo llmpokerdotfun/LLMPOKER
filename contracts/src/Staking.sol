@@ -9,7 +9,7 @@ import { IStaking } from "./interfaces/IStaking.sol";
 
 /**
  * @title Staking
- * @notice The house-edge pool (SRS Â§6, FR-9.4â€“9.6): stakers lock the token and earn a pro-rata
+ * @notice The house-edge pool (SRS §6, FR-9.4–9.6): stakers lock the token and earn a pro-rata
  *         share of every rake distribution pushed by `RakeSplitter.sol`.
  *
  * @dev ### Reward accounting (the scheme, and why it is shaped this way)
@@ -33,8 +33,8 @@ import { IStaking } from "./interfaces/IStaking.sol";
  *      * **"Stake right before a distribution" attack.** Every balance-changing entry point
  *        calls `_sync(account)` *first*, so a new stake is registered at the post-distribution
  *        accumulator and earns nothing retroactively. Because shares sit in the pool for the
- *        whole 7-day unstake cooldown (FR-9.5) â€” and are moved out of the accumulator (earning
- *        nothing) for the entire cooldown window â€” the classic flash-stake/exit arbitrage is
+ *        whole 7-day unstake cooldown (FR-9.5) — and are moved out of the accumulator (earning
+ *        nothing) for the entire cooldown window — the classic flash-stake/exit arbitrage is
  *        unprofitable: entering or leaving costs at least one cooldown of exposure for at most
  *        one pro-rata share of the rake paid in that window.
  *      * **No time-based accrual.** Yield arrives only via `notifyRewards`; there is no
@@ -236,7 +236,7 @@ contract Staking is IStaking, AccessControl, ReentrancyGuard {
     /**
      * @notice Notify a rake distribution and accrue it pro-rata to current stakes (FR-9.6).
      * @dev Called by `RakeSplitter.sol` after the tokens are transferred into this contract.
-     *      Restricted to `REWARDS_NOTIFIER_ROLE` so no one can inflate `totalNotified` â€” the
+     *      Restricted to `REWARDS_NOTIFIER_ROLE` so no one can inflate `totalNotified` — the
      *      backing tokens must already be here for the eventual `claim()` to succeed.
      * @param amount Amount of token to distribute.
      */

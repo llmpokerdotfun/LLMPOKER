@@ -8,12 +8,12 @@ import { IShuffle } from "./interfaces/IShuffle.sol";
  * @title Shuffle
  * @notice Verifiable RNG for No-Limit Texas Hold'em: commit-reveal keyed to the block
  *         immediately after the commitment, with a permanently stored anchor hash and a
- *         fully on-chain Fisherâ€“Yates shuffle (SRS Â§6, FR-6.1â€“6.6, NFR-6).
+ *         fully on-chain Fisher–Yates shuffle (SRS §6, FR-6.1–6.6, NFR-6).
  *
  * @dev Implements `docs/RNG.md` exactly; the random draw stream is
  *      `keccak256(abi.encodePacked(bytes32 entropy, uint256 k))` read as big-endian
  *      `uint64` words with rejection sampling, so `computeDeck` reproduces
- *      `packages/shared/vectors/rng-vectors.json` byte for byte â€” including
+ *      `packages/shared/vectors/rng-vectors.json` byte for byte — including
  *      `wordsConsumed`.
  *
  *      Lifecycle (FR-6.1):
@@ -137,7 +137,7 @@ contract Shuffle is IShuffle, AccessControl {
 
     /**
      * @notice Reveal `deckSeed` inside the window and derive/store the shuffled deck on-chain.
-     * @dev FR-6.1 steps 3â€“5, FR-6.2, FR-6.5, NFR-6. The anchor hash `blockhash(commitBlock + 1)`
+     * @dev FR-6.1 steps 3–5, FR-6.2, FR-6.5, NFR-6. The anchor hash `blockhash(commitBlock + 1)`
      *      is read once and written to storage so the entropy stays recomputable forever.
      * @param handId Commitment-derived hand identifier.
      * @param deckSeed The seed committed in `commit`.
@@ -226,7 +226,7 @@ contract Shuffle is IShuffle, AccessControl {
      *      `wordsConsumed` is the observable trace pinned by
      *      `packages/shared/vectors/rng-vectors.json`.
      * @param entropy `keccak256(abi.encodePacked(bytes32 deckSeed, bytes32 anchorBlockHash))`.
-     * @return deck The Fisherâ€“Yates ordering of the canonical deck `[0..51]`.
+     * @return deck The Fisher–Yates ordering of the canonical deck `[0..51]`.
      * @return wordsConsumed Number of `keccak256` stream words hashed (>= 13 for a full shuffle).
      */
     function computeDeckWithCost(bytes32 entropy) external pure returns (uint8[52] memory deck, uint256 wordsConsumed) {
@@ -235,7 +235,7 @@ contract Shuffle is IShuffle, AccessControl {
 
     /**
      * @notice Shuffled deck derived from `entropy`.
-     * @dev FR-6.3: canonical implementation of `docs/RNG.md` Â§3.
+     * @dev FR-6.3: canonical implementation of `docs/RNG.md` §3.
      * @param entropy `keccak256(abi.encodePacked(bytes32 deckSeed, bytes32 anchorBlockHash))`.
      */
     function computeDeck(bytes32 entropy) external pure returns (uint8[52] memory) {
@@ -245,7 +245,7 @@ contract Shuffle is IShuffle, AccessControl {
 
     /**
      * @notice Canonical `entropy = keccak256(abi.encodePacked(bytes32 deckSeed, bytes32 anchorBlockHash))`.
-     * @dev FR-6.1 step 4, `docs/RNG.md` Â§2.
+     * @dev FR-6.1 step 4, `docs/RNG.md` §2.
      */
     function computeEntropy(bytes32 deckSeed, bytes32 anchorBlockHash) public pure returns (bytes32) {
         return keccak256(abi.encodePacked(deckSeed, anchorBlockHash));
@@ -261,7 +261,7 @@ contract Shuffle is IShuffle, AccessControl {
 
     /**
      * @notice The anchor block for a committed hand (`commitBlock + 1`).
-     * @dev FR-6.2: exposed so verifiers can check step 2 of `docs/RNG.md` Â§5.
+     * @dev FR-6.2: exposed so verifiers can check step 2 of `docs/RNG.md` §5.
      */
     function anchorBlockOf(bytes32 handId) external view returns (uint256) {
         uint256 commitBlock = _commitments[handId].commitBlock;
@@ -338,7 +338,7 @@ contract Shuffle is IShuffle, AccessControl {
     }
 
     /**
-     * @dev `docs/RNG.md` Â§3, implemented verbatim.
+     * @dev `docs/RNG.md` §3, implemented verbatim.
      *
      *      `word(k) = keccak256(abi.encodePacked(bytes32 entropy, uint256 k))`, read as four
      *      big-endian `uint64` draws at byte offsets 0, 8, 16, 24. Rejected draws (those

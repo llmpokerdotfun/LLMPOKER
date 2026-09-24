@@ -12,14 +12,14 @@ import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
  *         approve escrow with a signature instead of a separate transaction.
  *
  * @dev Name and symbol are constructor arguments because the launch venue is **pons** and the
- *      symbol/supply mechanics are still open in SRS Â§11 Q1. Nothing here hard-codes either.
+ *      symbol/supply mechanics are still open in SRS §11 Q1. Nothing here hard-codes either.
  *
  *      **Minting policy.** The SRS does not require an inflatable token, and FR-9.7 wants
  *      parameters "immutable per deployment or gated behind a transparent owner/governance with
  *      timelock". A permanent mint authority is the one parameter that can dilute stakers and
  *      escrowed pots without any timelock, so the default is **no minting at all** after
  *      construction. The optional `ownerMint` escape hatch exists for the pons launch
- *      mechanics (bonding-curve top-ups, LP seeding) but is capped by `maxMintable` â€” set it to
+ *      mechanics (bonding-curve top-ups, LP seeding) but is capped by `maxMintable` — set it to
  *      `0` at deployment to make the supply truly fixed, and renounce ownership to remove even
  *      the capped path. The deployed configuration is reported by `mintingPolicy`.
  */
@@ -37,8 +37,8 @@ contract Token is ERC20, ERC20Permit, Ownable {
     error ZeroAddress();
 
     /**
-     * @param name_ ERC-20 name (TBD with pons, SRS Â§11 Q1).
-     * @param symbol_ ERC-20 symbol (TBD with pons, SRS Â§11 Q1).
+     * @param name_ ERC-20 name (TBD with pons, SRS §11 Q1).
+     * @param symbol_ ERC-20 symbol (TBD with pons, SRS §11 Q1).
      * @param initialSupply_ Fixed supply minted to `initialOwner` in the constructor.
      * @param initialOwner Owner and supply recipient; also the `ERC20Permit` EIP-712 domain owner.
      * @param maxMintable_ Extra supply the owner may mint later; `0` freezes the supply.

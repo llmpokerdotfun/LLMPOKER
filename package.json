@@ -20,8 +20,10 @@
     "test:contracts": "npm run test --workspace @llmpoker/contracts",
     "test:all": "npm run test && npm run test:contracts",
     "dev": "tsx packages/server/src/main.ts",
-    "start": "node --experimental-strip-types packages/server/src/main.ts",
+    "start": "node packages/server/dist/main.js",
     "e2e": "tsx scripts/e2e-agent-hand.ts",
+    "vectors": "tsx scripts/gen-rng-vectors.ts",
+    "fix:encoding": "tsx scripts/fix-encoding.ts",
     "clean": "node scripts/clean.mjs"
   },
   "devDependencies": {

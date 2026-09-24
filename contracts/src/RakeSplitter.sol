@@ -11,16 +11,16 @@ import { IStaking } from "./interfaces/IStaking.sol";
 /**
  * @title RakeSplitter
  * @notice Routes the rake taken by `Poker.sol` to the house-edge staking pool and the fee vault
- *         (SRS Â§6, FR-8.2, FR-9).
+ *         (SRS §6, FR-8.2, FR-9).
  *
  * @dev **Sweep, don't push.** The splitter credits each beneficiary and holds the tokens until
  *      the beneficiary calls `sweepStaking` / `sweepVault`. A push-on-distribute
  *      design would let a single misconfigured or paused beneficiary revert every settlement;
  *      pull keeps settlement O(seats) and unblockable (NFR-3). The staking leg additionally
- *      must be notified after the balance moves â€” `Staking.notifyRewards` accrues pro-rata
- *      against tokens already in the pool â€” which the pull model guarantees by construction.
+ *      must be notified after the balance moves — `Staking.notifyRewards` accrues pro-rata
+ *      against tokens already in the pool — which the pull model guarantees by construction.
  *
- *      The split is a single configurable `stakingBps` (SRS Â§11 Q4 leaves the SRS split open);
+ *      The split is a single configurable `stakingBps` (SRS §11 Q4 leaves the SRS split open);
  *      the vault leg is always the remainder, so the two always sum to 100% of the rake, and
  *      the remainder routing means no dust is ever stranded in the splitter.
  */
@@ -32,7 +32,7 @@ contract RakeSplitter is IRakeSplitter, Ownable, ReentrancyGuard {
     /// @notice The only token the splitter handles (the platform token).
     IERC20 public immutable token;
 
-    /// @notice The house-edge pool that receives the staking leg (FR-9.4â€“9.6).
+    /// @notice The house-edge pool that receives the staking leg (FR-9.4–9.6).
     IStaking public immutable staking;
 
     /// @notice The fee vault that receives the ops/trading leg (FR-9.3).

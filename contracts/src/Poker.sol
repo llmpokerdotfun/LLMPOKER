@@ -11,7 +11,7 @@ import { IRakeSplitter } from "./interfaces/IRakeSplitter.sol";
 
 /**
  * @title Poker
- * @notice On-chain custody, pot accounting and settlement for wager-mode NLHE (SRS Â§6, FR-5,
+ * @notice On-chain custody, pot accounting and settlement for wager-mode NLHE (SRS §6, FR-5,
  *         FR-8, FR-10.3, FR-10.5).
  *
  * @dev **Trust model.** The off-chain engine is the referee of *action legality* (FR-3.6) but is
@@ -19,21 +19,21 @@ import { IRakeSplitter } from "./interfaces/IRakeSplitter.sol";
  *      sits in this contract's escrow, keyed by `(tableId, seat)`, and can only leave through
  *      `cashOut` (owner-signed), `settleHand` (operator, and only against the recorded seat
  *      contributions that sum exactly to the pot), or `voidHand` (permissionless, only after
- *      `Shuffle` records a void). The engine can therefore misreport *who won* â€” which is why
- *      the deck is verifiable â€” but it can never move a token it was not authorized for.
+ *      `Shuffle` records a void). The engine can therefore misreport *who won* — which is why
+ *      the deck is verifiable — but it can never move a token it was not authorized for.
  *
  *      **What the contract does not do.** It does not evaluate poker hands, does not run the
  *      game loop and does not accept per-action bets: hole cards and board are recomputable
  *      from `Shuffle.sol` (FR-6.3) but hand evaluation is deliberately off-chain, so settlement
  *      takes winners and awards as calldata and *verifies the only things it can verify
- *      on-chain* â€” that contributions sum to the pot, that awards sum to pot minus the
+ *      on-chain* — that contributions sum to the pot, that awards sum to pot minus the
  *      contract-computed rake, that the seats exist, and that the hand was opened against a
  *      revealed shuffle for which every participant actually moved chips.
  */
 contract Poker is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    /// @notice Maximum seats at a wager table (6-max, SRS Â§1).
+    /// @notice Maximum seats at a wager table (6-max, SRS §1).
     uint8 public constant MAX_SEATS = 6;
 
     /// @notice Hard cap on any table's rake (10%, FR-8.1 / `validateTableConfig`).
@@ -44,7 +44,7 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
 
     /**
      * @notice Whether rake is charged only when a flop was dealt.
-     * @dev SRS Â§11 Q2 leaves the rake policy open; `computeRake` in
+     * @dev SRS §11 Q2 leaves the rake policy open; `computeRake` in
      *      `packages/shared/src/config.ts` is called with `rakeOnlyWithFlop: true` by
      *      `defaultWagerTableConfig`, so `true` is the shipped convention and it is exposed
      *      on-chain (rather than hidden in an argument) so the policy is auditable.
@@ -411,7 +411,7 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
      *      tolerated so callers can pass a fixed-size array. Verified on-chain: seat
      *      membership, per-seat contribution bounds against escrow, `sum(contributions) == pot`,
      *      `sum(awards) == pot - rake`, and the rake itself. Not verified (and not verifiable)
-     *      on-chain: who won the pot, and the hole-card/board mapping â€” the latter is
+     *      on-chain: who won the pot, and the hole-card/board mapping — the latter is
      *      recomputable from `Shuffle.sol` (FR-6.3).
      * @param tableId Table identifier.
      * @param handId Open hand.

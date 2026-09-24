@@ -233,7 +233,9 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       await expect(poker.connect(stack.players[5]!).deposit(TABLE_ID, 0, LEGAL_BUY_IN))
         .to.be.revertedWithCustomError(poker, 'OperatorCannotSeat')
         .withArgs(stack.playerAddresses[5]!);
-      // The old operator is now an ordinary player.
+      // The old operator is now an ordinary player, once it holds tokens and an approval.
+      await stack.token.connect(stack.owner).transfer(stack.operatorAddress, LEGAL_BUY_IN);
+      await stack.token.connect(stack.operator).approve(stack.pokerAddress, ethers.MaxUint256);
       await expect(poker.connect(stack.operator).deposit(TABLE_ID, 0, LEGAL_BUY_IN)).to.not.be.reverted;
     });
 
@@ -314,18 +316,21 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       expect(rake).to.equal(RAKE.cap); // 250 bps of 35 = 0.875, capped at 0.05
       expect(award).to.equal(pot - rake);
 
-      // Escrow: contributers debited, the winner credited the award.
-      expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(LEGAL_BUY_IN - contributions[0]!);
-      expect(await poker.escrowBalanceOf(TABLE_ID, 1)).to.equal(LEGAL_BUY_IN - contributions[1]!);
-      expect(await poker.escrowBalanceOf(TABLE_ID, 2)).to.equal(LEGAL_BUY_IN - contributions[2]! + award);
+      // Escrow: contributors debited, the winner credited the award.
+      const expected = [
+        LEGAL_BUY_IN - contributions[0]!,
+        LEGAL_BUY_IN - contributions[1]!,
+        LEGAL_BUY_IN - contributions[2]! + award,
+      ];
+      for (const [index, seat] of seats.entries()) {
+        expect(await poker.escrowBalanceOf(TABLE_ID, seat)).to.equal(expected[index]!);
+      }
 
-      // Conservation: escrow + rake == the tokens the contract actually holds.
-      const totalEscrow =
-        (await poker.escrowBalanceOf(TABLE_ID, 0)) +
-        (await poker.escrowBalanceOf(TABLE_ID, 1)) +
-        (await poker.escrowBalanceOf(TABLE_ID, 2));
-      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(totalEscrow + rake);
+      // Conservation: escrow + rake == the tokens the contract actually holds, and the rake the
+      // contract no longer holds is exactly what the splitter received.
+      const totalEscrow = expected.reduce((a, b) => a + b, 0n);
       expect(totalEscrow).to.equal(LEGAL_BUY_IN * 3n - rake);
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(totalEscrow);
 
       // Rake left escrow into the splitter (FR-8.2) and was split 50/50.
       expect(await stack.token.balanceOf(stack.splitterAddress)).to.equal(rake);
@@ -364,7 +369,10 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       expect(rake).to.equal(0n);
       expect(award).to.equal(pot);
       expect(await stack.token.balanceOf(stack.splitterAddress)).to.equal(0n);
+      // No rake: the winner's escrow is its untouched buy-in plus the whole 40-token pot.
       expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(LEGAL_BUY_IN + pot);
+      expect(await poker.escrowBalanceOf(TABLE_ID, 1)).to.equal(0n);
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(LEGAL_BUY_IN + pot);
     });
 
     it('honours the rake cap, not just the bps (FR-8.1)', async () => {
@@ -545,16 +553,17 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
       const seed = ethers.keccak256(ethers.toUtf8Bytes('over-escrow-seed'));
       await commitHand(stack, handId, seed, 1n);
       await poker.connect(stack.operator).openHand(TABLE_ID, handId, seats);
-      await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('21'));
-      await revealHand(stack, handId, seed);
 
-      await expect(
-        poker
-          .connect(stack.operator)
-          .settleHand(TABLE_ID, handId, [ethers.parseEther('21'), 0n], [0], [ethers.parseEther('21')], true),
-      )
+      // FR-5.3: chips leave escrow as they are committed, so a seat can never promise more than
+      // it actually holds.
+      await expect(poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('21')))
         .to.be.revertedWithCustomError(poker, 'ContributionExceedsEscrow')
         .withArgs(0, ethers.parseEther('21'), LEGAL_BUY_IN);
+
+      // The legal amount leaves escrow immediately and is visible before settlement.
+      await poker.connect(stack.operator).commitHand(TABLE_ID, handId, 0, ethers.parseEther('20'));
+      expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(0n);
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(LEGAL_BUY_IN * 2n);
     });
 
     it('supports a split pot across several winners', async () => {
@@ -629,7 +638,11 @@ describe('Poker (FR-5, FR-8, FR-10.3, FR-10.5)', () => {
         await poker.connect(stack.operator).commitHand(TABLE_ID, handId, seat, contributions[index]!);
       }
       const pot = contributions.reduce((a, b) => a + b, 0n);
-      expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(LEGAL_BUY_IN); // not debited until settlement
+      // Chips are debited as they are committed (FR-5.3): seat 0 contributed its whole buy-in.
+      expect(await poker.escrowBalanceOf(TABLE_ID, 0)).to.equal(LEGAL_BUY_IN - contributions[0]!);
+      expect(await poker.escrowBalanceOf(TABLE_ID, 1)).to.equal(LEGAL_BUY_IN - contributions[1]!);
+      expect(await poker.escrowBalanceOf(TABLE_ID, 2)).to.equal(LEGAL_BUY_IN - contributions[2]!);
+      expect(await stack.token.balanceOf(stack.pokerAddress)).to.equal(LEGAL_BUY_IN * 3n);
 
       // The reveal window expires and anyone voids the shuffle (FR-6.6).
       await mineUpTo(BigInt(commitBlock) + 257n);
