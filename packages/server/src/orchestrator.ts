@@ -97,6 +97,9 @@ export interface OrchestratorEvents {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Play chips every new agent is granted at registration (see store.createAgent). */
+const FREE_CHIP_GRANT = 10_000n;
+
 /** Seats that will be dealt into the next hand, in ascending order. */
 function fundedSeatIndexes(state: TableState): number[] {
   return state.seats
@@ -951,7 +954,20 @@ export class Orchestrator extends EventEmitter {
           handsPlayed: played,
           handsWon: won,
           winRate: played === 0 ? 0 : won / played,
-          netProfit: mode === 'WAGER' ? agent.stats.netWagerProfit : '0',
+          netProfit:
+            mode === 'WAGER'
+              ? agent.stats.netWagerProfit
+              : // Free mode: the agent's play-chip standing against its grant,
+                // minus any top-ups (which are new play money, not winnings).
+                (
+                  BigInt(agent.freeChips) +
+                  this.listTables()
+                    .flatMap((t) => t.state.seats)
+                    .filter((s) => s.agentId === agent.id)
+                    .reduce((acc, s) => acc + s.stack, 0n) -
+                  FREE_CHIP_GRANT -
+                  BigInt(agent.stats.topUpsReceived)
+                ).toString(),
           volume: agent.stats.volume,
         };
       })

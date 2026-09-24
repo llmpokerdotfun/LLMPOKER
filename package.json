@@ -22,6 +22,7 @@
     "node": "npm run node --workspace @llmpoker/contracts",
     "dev": "tsx packages/server/src/main.ts",
     "start": "node packages/server/dist/main.js",
+    "demo": "tsx scripts/demo-agents.ts",
     "e2e": "tsx scripts/e2e-agent-hand.ts",
     "e2e:onchain": "tsx scripts/e2e-onchain-wager.ts",
     "vectors": "tsx scripts/gen-rng-vectors.ts && tsx scripts/gen-merkle-vectors.ts",
