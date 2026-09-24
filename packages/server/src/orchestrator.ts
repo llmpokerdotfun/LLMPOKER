@@ -84,6 +84,13 @@ export interface ManagedTable {
   startedHands: number;
   /** Count of consecutive failed start attempts, so a retry gets a fresh hand id. */
   attempt: number;
+  /**
+   * Consecutive think-budget expiries per seat, cleared the moment that seat acts
+   * on its own. Feeds the idle sweep in `tick()`.
+   */
+  timeouts: Map<number, number>;
+  /** Seats over the timeout budget that are released as soon as the hand ends. */
+  pendingUnseat: Set<number>;
 }
 
 export interface OrchestratorEvents {
@@ -192,6 +199,8 @@ export class Orchestrator extends EventEmitter {
       nonce: 0n,
       startedHands: 0,
       attempt: 0,
+      timeouts: new Map(),
+      pendingUnseat: new Set(),
     };
     this.tables.set(config.id, managed);
     return managed;
@@ -244,28 +253,87 @@ export class Orchestrator extends EventEmitter {
 
   // -- the tick -------------------------------------------------------------
 
-  /** Runs the think-budget watchdog and starts hands that are due. */
+  /** Runs the think-budget watchdog, releases idle seats, and starts hands due. */
   async tick(now = this.now()): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;
     try {
       for (const table of this.tables.values()) {
+        // Release ghosts first, and unconditionally: the timeout branch below
+        // `continue`s, so a table that times out on consecutive ticks would
+        // otherwise starve the sweep forever. `leaveTable` refuses to leave
+        // mid-hand (the committed chips belong to the pot), so it waits for a
+        // gap between hands.
         const hand = table.state.hand;
-        if (hand && !hand.complete && hand.deadlineTs !== null && hand.deadlineTs <= now) {
+        const live = Boolean(hand && !hand.complete);
+        if (!live && !table.busy && table.pendingUnseat.size > 0) {
+          await this.releaseIdleSeats(table, now);
+        }
+
+        const current = table.state.hand;
+        if (current && !current.complete && current.deadlineTs !== null && current.deadlineTs <= now) {
+          const seatOnClock = current.toActSeat;
           try {
             const step = timeoutAction(table.state, now);
             await this.applyStep(table, step, now);
+            this.noteTimeout(table, seatOnClock);
           } catch (error) {
             this.emit('error', error as Error, `timeout:${table.state.config.id}`);
           }
           continue;
         }
+
         if (canStartHand(table.state) && !table.busy && now >= table.nextHandAt) {
           await this.startNextHand(table, now);
         }
       }
     } finally {
       this.ticking = false;
+    }
+  }
+
+  /**
+   * Counts a think-budget expiry against the seat that was on the clock. A seat
+   * that keeps checking or folding on the watchdog is present but not playing,
+   * so it is queued for release; a single timeout (or a slow model) is not
+   * enough, and the counter resets the moment the agent acts for itself.
+   */
+  private noteTimeout(table: ManagedTable, seat: number | null): void {
+    if (seat === null) return;
+    const limit = this.config.idleUnseatAfterTimeouts;
+    if (limit <= 0) return;
+    const record = table.state.seats[seat];
+    if (!record?.agentId) return;
+
+    const count = (table.timeouts.get(seat) ?? 0) + 1;
+    table.timeouts.set(seat, count);
+    if (count < limit) return;
+
+    if (!table.pendingUnseat.has(seat)) {
+      table.pendingUnseat.add(seat);
+      this.log(
+        'warn',
+        `${record.agentName ?? record.agentId} at ${table.state.config.id}#${seat} timed out ${count} times in a row; it will be unseated once this hand ends`,
+      );
+    }
+  }
+
+  /** Releases every seat queued by `noteTimeout`, returning its chips (FR-5.5). */
+  private async releaseIdleSeats(table: ManagedTable, now: number): Promise<void> {
+    for (const seat of [...table.pendingUnseat]) {
+      table.pendingUnseat.delete(seat);
+      table.timeouts.delete(seat);
+      const agentId = table.state.seats[seat]?.agentId;
+      if (!agentId) continue;
+      try {
+        const { cashOut } = await this.leave(agentId, table.state.config.id, now);
+        this.log(
+          'warn',
+          `unseated idle agent ${agentId} from ${table.state.config.id}#${seat}; returned ${cashOut} play chips`,
+        );
+      } catch (error) {
+        this.emit('error', error as Error, `idle-unseat:${table.state.config.id}#${seat}`);
+      }
     }
   }
 
@@ -807,6 +875,9 @@ export class Orchestrator extends EventEmitter {
 
     const step = actOnTable(table.state, seat.seat, action, now, 'AGENT');
     await this.applyStep(table, step, now);
+    // The agent acted for itself: clear any idle strike against its seat.
+    table.timeouts.delete(seat.seat);
+    table.pendingUnseat.delete(seat.seat);
     this.store.markSeen(agentId, now);
 
     // A hand that completes on this action also releases any agent whose whole
@@ -848,6 +919,7 @@ export class Orchestrator extends EventEmitter {
           status: seat.status,
           agentId: seat.agentId,
           agentName: seat.agentName,
+          agentLastSeenAt: seat.agentId ? (this.store.getAgent(seat.agentId)?.lastSeenAt ?? null) : null,
           stack: toChipsJson(seat.stack),
           committed: toChipsJson(handSeat?.committed ?? 0n),
           totalCommitted: toChipsJson(handSeat?.totalCommitted ?? 0n),

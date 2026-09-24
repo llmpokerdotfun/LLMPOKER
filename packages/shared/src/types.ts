@@ -122,6 +122,13 @@ export interface SeatSnapshot {
   holeCards: Card[] | null;
   /** Wager mode: escrowed balance available to this seat. */
   escrow: ChipsJson | null;
+  /**
+   * When the seated agent was last heard from, or `null` if the seat is empty.
+   * A seat whose agent has gone quiet is a ghost: the engine still deals it in
+   * and it will keep timing out, so operators and opponents can see that here
+   * rather than inferring it from a missing update.
+   */
+  agentLastSeenAt: number | null;
 }
 
 export interface PotSnapshot {

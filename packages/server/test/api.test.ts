@@ -684,6 +684,74 @@ describe('LLM Poker Arena server', () => {
     });
   });
 
+  describe('idle seats: an agent that stops playing loses its chair', () => {
+    /** Seats two agents and drives the think-budget watchdog until they stop. */
+    const driveTimeouts = async (ticks: number): Promise<void> => {
+      for (let i = 0; i < ticks; i++) await harness.orchestrator.tick(harness.advance(31_000));
+    };
+
+    it('frees a seat whose agent stops playing, and returns its chips', async () => {
+      const a = await registerAgent('Sleeper');
+      const b = await registerAgent('Statue');
+      await seatAgent(a.agentId, a.apiKey, 'free-0-1', '400');
+      await seatAgent(b.agentId, b.apiKey, 'free-0-1', '400');
+
+      // Neither agent ever acts for itself, so every turn is a watchdog expiry.
+      await driveTimeouts(60);
+
+      // Heads-up, a hand ends on the very first expiry, and the seat on the
+      // clock alternates between hands, so exactly one of the two accumulates
+      // the strikes and is released first. Once it is gone the table is down to
+      // one funded seat, `canStartHand` is false and the other stops timing out.
+      const table = harness.orchestrator.getTable('free-0-1');
+      const freed = table.state.seats.filter((seat) => seat.agentId === null);
+      expect(freed.length).toBeGreaterThan(0);
+      expect(table.timeouts.size).toBeLessThan(2);
+
+      // FR-5.5: leaving returns the stack to the agent's play chips, so being
+      // evicted for going quiet is not a silent loss of the buy-in.
+      const balances = harness.store.listAgents().map((agent) => BigInt(agent.freeChips));
+      expect(balances.length).toBe(2);
+      for (const balance of balances) expect(balance).toBeGreaterThan(0n);
+    });
+
+    it('is off when the limit is zero, so a slow model is never evicted', async () => {
+      harness = await buildHarness({ LLMPOKER_IDLE_UNSEAT_TIMEOUTS: '0' });
+      const a = await registerAgent('Slow');
+      const b = await registerAgent('Slower');
+      await seatAgent(a.agentId, a.apiKey, 'free-0-1', '400');
+      await seatAgent(b.agentId, b.apiKey, 'free-0-1', '400');
+
+      await driveTimeouts(60);
+
+      const table = harness.orchestrator.getTable('free-0-1');
+      expect(table.state.seats.filter((seat) => seat.agentId !== null)).toHaveLength(2);
+    });
+
+    it('records no strikes while the agents keep answering for themselves', async () => {
+      const a = await registerAgent('Live1');
+      const b = await registerAgent('Live2');
+      await seatAgent(a.agentId, a.apiKey, 'free-0-1', '400');
+      await seatAgent(b.agentId, b.apiKey, 'free-0-1', '400');
+
+      // Play hands out properly, every answer landing well inside the budget.
+      // Acting for yourself must clear the strike against your seat, so a table
+      // of attentive agents never accumulates any.
+      for (let i = 0; i < 200; i++) {
+        await harness.orchestrator.tick(harness.advance(200));
+        const table = harness.orchestrator.getTable('free-0-1');
+        const request = harness.orchestrator.actionRequest(table);
+        if (!request) continue;
+        const agentId = table.state.seats[request.seat]?.agentId;
+        if (!agentId) continue;
+        const choice = request.legal.canCheck ? 'CHECK' : request.legal.canCall ? 'CALL' : 'FOLD';
+        await harness.orchestrator.act(agentId, 'free-0-1', { action: choice });
+      }
+
+      expect(harness.orchestrator.getTable('free-0-1').timeouts.size).toBe(0);
+    });
+  });
+
   describe('monitor (FR-7)', () => {
     it('exposes tables, hands, leaderboards and agent status without credentials', async () => {
       const a = await registerAgent('Hermes');

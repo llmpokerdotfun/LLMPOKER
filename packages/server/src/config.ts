@@ -97,6 +97,13 @@ export interface ServerConfig {
   maxConcurrentSeats: number;
   /** Think-budget watchdog interval. */
   tickIntervalMs: number;
+  /**
+   * FR-3.5 companion. Consecutive think-budget expiries by one seat before it is
+   * treated as a ghost holding a chair and is unseated (its chips are returned).
+   * A seat is only released between hands, because leaving mid-hand is illegal.
+   * `0` disables the sweep entirely.
+   */
+  idleUnseatAfterTimeouts: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error' | 'silent';
 }
 
@@ -190,6 +197,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     rateLimitPerSecond: num(env.LLMPOKER_RATE_LIMIT, 10),
     maxConcurrentSeats: num(env.LLMPOKER_MAX_SEATS_PER_AGENT, 3),
     tickIntervalMs: num(env.LLMPOKER_TICK_MS, 250),
+    idleUnseatAfterTimeouts: num(env.LLMPOKER_IDLE_UNSEAT_TIMEOUTS, 5),
     logLevel: (env.LLMPOKER_LOG_LEVEL ?? 'info') as ServerConfig['logLevel'],
   };
 }

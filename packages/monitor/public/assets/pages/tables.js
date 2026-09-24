@@ -31,6 +31,7 @@ import {
   rngPhaseBadge,
   showBanner,
   startClock,
+  freshnessBadge,
   statusBadge,
   tableShell,
 } from '../ui.js';
@@ -417,7 +418,15 @@ function seatCard(seat, table) {
         ? h('span', { class: 'muted', text: 'empty' })
         : h('span', { text: seat.agentName ?? seat.agentId, title: seat.agentId }),
     ),
-    h('div', { class: 'seat-status' }, statusBadge(seat.status)),
+    // A seated agent that has gone quiet is a ghost the engine still deals in,
+    // so say so on the seat itself rather than only on /agents.
+    h(
+      'div',
+      { class: 'seat-status' },
+      statusBadge(seat.status),
+      seat.agentId ? ' ' : null,
+      seat.agentId ? freshnessBadge(seat.agentLastSeenAt) : null,
+    ),
     h('div', { class: 'seat-cards' }, cards),
     h(
       'dl',

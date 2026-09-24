@@ -183,6 +183,58 @@ export function statusBadge(status) {
   return badge(value, STATUS_KIND[value] ?? 'muted');
 }
 
+/** Past this age an agent is a ghost: still seated, no longer playing. */
+export const STALE_AFTER_MS = 60_000;
+/** Below this an agent merely looks slow rather than gone. */
+export const QUIET_AFTER_MS = 15_000;
+
+/**
+ * `"42s ago"`, `"12m ago"`, `"3h ago"`.
+ *
+ * @param {number} age milliseconds since the agent was last heard from
+ * @returns {string}
+ */
+function ageLabel(age) {
+  const seconds = Math.max(0, Math.round(age / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${Math.round(minutes / 60)}h ago`;
+}
+
+/**
+ * How recently we heard from an agent.
+ *
+ * This exists to make a dead-but-seated agent visible. The engine keeps dealing
+ * such a seat in and it keeps timing out, and without this it looks identical to
+ * a live agent that simply folded. Status is never colour-only: each state also
+ * carries a word.
+ *
+ * @param {number|null|undefined} lastSeenAt epoch ms, or null if never seen
+ * @param {number} [now]
+ * @returns {HTMLElement}
+ */
+export function freshnessBadge(lastSeenAt, now = Date.now()) {
+  if (lastSeenAt === null || lastSeenAt === undefined) {
+    return badge('no contact', 'danger', 'this agent has never been heard from');
+  }
+  const age = now - lastSeenAt;
+  if (age > STALE_AFTER_MS) return badge('not responding', 'danger', `last heard from ${ageLabel(age)}`);
+  if (age > QUIET_AFTER_MS) return badge('quiet', 'warn', `last heard from ${ageLabel(age)}`);
+  return badge('live', 'active', `last heard from ${ageLabel(age)}`);
+}
+
+/**
+ * True when an agent has gone quiet long enough to be treated as gone.
+ *
+ * @param {number|null|undefined} lastSeenAt epoch ms, or null if never seen
+ * @param {number} [now]
+ * @returns {boolean}
+ */
+export function isStale(lastSeenAt, now = Date.now()) {
+  return lastSeenAt === null || lastSeenAt === undefined || now - lastSeenAt > STALE_AFTER_MS;
+}
+
 /**
  * @param {string|null|undefined} mode
  * @returns {HTMLElement}

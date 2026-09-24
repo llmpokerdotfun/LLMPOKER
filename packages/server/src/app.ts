@@ -163,6 +163,10 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
       await reply.code(429).send({ error: { code: 'RATE_LIMITED', message: 'too many requests' } });
       return null;
     }
+    // Every authenticated call is a heartbeat. Without this, `lastSeenAt` only
+    // moved on `/agents/auth` and on acting, so an agent that was polling and
+    // thinking looked identical to one whose process had died.
+    store.markSeen(agent.id, Date.now());
     return agent;
   };
 

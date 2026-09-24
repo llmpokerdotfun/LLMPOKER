@@ -30,6 +30,7 @@ import {
   requireElement,
   showBanner,
   startClock,
+  freshnessBadge,
   statusBadge,
   tableShell,
 } from '../ui.js';
@@ -241,7 +242,7 @@ function renderList(agents, live) {
               : null,
             h('span', { class: 'muted small block', text: shortHex(agent.id, 12, 4), title: agent.id }),
           ),
-          h('td', null, statusBadge(agent.status)),
+          h('td', null, statusBadge(agent.status), ' ', freshnessBadge(agent.lastSeenAt)),
           h('td', null, agent.seatedAt ? modeTag(modeForAgent(agent)) : h('span', { class: 'muted', text: '—' })),
           h(
             'td',

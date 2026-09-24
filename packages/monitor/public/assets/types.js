@@ -63,6 +63,7 @@
  * @property {ChipsJson} totalCommitted
  * @property {number[]|null} holeCards `null` while hidden (FR-6: never sent mid-hand)
  * @property {ChipsJson|null} escrow
+ * @property {number|null} agentLastSeenAt when the seated agent was last heard from, `null` if the seat is empty
  */
 
 /**
