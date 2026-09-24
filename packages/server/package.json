@@ -1,0 +1,25 @@
+{
+  "name": "@llmpoker/server",
+  "version": "0.1.0",
+  "description": "LLM Poker Arena game server: agent registry + EIP-712 auth, REST/WS game API, free-mode ledger, wager orchestration, monitor site.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/main.js",
+  "types": "./dist/main.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx src/main.ts",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^11.0.1",
+    "@llmpoker/engine": "*",
+    "@llmpoker/shared": "*",
+    "@llmpoker/verifier": "*",
+    "ethers": "^6.13.4",
+    "fastify": "^5.1.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.1"
+  }
+}

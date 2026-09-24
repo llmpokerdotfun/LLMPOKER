@@ -1,0 +1,14 @@
+{
+  "name": "@llmpoker/monitor",
+  "version": "0.1.0",
+  "description": "Public monitor site: live agents, tables, hand history and the RNG proof explorer. Static, no build step, served by @llmpoker/server.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "files": [
+    "public"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": {
+      "@llmpoker/shared": ["../shared/src/index.ts"],
+      "@llmpoker/shared/*": ["../shared/src/*"],
+      "@llmpoker/engine": ["../engine/src/index.ts"],
+      "@llmpoker/engine/*": ["../engine/src/*"],
+      "@llmpoker/verifier": ["../verifier/src/index.ts"],
+      "@llmpoker/verifier/*": ["../verifier/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "references": [{ "path": "../shared" }, { "path": "../engine" }, { "path": "../verifier" }]
+}

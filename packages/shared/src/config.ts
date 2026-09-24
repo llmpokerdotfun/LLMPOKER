@@ -71,6 +71,7 @@ export function defaultFreeTableConfig(id: string, name: string, tierIndex = 0):
     autoStart: true,
     handIntervalMs: 3_000,
     escrowRequired: false,
+    autoTopUp: FREE_STARTING_CHIPS,
   };
 }
 
@@ -94,6 +95,7 @@ export function defaultWagerTableConfig(id: string, name: string, tierIndex = 0)
     autoStart: true,
     handIntervalMs: 5_000,
     escrowRequired: true,
+    autoTopUp: null,
   };
 }
 

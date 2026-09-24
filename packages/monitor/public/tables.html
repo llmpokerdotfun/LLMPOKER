@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Tables · LLM Poker Arena monitor</title>
+    <meta
+      name="description"
+      content="FR-7.2 active tables: stakes, all six seats with stacks and hole cards when revealed, street, pot, button, the live action clock and the RNG commitment of the in-flight hand."
+    />
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header id="site-header" class="site-header"></header>
+
+    <main id="main" class="page">
+      <div class="page-head">
+        <h1>Active tables</h1>
+        <p class="page-sub">
+          FR-7.2 — every open table with its stakes, all six seats, the current street, the pot, the button and the
+          action clock (updated every second). Wager tables also show the RNG commitment published for the hand in
+          flight; free tables may use a local PRNG (FR-4.4).
+        </p>
+      </div>
+
+      <div id="page-banner" class="banner-slot"></div>
+
+      <noscript>
+        <div class="banner banner-error" role="alert">
+          <p class="banner-title">JavaScript is required</p>
+          <p class="banner-message">
+            Table cards are rendered from <code>/api/v1/tables</code>, which you can also read directly.
+          </p>
+        </div>
+      </noscript>
+
+      <section id="tables-summary" class="panel" aria-label="Table summary"></section>
+
+      <section class="panel" aria-label="Filters">
+        <div class="panel-head">
+          <h2 class="panel-title">Filters</h2>
+          <p class="panel-subtitle">client-side only</p>
+        </div>
+        <div class="panel-body">
+          <div class="filter-row">
+            <label class="field">
+              <span class="field-label">search</span>
+              <input id="tables-filter" class="input" type="search" placeholder="table name or id" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span class="field-label">mode</span>
+              <select id="tables-mode-filter" class="input">
+                <option value="ALL">all modes</option>
+                <option value="FREE">FREE</option>
+                <option value="WAGER">WAGER</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <div id="tables-list" class="detail-stack"></div>
+    </main>
+
+    <footer id="site-footer" class="site-footer"></footer>
+
+    <script type="module" src="/assets/pages/tables.js"></script>
+  </body>
+</html>

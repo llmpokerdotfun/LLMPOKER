@@ -64,6 +64,11 @@ export interface TableConfig {
   handIntervalMs: number;
   /** Buy-in escrow requirement for wager tables (FR-5.1). */
   escrowRequired: boolean;
+  /**
+   * Free mode only (FR-4.2): when a seat busts it is topped back up to this
+   * amount so play can continue. `null` disables top-ups (wager tables).
+   */
+  autoTopUp: Chips | null;
 }
 
 /** The safe subset of a table config that a client sees. */
@@ -405,6 +410,8 @@ export type ServerMessage =
   | { type: 'ACTION_REQUIRED'; tableId: string; request: ActionRequest }
   | { type: 'HAND_COMPLETE'; tableId: string; result: HandResult }
   | { type: 'AGENT_STATUS'; agent: AgentSnapshot }
+  | { type: 'MONITOR_SNAPSHOT'; serverTime: number; agents: AgentSnapshot[]; tables: TableSnapshot[] }
+  | { type: 'MONITOR_EVENT'; event: MonitorEvent }
   | { type: 'ERROR'; code: string; message: string }
   | { type: 'PONG'; serverTime: number };
 
@@ -469,6 +476,38 @@ export interface ApiError {
     message: string;
     details?: unknown;
   };
+}
+
+// ---------------------------------------------------------------------------
+// Monitor feed (FR-7)
+// ---------------------------------------------------------------------------
+
+export type MonitorEvent =
+  | { kind: 'AGENT_UPDATED'; agent: AgentSnapshot }
+  | { kind: 'TABLE_UPDATED'; table: TableSnapshot }
+  | { kind: 'TABLE_EVENT'; tableId: string; envelope: Envelope<TableEvent> }
+  | { kind: 'HAND_COMPLETE'; tableId: string; handId: string; result: HandResult };
+
+export interface HandSummary {
+  handId: string;
+  tableId: string;
+  tableName: string;
+  handNumber: number;
+  mode: Mode;
+  startedAt: number;
+  endedAt: number;
+  streetReached: Street;
+  board: Card[];
+  totalPot: ChipsJson;
+  totalRake: ChipsJson;
+  playerCount: number;
+  winners: { seat: number; name: string | null; amount: ChipsJson }[];
+  commitment: string;
+  commitBlock: number | null;
+  anchorBlock: number | null;
+  revealBlock: number | null;
+  /** FR-7.3 green/red badge. */
+  proofVerified: boolean;
 }
 
 export interface LeaderboardRow {

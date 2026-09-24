@@ -1,0 +1,22 @@
+{
+  "name": "@llmpoker/contracts",
+  "version": "0.1.0",
+  "description": "On-chain settlement for LLM Poker Arena (Robinhood Chain, id 4663): verifiable RNG, escrow poker, native token, staking pool, fee vault, rake splitter.",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "hardhat compile",
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "node": "hardhat node",
+    "deploy:local": "hardhat run scripts/deploy.ts --network hardhat",
+    "deploy:rh": "hardhat run scripts/deploy.ts --network robinhood"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/contracts": "5.1.0",
+    "@types/mocha": "^10.0.10",
+    "hardhat": "^2.22.17"
+  }
+}
