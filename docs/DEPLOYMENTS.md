@@ -1,8 +1,11 @@
 # Deployments
 
-**There is no live deployment of this platform yet.** This file records what a
-deployment requires, so nobody has to guess later, and so no address is ever
-implied that does not exist.
+**The contracts are live on a testnet; the platform is not.** A complete,
+verified contract deployment exists on **Elysium testnet (chain id 99801)**, but
+no server points at it yet: the game server still runs locally against a
+simulated anchor and a local settlement ledger. This file records exactly what is
+deployed where and what is still missing, so no address is ever implied that does
+not exist.
 
 ## Current state
 
@@ -11,12 +14,74 @@ implied that does not exist.
 | Game server + monitor | local (`npm run dev`) | `http://127.0.0.1:8787` |
 | RNG anchor | simulated local chain (`anchorSource: "LOCAL"`) | n/a |
 | Wager settlement | local mirror ledger (`settlement: "LOCAL"`) | n/a |
-| **Full on-chain path** | **local EVM (`hardhat node`), real transactions** | ephemeral — `npm run e2e:onchain` |
-| `Shuffle.sol`, `Poker.sol`, `Token.sol`, `Staking.sol`, `Vault.sol`, `RakeSplitter.sol` | compiled, tested and deployed to local nodes | not deployed publicly |
+| **Contracts** | **Elysium testnet, gas in HYPE** | see *Elysium testnet* below |
+| Full on-chain path | local EVM (`hardhat node`), real transactions | ephemeral — `npm run e2e:onchain` |
 | Native token on pons | not launched | n/a |
 
 Free mode needs none of the on-chain pieces: it is fully playable and fully
 verifiable today, with `anchorSource: "LOCAL"` on every proof.
+
+## Elysium testnet (chain id 99801)
+
+Deployed 2026-09-25 with `npx hardhat run scripts/deploy.ts --network elysium`.
+Elysium is a standard Arbitrum Orbit EVM, so the contracts and Hardhat are
+unchanged; only the network entry is new. Gas is paid in HYPE and costs a
+fraction of a cent per transaction at 0.01 gwei.
+
+| Contract | Address |
+|---|---|
+| `Token` (LLMPOKER, 18 dec, 1e9 fixed supply) | `0x994Fb45a872D337724916ae79be4839dB2354e1a` |
+| `Vault` | `0xb7CA3A41f6d5fB76BF5F678881d15d8E76fa7377` |
+| `Staking` | `0x8cb2d335E028C6AFc5Ab74E1a4140EBd95E7A08e` |
+| `RakeSplitter` | `0x2D9F69cB9cF28cB3ffAa0239b46f0929A68161e6` |
+| `BuybackBurner` | `0xD98F06A789FeE890ed244dc16Af30ED611fEe1a7` |
+| `Shuffle` | `0x13c0D74D778544A2Bd62b1870602e5c96d40D8B3` |
+| `Poker` | `0x3918DCeF39EC126850D97283DDa115b6Fa8651bF` |
+
+* Deployer / owner / operator: `0x9E305297717944045DAe991a950a4a77637b9159`
+* Explorer base: `https://elysium.kinetiq.xyz/testnet-explorer/address/<address>`
+* One wager table created: `wager-llmpoker-1`
+  (`keccak256("wager-llmpoker-1")` = `0x12f5baa56467c4729095a41a56635797a5eb8f22d4de6b29793d07a7295809b6`),
+  blinds 0.05/0.1, buy-in 5–25, rake 250 bps capped at 0.05, 6 seats, settling in LLMPOKER.
+
+Wiring was verified on-chain, not assumed: `RakeSplitter` points at `Poker`,
+`Staking`, `Vault` and the burner; `BuybackBurner.splitter` points at the
+splitter; `Staking.REWARDS_NOTIFIER_ROLE` is held by the splitter; and
+`Shuffle.OPERATOR_ROLE` is held by the deployer (granted at construction).
+
+### What is deliberately not configured
+
+* **`BuybackBurner.router` is unset.** With no DEX router the buyback leg holds
+  its fees and emits `BuybackPending` rather than pretending to trade. Point
+  `DEX_ROUTER_ADDRESS` at a v2 router and re-run to enable it.
+* **No USDG address**, so no USDG-denominated wager table exists. Only the
+  LLMPOKER table was created.
+* **Sources are not verified on the explorer** (NFR-4), and the operator bond
+  required by `Shuffle` has not been posted.
+* The addresses live in `contracts/deployments/elysium.json`, which is gitignored
+  because a deployment file is environment-specific. This table is the durable
+  record.
+
+### Pointing the server at it
+
+The server reads these from the environment. Note the gate interaction: setting
+`LLMPOKER_TOKEN_ADDRESS` **enables the free-play token gate by default**, because
+a gate with a token address defaults to on. To serve the deployed contracts while
+keeping free play ungated, set the address *and* `LLMPOKER_FREE_GATE=false`.
+
+```bash
+LLMPOKER_TOKEN_ADDRESS=0x994Fb45a872D337724916ae79be4839dB2354e1a
+LLMPOKER_POKER_ADDRESS=0x3918DCeF39EC126850D97283DDa115b6Fa8651bF
+LLMPOKER_SHUFFLE_ADDRESS=0x13c0D74D778544A2Bd62b1870602e5c96d40D8B3
+LLMPOKER_STAKING_ADDRESS=0x8cb2d335E028C6AFc5Ab74E1a4140EBd95E7A08e
+LLMPOKER_VAULT_ADDRESS=0xb7CA3A41f6d5fB76BF5F678881d15d8E76fa7377
+LLMPOKER_RAKE_SPLITTER_ADDRESS=0x2D9F69cB9cF28cB3ffAa0239b46f0929A68161e6
+LLMPOKER_BUYBACK_BURNER_ADDRESS=0xD98F06A789FeE890ed244dc16Af30ED611fEe1a7
+LLMPOKER_FREE_GATE=false
+```
+
+On-chain anchor and settlement additionally need `LLMPOKER_RPC_URL`,
+`LLMPOKER_ANCHOR=onchain` and `LLMPOKER_SETTLEMENT=onchain`.
 
 ## What the local on-chain run proves
 

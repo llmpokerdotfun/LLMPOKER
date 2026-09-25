@@ -226,15 +226,23 @@ async function main(): Promise<void> {
   const rewardsNotifierRole = (await stakingContract.REWARDS_NOTIFIER_ROLE!()) as string;
   const operatorRole = (await shuffleContract.OPERATOR_ROLE!()) as string;
 
-  const wire: Array<[string, Promise<ethers.ContractTransactionResponse>]> = [
-    ['splitter.setBuyback(buybackBurner)', splitterContract.setBuyback!(buybackBurnerAddress)],
-    ['splitter.setPoker(poker)', splitterContract.setPoker!(pokerAddress)],
-    ['buybackBurner.setSplitter(splitter)', burnerContract.setSplitter!(splitterAddress)],
-    ['staking.grantRole(REWARDS_NOTIFIER_ROLE, splitter)', stakingContract.grantRole!(rewardsNotifierRole, splitterAddress)],
-    ['shuffle.grantRole(OPERATOR_ROLE, operator)', shuffleContract.grantRole!(operatorRole, operator)],
+  // Each entry is a thunk, not a live promise. Building the array eagerly would
+  // *send* all five transactions at once and only then await them, so they race
+  // on the account nonce: a public RPC whose nonce view lags rejects the later
+  // ones with "nonce too low" and the wiring half-lands. Sending strictly one at
+  // a time and waiting for each receipt is slower by a few seconds and correct.
+  const wire: Array<[string, () => Promise<ethers.ContractTransactionResponse>]> = [
+    ['splitter.setBuyback(buybackBurner)', () => splitterContract.setBuyback!(buybackBurnerAddress)],
+    ['splitter.setPoker(poker)', () => splitterContract.setPoker!(pokerAddress)],
+    ['buybackBurner.setSplitter(splitter)', () => burnerContract.setSplitter!(splitterAddress)],
+    [
+      'staking.grantRole(REWARDS_NOTIFIER_ROLE, splitter)',
+      () => stakingContract.grantRole!(rewardsNotifierRole, splitterAddress),
+    ],
+    ['shuffle.grantRole(OPERATOR_ROLE, operator)', () => shuffleContract.grantRole!(operatorRole, operator)],
   ];
-  for (const [label, pending] of wire) {
-    const receipt = await (await pending).wait();
+  for (const [label, send] of wire) {
+    const receipt = await (await send()).wait();
     console.log(`  ${label}  (gas ${receipt?.gasUsed.toString() ?? 'n/a'})`);
   }
 

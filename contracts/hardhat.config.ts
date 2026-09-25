@@ -22,6 +22,14 @@ const DEPLOYER_PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY?.trim();
 // deployment secrets can still run `hardhat test` on the in-process network.
 const LOCALHOST_RPC_URL = process.env.LOCALHOST_RPC_URL?.trim() || 'http://127.0.0.1:8545';
 
+/**
+ * Elysium testnet: a standard Arbitrum Orbit EVM that pays gas in HYPE, so
+ * Solidity and Hardhat work unchanged. Its RPC is public, so the network is
+ * always registered; only the signer is optional, which is what keeps
+ * `hardhat test` runnable on a machine that holds no secrets.
+ */
+const ELYSIUM_RPC_URL = process.env.ELYSIUM_RPC_URL?.trim() || 'https://testnet-rpc.elysium.kinetiq.xyz';
+
 const networks: HardhatUserConfig['networks'] = {
   hardhat: {
     chainId: 31337,
@@ -35,6 +43,11 @@ const networks: HardhatUserConfig['networks'] = {
   localhost: {
     url: LOCALHOST_RPC_URL,
     chainId: 31337,
+  },
+  elysium: {
+    url: ELYSIUM_RPC_URL,
+    chainId: 99801,
+    accounts: DEPLOYER_PRIVATE_KEY ? [DEPLOYER_PRIVATE_KEY] : [],
   },
 };
 
