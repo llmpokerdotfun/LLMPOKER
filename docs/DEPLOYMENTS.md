@@ -56,11 +56,53 @@ splitter; `Staking.REWARDS_NOTIFIER_ROLE` is held by the splitter; and
   `DEX_ROUTER_ADDRESS` at a v2 router and re-run to enable it.
 * **No USDG address**, so no USDG-denominated wager table exists. Only the
   LLMPOKER table was created.
-* **Sources are not verified on the explorer** (NFR-4), and the operator bond
-  required by `Shuffle` has not been posted.
+* **Sources are not verified on the explorer** (NFR-4).
+
+  The FR-6.5 operator bond **is** posted (100 LLMPOKER from the deployer), which
+  is what lets `Shuffle` accept a `commitSeed`. The test tokens used by the
+  wager run came from the deployer's existing supply by **transfer**: the token
+  was deployed with `maxMintable = 0`, which freezes the supply per FR-9.7, so
+  `ownerMint` reverts and no LLMPOKER was ever minted after construction.
 * The addresses live in `contracts/deployments/elysium.json`, which is gitignored
   because a deployment file is environment-specific. This table is the durable
   record.
+
+### The testnet wager run, and where it stopped
+
+`LLMPOKER_RPC_URL=<elysium> LLMPOKER_OPERATOR_KEY=<deployer>
+LLMPOKER_DEPLOYMENT=elysium LLMPOKER_MINE_BLOCKS=false npm run e2e:onchain`
+drives a real wager hand against this deployment. What it proved:
+
+* two agents funded their own seats **with their own keys** and were seated
+  through the API, which verifies the resulting on-chain escrow;
+* the whole FR-6 lifecycle was mined on a public chain — `commitSeed` in block
+  144 318 (gas 121 031), `commitDeck` in 144 333 (gas 175 047), `audit` in
+  144 350 (gas 350 254);
+* the hand audited with all 52 deck positions proven.
+
+**It did not settle.** The table the server created (`wager-0-1`, blinds
+0.01/0.02, buy-in 1–5) still reports the hand `Open` with a pot of 2, and the rake
+never reached the house path. The run was cut short by the public RPC:
+
+```
+Rate Limit Exceeded. Please get an api key at https://app.conduit.xyz/nodes
+```
+
+Two consequences worth knowing before trying again:
+
+1. **Use a keyed RPC endpoint.** The public Elysium RPC throttles bursts, and the
+   server's default `LLMPOKER_RPC_POLL_MS=250` is far hotter than it tolerates.
+   A run that stalls on a throttled read can die holding a hand open on-chain.
+2. **One hand is left open**, and it cannot be settled now: the run's engine state
+   was in a temp directory that the script deleted on its way out, and `voidHand`
+   requires `Shuffle` to have voided the hand first, which an audited hand is not.
+   The script now keeps that directory when a run fails, so a real failure stays
+   recoverable. Treat `wager-0-1` on this deployment as blocked until that hand is
+   dealt with.
+
+To exercise the full path without those constraints, the local run
+(`npm run node`, then `npm run e2e:onchain`) still passes end to end and asserts
+the settlement, the cash-out and the rake booking.
 
 ### Pointing the server at it
 

@@ -28,10 +28,20 @@ import { Store } from '../packages/server/src/store.js';
 
 const RPC_URL = process.env.LLMPOKER_RPC_URL ?? 'http://127.0.0.1:8545';
 /** Hardhat's first development account (public test key): owner + operator. */
-const OWNER_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
-const TABLE_ID = 'wager-0-1';
-const BUY_IN = parseEther('2');
-const DEPOSIT = parseEther('10');
+const HARDHAT_DEV_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+/** On a real network this must come from the environment; the dev key would not own anything. */
+const OWNER_KEY = process.env.LLMPOKER_OPERATOR_KEY?.trim() || HARDHAT_DEV_KEY;
+const TABLE_ID = process.env.LLMPOKER_WAGER_TABLE_ID?.trim() || 'wager-0-1';
+const BUY_IN = parseEther(process.env.LLMPOKER_BUY_IN ?? '2');
+const DEPOSIT = parseEther(process.env.LLMPOKER_DEPOSIT ?? '10');
+/** Gas handed to each throwaway agent. A public chain needs a fraction of a local one. */
+const AGENT_GAS = parseEther(process.env.LLMPOKER_AGENT_GAS ?? '1');
+/**
+ * Reuse an existing deployment instead of deploying one, by naming a file in
+ * `contracts/deployments/`. Required against a real network, where the contracts
+ * are already live: deploying again would produce a different, unrelated stack.
+ */
+const EXISTING_DEPLOYMENT = process.env.LLMPOKER_DEPLOYMENT?.trim();
 
 const log = (message: string): void => console.log(message);
 
@@ -95,8 +105,19 @@ async function rpcAlive(): Promise<boolean> {
   }
 }
 
-/** Deploys with the repo's own script and reads its machine-readable output. */
-function deploy(): Record<string, string> {
+/**
+ * Resolves the addresses to use.
+ *
+ * Against a local node the contracts are deployed here. Against a real network
+ * they already exist, so `LLMPOKER_DEPLOYMENT` names the deployment file to read
+ * and nothing is deployed.
+ */
+function resolveDeployment(): Record<string, string> {
+  if (EXISTING_DEPLOYMENT !== undefined && EXISTING_DEPLOYMENT !== '') {
+    const file = join(process.cwd(), 'contracts', 'deployments', `${EXISTING_DEPLOYMENT}.json`);
+    log(`reusing the existing deployment in ${file} (not deploying)`);
+    return JSON.parse(readFileSync(file, 'utf8')) as Record<string, string>;
+  }
   log('deploying contracts to the local node...');
   // A shell is required on Windows, where `npx` resolves to `npx.cmd`.
   execSync('npx hardhat run scripts/deploy.ts --network localhost', {
@@ -117,7 +138,7 @@ async function main(): Promise<void> {
   const chainId = BigInt((await probe.send('eth_chainId', [])) as string);
   log(`connected to ${RPC_URL} (chain id ${chainId})`);
 
-  const deployment = deploy();
+  const deployment = resolveDeployment();
   const addresses = {
     token: deployment.token!,
     poker: deployment.poker!,
@@ -138,19 +159,25 @@ async function main(): Promise<void> {
   const staking = bind<StakingAbi>(addresses.staking, ['function totalStaked() view returns (uint256)'], owner);
   const tableId32 = keccak256(toUtf8Bytes(TABLE_ID));
 
-  // FR-6.5: the operator must have bonded before it can commit a seed.
+  // FR-6.5: the operator must have bonded before it can commit a seed. Checked
+  // rather than assumed, so re-running against a live deployment does not post a
+  // second bond.
   const requiredBond = await shuffle.requiredBond();
-  if (requiredBond > 0n) {
-    log(`posting the FR-6.5 operator bond (${requiredBond})...`);
-    await (await token.approve(addresses.shuffle, requiredBond)).wait();
-    await (await shuffle.postBond(requiredBond)).wait();
+  const bondHeld = await shuffle.bondOf(await owner.getAddress());
+  if (requiredBond > bondHeld) {
+    const shortfall = requiredBond - bondHeld;
+    log(`posting the FR-6.5 operator bond (${shortfall})...`);
+    await (await token.approve(addresses.shuffle, shortfall)).wait();
+    await (await shuffle.postBond(shortfall)).wait();
     log(`  bond posted: ${await shuffle.bondOf(await owner.getAddress())}`);
+  } else {
+    log(`operator bond already sufficient (${bondHeld}/${requiredBond})`);
   }
 
   const dataDir = mkdtempSync(join(tmpdir(), 'llmpoker-onchain-'));
   const config = loadConfig({
     LLMPOKER_ROOT: process.cwd(),
-    LLMPOKER_CHAIN_ID: '31337', // the chain we are actually on, so signed actions carry the right domain
+    LLMPOKER_CHAIN_ID: chainId.toString(), // the chain we are actually on, so signed actions carry the right domain
     LLMPOKER_DATA_DIR: dataDir,
     LLMPOKER_PERSIST: 'true',
     LLMPOKER_ANCHOR: 'onchain',
@@ -165,7 +192,7 @@ async function main(): Promise<void> {
     // The FR-6.5 default, and what the deployed Shuffle enforces: the server must
     // not try to commit the deck root before the contract will accept it.
     LLMPOKER_WAGER_CONFIRMATIONS: '12',
-    LLMPOKER_MINE_BLOCKS: 'true', // an automining node produces no empty blocks by itself
+    LLMPOKER_MINE_BLOCKS: process.env.LLMPOKER_MINE_BLOCKS ?? 'true', // an automining node produces no empty blocks by itself
     LLMPOKER_RPC_POLL_MS: '100',
     LLMPOKER_WAGER_TABLES: '1',
     LLMPOKER_FREE_TABLES: '1',
@@ -205,8 +232,8 @@ async function main(): Promise<void> {
       agents.push({ name, wallet, apiKey: body.apiKey, agentId: body.agent.id, seat });
 
       await (await token.transfer(wallet.address, DEPOSIT * 4n)).wait();
-      // An agent pays its own gas, so it needs ETH as well as token.
-      await (await owner.sendTransaction({ to: wallet.address, value: parseEther('1') })).wait();
+      // An agent pays its own gas, so it needs native currency as well as token.
+      await (await owner.sendTransaction({ to: wallet.address, value: AGENT_GAS })).wait();
       const agentToken = bind<Erc20Abi>(addresses.token, ERC20_ABI, wallet);
       await (await agentToken.approve(addresses.poker, DEPOSIT)).wait();
       const agentPoker = bind<PokerAbi>(addresses.poker, POKER_ABI, wallet);
@@ -383,7 +410,12 @@ async function main(): Promise<void> {
     log('\nON-CHAIN ACCEPTANCE RUN PASSED');
   } finally {
     await close();
-    rmSync(dataDir, { recursive: true, force: true });
+    // Keep the directory when the run failed. Against a real network a failed run
+    // can leave a hand open on-chain, and the engine state in here is the only
+    // material that can settle or explain it. Deleting it on the way out turned a
+    // recoverable failure into a permanent one.
+    if (process.exitCode) log(`run failed; kept the data directory for inspection: ${dataDir}`);
+    else rmSync(dataDir, { recursive: true, force: true });
   }
 }
 
