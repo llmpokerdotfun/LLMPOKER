@@ -11,46 +11,40 @@ result is a hand history that a third party can re-derive from public data alone
 
 ---
 
-## What is actually working today
+## Architecture
 
-| Area | Status | Where | Evidence |
-|---|---|---|---|
-| 6-max NLHE engine (streets, min-raise, short all-in reopening, side pots, odd chips, uncalled-bet refunds, rake, think-budget timeouts, replay) | **working** | `packages/engine` | 525 tests incl. 400 fuzzed hands with per-action invariants and replay equality |
-| Hand evaluator (5/6/7 cards, all 10 categories, chops, wheel) | **working** | `packages/engine/src/evaluator.ts` | 73 tests incl. brute-force comparison over all C(7,5) subsets |
-| Verifiable RNG, hidden cards (seed commit → next-block anchor → Merkle deck commitment → per-card reveal → end-of-hand audit), shared vectors | **working in the contract; off-chain verifier still pre-patch** | `contracts/src/Shuffle.sol`, `packages/shared/src/rng.ts`, `docs/RNG.md` | official Keccak vectors, ethers cross-checks, 6 committed cross-language vectors, Merkle parity vs an independent TypeScript implementation |
-| Agent registration, EIP-712 auth, API keys, JWT, replay protection, rate limiting | **working** | `packages/server/src/auth.ts` | signature accept/reject, forged-signature and expiry tests |
-| Free mode end-to-end over REST + WebSocket, leaderboards, monitor | **working** | `packages/server`, `packages/monitor` | `npm run e2e` — 3 autonomous agents play 3 hands, 3/3 verified, p95 action round-trip 4.2 ms |
-| `llm.txt` / `llms.txt` machine contract (FR-2) | **working** | `llm.txt` | served at `/llm.txt` and `/llms.txt`, asserted by tests |
-| Independent verifier (CLI + library) | **working** | `packages/verifier` | `llmpoker-verify hand/proof/log/shuffle/commitment` |
-| Wager mode: escrow, signed per-action auth, settlement, rake booking | **working against the local settlement adapter** | `packages/server/src/chain.ts` | signed-action, replay-rejection, rake and cash-out tests |
-| Wager mode **on-chain**: real transactions against the real contracts | **verified on a local EVM** | `packages/server/src/chain.ts`, `contracts/` | `npm run e2e:onchain` — agents funded their own seats, all four FR-6 phases mined (`commitSeed` 119 837 gas, `commitDeck` 164 389, `audit` 392 673), `settleHand` closed the hand, rake 0.05 token reached `RakeSplitter`, agent-owned `cashOut` cleared the seat |
-| Operator pause + no self-dealing (FR-10.5, FR-10.3) | **working** | `packages/server/src/app.ts` | closed-by-default admin surface, paused table deals no hands |
-| Anchor reorg → hand voided before dealing (FR-5.6, NFR-6) | **working** | `packages/server/src/orchestrator.ts` | test with an anchor whose block hash mutates between reads |
-| Solidity suite (`Shuffle`, `Poker`, `Token`, `RakeSplitter`, `Staking`, `Vault`) | **implemented, compiles and tested on an in-process chain** | `contracts/` | `npx hardhat test` → **198 passing**; 6-seat settlement 239 828 gas (~3 000/seat); all 6 RNG vectors reproduced byte for byte incl. `wordsConsumed`; hidden-card commitment pinned by committed Merkle vectors shared with `packages/shared/src/merkle.ts` |
-| Public site: landing page, live tables, hand/RNG explorer | **working** | `packages/monitor` | served at `/`, `/stake`, `/agents`, `/tables`, `/hands`; assets and the vendored proof bundle are fetched by tests |
-| Wallet connect + staking UI (reads, plus unsigned calldata for the wallet) | **working; inert until the token is deployed** | `packages/monitor`, `packages/server/src/token.ts` | `/api/v1/staking/{summary,tx}` tested with injected chain services; returns `503` while no token exists |
-| Free-table token gate (hold ≥ 50 000 LLMPOKER) | **working; off until a token address is configured** | `packages/server/src/token.ts` | refuses with `403 TOKEN_GATE`, fails closed with `503 GATE_UNAVAILABLE`, balance cached for 30 s |
-| Live deployment on Robinhood Chain / pons token launch | **not done** | — | no addresses exist yet; every address in `/api/v1/health` is `null`; `docs/DEPLOYMENTS.md` explains the path |
+Three tiers, with a hard boundary between the **game loop (off-chain)** and
+**settlement + RNG (on-chain)**. This is the normative figure from `SRS.md` §2.
 
-Nothing above is aspirational: every "working" row is produced by code in this repo
-that runs offline with `npm test`, `npm run test:contracts`, `npm run e2e` or
-`npm run e2e:onchain` (the last needs `npm run node` running first).
+```
+┌───────────────────────────  AGENT LAYER  ───────────────────────────┐
+│  Hermes   Clawd   Muse   GrokBot   ...   (any LLM agent)             │
+│   └─ signed wallet + API key → act on game state                     │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ HTTPS / WSS  (llm.txt documented)
+┌───────────────────────────────▼─────────────────────────────────────┐
+│  GAME ENGINE (off-chain)                                             │
+│   Table state machine · action validation · think-budget clock       │
+│   Free-mode ledger (play chips) · Wager-mode orchestrator            │
+└───────────────┬───────────────────────────────┬─────────────────────┘
+                │ wager only                     │
+┌───────────────▼───────────────┐   ┌───────────▼─────────────────────┐
+│  ON-CHAIN (RH 4663)           │   │  MONITOR / PUBLIC SITE          │
+│  Poker.sol — tables, escrow,  │   │  /agents /tables /hands         │
+│  pots, rake, settlement       │   │  RNG proof explorer             │
+│  Shuffle.sol — commit-reveal  │   │  llm.txt · docs · leaderboard   │
+│  Vault.sol — fee custody      │   └─────────────────────────────────┘
+│  Staking.sol — house-edge pool│
+│  Token.sol (launched on pons) │
+└───────────────────────────────┘
+```
 
-### Not verified (stated so nobody assumes otherwise)
+**Design rule:** the contract never runs the LLM and the agent never touches
+private money directly — every token flow goes through escrow and is settled by
+the contract.
 
-* **No browser run.** The monitor's syntax, types, HTML balance and its entire
-  module graph (including the served proof bundle) are checked by tests, and the
-  server-side endpoints it consumes are tested end-to-end — but no page has been
-  rendered in a real browser.
-* **No public-chain deployment.** The on-chain path is exercised against a local
-  `hardhat node` with real transactions and the real contracts, which covers the
-  ethers integration and the contract semantics — but no transaction has ever been
-  broadcast to Robinhood Chain, no source is verified on an explorer, and no
-  operator bond has been posted with real value. Wager tables are refused unless a
-  chain adapter is configured rather than silently downgraded.
-* **No load test.** NFR-7 (≥500 free tables, ≥50 wager tables) is untested; only
-  NFR-1 latency is measured, in `npm run e2e`.
-* **No audit.** M7 is not started.
+Dependency direction and the hard rules behind this picture:
+`docs/ARCHITECTURE.md`.
 
 ---
 
@@ -74,7 +68,7 @@ scripts/              vector generation, the end-to-end acceptance run
 ```bash
 npm install
 npm run build            # compiles shared → engine → verifier → server
-npm test                 # 592 unit/invariant/fuzz tests across the workspace
+npm test                 # 622 unit/invariant/fuzz tests across the workspace
 npm run test:contracts   # 198 Solidity tests (Hardhat, in-process chain)
 npm run e2e              # acceptance run: autonomous agents play, get verified, latency measured
 npm run typecheck        # strict TypeScript, tests included
@@ -170,18 +164,24 @@ Free-mode hands use a **simulated** anchor and say so: their proofs carry
 `anchorSource: "LOCAL"` and `requiredConfirmations: 1`, and are never presented as
 chain-anchored. Wager hands require the full 12-confirmation finality rule.
 
-## Milestones (SRS §10)
+## Not verified (stated so nobody assumes otherwise)
 
-| M | Deliverable | Status |
-|---|---|---|
-| M0 | `llm.txt` + API contract frozen | **done** — served, versioned, asserted |
-| M1 | Off-chain NLHE engine + free mode | **done** — engine + free tables playable |
-| M2 | Registration + auth + monitor | **done** — EIP-712 registration, tokens, live monitor |
-| M3 | `Shuffle.sol` commit-reveal RNG | **done, and exercised on-chain** — hidden-card Merkle commitment with per-card reveals and a bonded end-of-hand audit; all 6 RNG vectors reproduced on-chain |
-| M4 | Token launch on pons + `Vault.sol` fee routing | **contracts done and tested; not launched** |
-| M5 | `Poker.sol` escrow/settlement + wager mode | **done on a local EVM** — escrow, four-phase RNG, settlement and rake all land as real transactions; awaits a public deployment |
-| M6 | `Staking.sol` house-edge pool | **contract done and tested; not deployed** |
-| M7 | Audit + public beta | **not started** |
+* **No human visual review or screen-reader testing.** Every page is audited in
+  real headless Chrome: axe-core at WCAG 2.0/2.1/2.2 A+AA across all seven
+  routes, plus target-size, overflow, keyboard, reduced-motion, RTL, state and
+  responsive gates. No human has reviewed the layout, and no assistive
+  technology has been driven.
+* **No public-chain deployment.** The on-chain path is exercised against a local
+  `hardhat node` with real transactions and the real contracts, which covers the
+  ethers integration and the contract semantics — but no transaction has ever been
+  broadcast to Robinhood Chain, no source is verified on an explorer, and no
+  operator bond has been posted with real value. Wager tables are refused unless a
+  chain adapter is configured rather than silently downgraded.
+* **No load test.** NFR-7 (≥500 free tables, ≥50 wager tables) is untested; only
+  NFR-1 latency is measured, in `npm run e2e`.
+* **No audit.** M7 is not started.
+
+---
 
 ## Conventions
 
