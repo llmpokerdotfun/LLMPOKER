@@ -93,7 +93,7 @@ const SYSTEM = `You are an expert no-limit Texas Hold'em player, playing 6-max o
 agent-only table. You are given the exact legal actions for your turn.
 
 Choose exactly one action and reply with ONLY a JSON object, no prose:
-{"action":"FOLD"|"CHECK"|"CALL"|"BET"|"RAISE"|"ALL_IN","amount":"<chips>","reasoning":"<one short sentence>"}
+{"action":"FOLD"|"CHECK"|"CALL"|"BET"|"RAISE"|"ALL_IN","amount":"<chips>","chat":"<table talk, optional>","reasoning":"<one short sentence>"}
 
 Rules you must respect:
 - "amount" is required for BET and RAISE and must be omitted for the others.
@@ -101,6 +101,10 @@ Rules you must respect:
   ("raise to"), not the increment. It must be between minRaiseTo and maxRaiseTo.
 - Only use an action the legal set allows.
 - Chips are plain integers on a free table.
+- "chat" is optional table talk that every other agent can read, in this hand and
+  afterwards. At most 280 characters, at most 8 lines per hand. It is public:
+  never put a secret in it. Use it to pressure, misdirect or comment, as a real
+  player would at a live table. Leave it out when you have nothing to say.
 Play sound, aggressive-when-ahead poker. Do not invent cards you were not given.`;
 
 /** Human-readable board/hole cards, e.g. ["As","Td"]. */
@@ -129,6 +133,10 @@ function userPrompt(request: ActionRequest, tableName: string): string {
     `Raise/bet targets you may use: ${legal.sizedTargets.join(', ') || '(none)'}`,
     `LEGAL ACTIONS: ${allowed.join(' | ')}`,
     '',
+    request.chat && request.chat.length > 0
+      ? `Table talk so far this hand:\n${request.chat.map((m) => `  seat ${m.seat} (${m.agentName}): ${m.text}`).join('\n')}`
+      : 'Table talk so far this hand: (nothing said yet)',
+    '',
     'Reply with the JSON object only.',
   ].join('\n');
 }
@@ -136,6 +144,7 @@ function userPrompt(request: ActionRequest, tableName: string): string {
 interface Decision {
   action: ActionType;
   amount?: string;
+  chat?: string;
   reasoning?: string;
 }
 
@@ -162,6 +171,11 @@ function parseDecision(text: string): Decision | string {
   }
   const decision: Decision = { action: name as ActionType };
   if (typeof record.reasoning === 'string') decision.reasoning = record.reasoning.slice(0, 160);
+  if (typeof record.chat === 'string') {
+    // Same normalisation the server applies, so what we log is what was sent.
+    const clean = record.chat.replace(/\s+/g, ' ').trim();
+    if (clean !== '' && clean.length <= 280) decision.chat = clean;
+  }
   if (record.amount !== undefined && record.amount !== null) {
     const amount = String(record.amount);
     if (!/^[0-9]+$/.test(amount)) return `amount ${JSON.stringify(record.amount)} is not a whole number of chips`;
@@ -329,8 +343,9 @@ async function main(): Promise<void> {
         return;
       }
 
-      const payload: { action: string; amount?: string } = { action: decision.action };
+      const payload: { action: string; amount?: string; chat?: string } = { action: decision.action };
       if (decision.amount !== undefined) payload.amount = decision.amount;
+      if (decision.chat !== undefined) payload.chat = decision.chat;
       await api(`/api/v1/tables/${TABLE_ID}/act`, {
         method: 'POST',
         headers: { authorization: `Bearer ${apiKey}` },
@@ -338,6 +353,7 @@ async function main(): Promise<void> {
       });
       log(
         `${request.street} seat ${request.seat}: ${decision.action}${decision.amount ? ` ${decision.amount}` : ''}` +
+          `${decision.chat ? `  says "${decision.chat}"` : ''}` +
           `${decision.reasoning ? `  (${decision.reasoning})` : ''}`,
       );
     } catch (error) {
@@ -363,6 +379,12 @@ async function main(): Promise<void> {
     }
     if (message.type === 'ACTION_REQUIRED') {
       void decide(message.request, before.config.name);
+    }
+    // Mirror the table's talk into this agent's log, so an operator watching one
+    // agent can see the conversation the model is reacting to.
+    if (message.type === 'TABLE_EVENT' && message.envelope.payload.type === 'CHAT') {
+      const said = message.envelope.payload.message;
+      if (said.agentId !== agentId) log(`heard seat ${said.seat} (${said.agentName}): ${said.text}`);
     }
   });
   socket.on('error', (error: Error) => log(`feed error: ${error.message}`));

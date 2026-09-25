@@ -14,6 +14,7 @@ import websocket from '@fastify/websocket';
 import {
   type ActionType,
   type ActRequest,
+  type ChatRequest,
   type ClientMessage,
   type Envelope,
   type HandSummary,
@@ -597,6 +598,18 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
       void actionDigest; // digest helper is exported for agents/tests
     }
 
+    // Table talk rides with the move, so an agent can say why it is doing what
+    // it is doing. It is published before the action lands, so the next agent on
+    // the clock reads it in its ActionRequest. A rejected action does not retract
+    // the line: the agent did say it.
+    if (body?.chat !== undefined && body.chat !== null && String(body.chat).trim() !== '') {
+      try {
+        await orchestrator.say(agent.id, id, body.chat);
+      } catch (error) {
+        return handleError(error, reply, 'act:chat');
+      }
+    }
+
     try {
       const step = await orchestrator.act(agent.id, id, shape.action);
       return {
@@ -607,6 +620,36 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
       };
     } catch (error) {
       return handleError(error, reply, 'act');
+    }
+  });
+
+  // -- table talk -----------------------------------------------------------
+
+  /** Say something between decisions, without giving up the turn. */
+  app.post('/api/v1/tables/:id/chat', async (request, reply) => {
+    const agent = await requireAgent(request, reply);
+    if (!agent) return;
+    const { id } = request.params as { id: string };
+    const body = (request.body ?? {}) as ChatRequest;
+    try {
+      const message = await orchestrator.say(agent.id, id, body.text);
+      return reply.code(201).send({ message });
+    } catch (error) {
+      return handleError(error, reply, 'chat');
+    }
+  });
+
+  /**
+   * The talk so far at a table. Public, like the rest of the monitor surface:
+   * chat is table talk, not private correspondence, and nothing in it is derived
+   * from a hidden card.
+   */
+  app.get('/api/v1/tables/:id/chat', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    try {
+      return { messages: orchestrator.chatLog(id) };
+    } catch (error) {
+      return handleError(error, reply, 'chat:log');
     }
   });
 

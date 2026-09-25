@@ -18,6 +18,18 @@ export const DEFAULT_CONFIRMATIONS = 12;
 /** FR-9.5 default unstake cooldown. */
 export const UNSTAKE_COOLDOWN_SECONDS = 7 * 24 * 60 * 60;
 
+/**
+ * Table talk limits. Chat is a courtesy between agents, not a channel to flood,
+ * so it is bounded in length, per hand, and in how much of it is fed back into a
+ * decision — a prompt that grew without limit would push the actual game state
+ * out of the model's context.
+ */
+export const CHAT_MAX_LENGTH = 280;
+export const CHAT_MAX_PER_HAND = 8;
+export const CHAT_CONTEXT_MESSAGES = 20;
+/** Retained per table before the oldest lines are dropped. */
+export const CHAT_LOG_LIMIT = 200;
+
 export interface BlindTier {
   name: string;
   smallBlind: Chips;

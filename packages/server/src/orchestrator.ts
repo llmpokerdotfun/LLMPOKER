@@ -13,6 +13,7 @@ import {
   type ActionRequest,
   type AgentSnapshot,
   type Card,
+  type ChatMessage,
   type Chips,
   type DeckCommitment,
   type HandHistory,
@@ -26,6 +27,10 @@ import {
   type TableSnapshot,
   bytesToHex,
   bytesToHex32,
+  CHAT_CONTEXT_MESSAGES,
+  CHAT_LOG_LIMIT,
+  CHAT_MAX_LENGTH,
+  CHAT_MAX_PER_HAND,
   commitDeckOrder,
   commitmentHex,
   defaultFreeTableConfig,
@@ -91,6 +96,14 @@ export interface ManagedTable {
   timeouts: Map<number, number>;
   /** Seats over the timeout budget that are released as soon as the hand ends. */
   pendingUnseat: Set<number>;
+  /**
+   * Table talk, oldest first, trimmed to `CHAT_LOG_LIMIT`. Kept on the table
+   * rather than in the engine: chat has no effect on the rules or on the deal,
+   * so it must never be able to change a hand's outcome.
+   */
+  chat: ChatMessage[];
+  /** Monotonic per table, so a reader can order and de-duplicate lines. */
+  chatSeq: number;
 }
 
 export interface OrchestratorEvents {
@@ -201,6 +214,8 @@ export class Orchestrator extends EventEmitter {
       attempt: 0,
       timeouts: new Map(),
       pendingUnseat: new Set(),
+      chat: [],
+      chatSeq: 0,
     };
     this.tables.set(config.id, managed);
     return managed;
@@ -594,10 +609,24 @@ export class Orchestrator extends EventEmitter {
 
   private async applyStep(table: ManagedTable, step: TableStep, now: number): Promise<void> {
     table.state = step.table;
-    if (step.events.length > 0) this.emit('tableEvent', table.state.config.id, step.events);
-    if (step.actionRequest) this.emit('actionRequired', step.actionRequest);
+    const tableId = table.state.config.id;
+    const handId = step.table.hand?.handId ?? null;
 
-    const handId = step.table.hand?.handId;
+    // Table talk belongs to the server, not the engine, so it is attached to
+    // every outgoing request here — both the `actionRequired` event the socket
+    // layer forwards to the seat on the clock, and the ACTION_REQUIRED inside
+    // the event list the table's subscribers see. Without this an agent would
+    // receive a request with no talk in it.
+    const chat = handId ? this.chatForHand(tableId, handId) : [];
+    const events: TableEvent[] =
+      chat.length === 0
+        ? step.events
+        : step.events.map((event) =>
+            event.type === 'ACTION_REQUIRED' ? { ...event, request: { ...event.request, chat } } : event,
+          );
+    if (events.length > 0) this.emit('tableEvent', tableId, events);
+    if (step.actionRequest) this.emit('actionRequired', { ...step.actionRequest, chat });
+
     if (handId) {
       // FR-6.3: publish whatever the rules just made public, and nothing else.
       await this.publishReveals(table, handId, now);
@@ -621,7 +650,15 @@ export class Orchestrator extends EventEmitter {
       return;
     }
 
-    const history: HandHistory = { result, proof, deck: proof.deck, config: table.state.config };
+    const history: HandHistory = {
+      result,
+      proof,
+      deck: proof.deck,
+      config: table.state.config,
+      // Table talk belongs with the hand it was said during. It is carried in the
+      // history but never in the proof, so a verifier ignores it entirely.
+      chat: this.chatForHand(table.state.config.id, result.handId),
+    };
     table.histories.set(result.handId, history);
     this.store.appendHand(history);
 
@@ -864,6 +901,68 @@ export class Orchestrator extends EventEmitter {
     return { cashOut, escrow };
   }
 
+  /**
+   * Table talk. Publishes one line from a seated agent.
+   *
+   * A line can only be said while a hand is live. That is not an arbitrary
+   * restriction: a line only means something attached to the hand it was said
+   * during, it is what makes the per-hand allowance enforceable, and it keeps
+   * "what was said" from ever being ambiguous about which decision it preceded.
+   */
+  async say(agentId: string, tableId: string, text: unknown, now = this.now()): Promise<ChatMessage> {
+    const table = this.getTable(tableId);
+    const seat = table.state.seats.find((s) => s.agentId === agentId);
+    if (!seat) throw new EngineError('SEAT_NOT_FOUND', `agent ${agentId} is not seated at ${tableId}`);
+
+    const hand = table.state.hand;
+    if (!hand || hand.complete) {
+      throw new EngineError('HAND_NOT_FOUND', `table ${tableId} has no live hand to talk during`);
+    }
+
+    const clean = normaliseChat(text);
+    if (clean === null || clean.length > CHAT_MAX_LENGTH) {
+      throw new EngineError('CHAT_REJECTED', `chat must be 1..${CHAT_MAX_LENGTH} printable characters`);
+    }
+
+    const saidThisHand = table.chat.filter((m) => m.handId === hand.handId).length;
+    if (saidThisHand >= CHAT_MAX_PER_HAND) {
+      throw new EngineError('CHAT_LIMIT', `already said ${saidThisHand} lines this hand (max ${CHAT_MAX_PER_HAND})`);
+    }
+
+    const agent = this.store.getAgent(agentId);
+    table.chatSeq += 1;
+    const message: ChatMessage = {
+      seq: table.chatSeq,
+      tableId,
+      handId: hand.handId,
+      seat: seat.seat,
+      agentId,
+      agentName: agent?.name ?? seat.agentName ?? agentId,
+      text: clean,
+      at: now,
+    };
+
+    table.chat.push(message);
+    if (table.chat.length > CHAT_LOG_LIMIT) table.chat.splice(0, table.chat.length - CHAT_LOG_LIMIT);
+    this.emit('tableEvent', tableId, [{ type: 'CHAT', message }]);
+    return message;
+  }
+
+  /**
+   * Table talk for one hand, oldest first and bounded, ready to drop into a
+   * decision prompt without letting talk crowd out the game state.
+   */
+  chatForHand(tableId: string, handId: string): ChatMessage[] {
+    return this.getTable(tableId)
+      .chat.filter((m) => m.handId === handId)
+      .slice(-CHAT_CONTEXT_MESSAGES);
+  }
+
+  /** Everything still retained for a table, newest last. */
+  chatLog(tableId: string): ChatMessage[] {
+    return [...this.getTable(tableId).chat];
+  }
+
   /** Applies an agent action. The caller has already authenticated the agent. */
   async act(agentId: string, tableId: string, action: PlayerAction, now = this.now()): Promise<TableStep> {
     const table = this.getTable(tableId);
@@ -893,7 +992,11 @@ export class Orchestrator extends EventEmitter {
   actionRequest(table: ManagedTable): ActionRequest | null {
     const hand = table.state.hand;
     if (!hand || hand.complete) return null;
-    return actionRequestFor(hand);
+    const base = actionRequestFor(hand);
+    if (!base) return null;
+    // The engine builds everything that is about the rules; table talk is the
+    // server's, so it is attached here and never reaches the pure engine.
+    return { ...base, chat: this.chatForHand(table.state.config.id, hand.handId) };
   }
 
   // -- projections ----------------------------------------------------------
@@ -1088,3 +1191,22 @@ export class Orchestrator extends EventEmitter {
 
 export { nextButtonSeat };
 export type { TableState };
+
+/**
+ * Normalises one line of table talk.
+ *
+ * Control characters are removed rather than escaped. A newline or a NUL inside
+ * a message would let a sender forge structure in whatever prompt a reader drops
+ * the line into, which is a prompt-injection foothold between agents. Runs of
+ * whitespace collapse so a line cannot be padded to look like something else.
+ *
+ * @returns the cleaned line, or `null` when nothing publishable is left.
+ */
+function normaliseChat(text: unknown): string | null {
+  if (typeof text !== 'string') return null;
+  const stripped = text
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return stripped === '' ? null : stripped;
+}

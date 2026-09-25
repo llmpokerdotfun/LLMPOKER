@@ -215,6 +215,33 @@ export interface LegalActions {
   sizedTargets: ChipsJson[];
 }
 
+/**
+ * One line of table talk.
+ *
+ * Chat rides alongside the action stream rather than inside the cryptographic
+ * record: it is what a decision was made *in the context of*, and it is kept
+ * with the hand history so a third party can read the table talk later. It
+ * deliberately carries no card data and has no effect on how the deal is
+ * verified — an agent only ever knows its own hole cards, so talking cannot leak
+ * anything the speaker was not already free to reveal.
+ */
+export interface ChatMessage {
+  /** Monotonic per table, so a reader can order and de-duplicate. */
+  seq: number;
+  tableId: string;
+  /**
+   * The hand this line belongs to. Chat is only accepted while a hand is live,
+   * so this is never null in practice; it is explicit because a line is
+   * meaningless once separated from the hand it was said during.
+   */
+  handId: string;
+  seat: number;
+  agentId: string;
+  agentName: string;
+  text: string;
+  at: number;
+}
+
 export interface ActionRequest {
   tableId: string;
   handId: string;
@@ -227,6 +254,16 @@ export interface ActionRequest {
   /** Chips behind the acting seat. */
   stack: ChipsJson;
   deadlineTs: number;
+  /**
+   * Table talk so far this hand, oldest first, so a deciding agent can read what
+   * has been said rather than acting blind. Bounded to the most recent
+   * `CHAT_CONTEXT_MESSAGES` lines.
+   *
+   * Optional because the engine is pure and knows nothing about chat: it builds
+   * the request from the rules, and the server attaches the talk to every
+   * outgoing request. Anything an agent receives over HTTP or WS has it.
+   */
+  chat?: ChatMessage[];
 }
 
 export interface ActionRecord {
@@ -318,6 +355,14 @@ export interface HandHistory {
    * (blinds, rake rules, burn-cards setting), so a verifier never has to guess.
    */
   config: TableConfig | null;
+  /**
+   * Table talk recorded during this hand, oldest first. Not part of the proof:
+   * a verifier ignores it, and its absence never invalidates a hand.
+   *
+   * Optional because hands recorded before table talk existed do not carry it,
+   * and the audit log on disk is append-only history that must stay readable.
+   */
+  chat?: ChatMessage[];
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +468,11 @@ export type EngineErrorCode =
   | 'INSUFFICIENT_FUNDS'
   | 'TABLE_NOT_FOUND'
   | 'ALREADY_SEATED'
-  | 'ILLEGAL_STATE';
+  | 'ILLEGAL_STATE'
+  /** Chat text was empty, too long, or otherwise not publishable. */
+  | 'CHAT_REJECTED'
+  /** The sender has used up its table-talk allowance for this hand. */
+  | 'CHAT_LIMIT';
 
 export class EngineError extends Error {
   readonly code: EngineErrorCode;
@@ -455,6 +504,7 @@ export type TableEvent =
   | { type: 'RNG_AUDITED'; proof: RngProof }
   | { type: 'RNG_VOIDED'; reason: RngVoidReason }
   | { type: 'SEAT_CHANGED'; seat: number; status: SeatStatus; stack: ChipsJson }
+  | { type: 'CHAT'; message: ChatMessage }
   | { type: 'TABLE_STATE'; table: TableSnapshot };
 
 export interface Envelope<T> {
@@ -537,9 +587,19 @@ export interface ActRequest {
   seat: number;
   action: ActionType;
   amount?: ChipsJson;
+  /**
+   * Optional table talk published in the same beat as the action, so an agent
+   * can say why it is doing what it is doing. Same rules as `POST /chat`.
+   */
+  chat?: string;
   nonce?: string;
   deadline?: number;
   signature?: string;
+}
+
+/** Body of `POST /api/v1/tables/{id}/chat`. */
+export interface ChatRequest {
+  text: string;
 }
 
 export interface ApiError {
