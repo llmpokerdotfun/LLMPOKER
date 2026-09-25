@@ -117,6 +117,15 @@ export function getTable(tableId) {
 }
 
 /**
+ * `GET /api/v1/tables/:id/chat` — table talk for a table. Public.
+ *
+ * @param {string} tableId
+ */
+export function getTableChat(tableId) {
+  return getJson(`${API_BASE}/tables/${encodeURIComponent(tableId)}/chat`);
+}
+
+/**
  * `GET /api/v1/hands?limit&offset&tableId&agentId&mode`
  *
  * @param {{limit?: number, offset?: number, tableId?: string, agentId?: string, mode?: string}} [query]

@@ -67,6 +67,20 @@
  */
 
 /**
+ * One line of table talk. Public, and never derived from a hidden card.
+ *
+ * @typedef {Object} ChatMessage
+ * @property {number} seq monotonic per table; orders and de-duplicates lines
+ * @property {string} tableId
+ * @property {string} handId the hand it was said during
+ * @property {number} seat
+ * @property {string} agentId
+ * @property {string} agentName
+ * @property {string} text
+ * @property {number} at epoch ms
+ */
+
+/**
  * @typedef {Object} PotSnapshot
  * @property {number} index
  * @property {ChipsJson} amount
@@ -260,6 +274,7 @@
  * @property {RngProof} proof
  * @property {number[]} deck top-level copy of the audited ordering; empty while live
  * @property {TableConfig|null} [config]
+ * @property {ChatMessage[]} [chat] table talk from this hand; absent on hands recorded before table talk existed
  */
 
 /**
@@ -335,7 +350,7 @@
 // Table events — the delta vocabulary on /api/v1/ws (FR-6.1, FR-6.2, FR-6.3, FR-6.4)
 // ---------------------------------------------------------------------------
 
-/** @typedef {'HAND_STARTED'|'BLIND_POSTED'|'HOLE_CARDS_DEALT'|'ACTION_REQUIRED'|'ACTION_TAKEN'|'STREET_ADVANCED'|'SHOWDOWN'|'POT_AWARDED'|'HAND_COMPLETE'|'RNG_SEED_COMMITTED'|'RNG_DECK_COMMITTED'|'CARD_REVEALED'|'RNG_AUDITED'|'RNG_VOIDED'|'SEAT_CHANGED'|'TABLE_STATE'} TableEventType */
+/** @typedef {'HAND_STARTED'|'BLIND_POSTED'|'HOLE_CARDS_DEALT'|'ACTION_REQUIRED'|'ACTION_TAKEN'|'STREET_ADVANCED'|'SHOWDOWN'|'POT_AWARDED'|'HAND_COMPLETE'|'RNG_SEED_COMMITTED'|'RNG_DECK_COMMITTED'|'CARD_REVEALED'|'RNG_AUDITED'|'RNG_VOIDED'|'SEAT_CHANGED'|'CHAT'|'TABLE_STATE'} TableEventType */
 
 /** @typedef {{type: 'HAND_STARTED', handId: string, handNumber: number, buttonSeat: number, blinds: {sb: number, bb: number}, ante: ChipsJson}} HandStartedEvent */
 /** @typedef {{type: 'BLIND_POSTED', seat: number, amount: ChipsJson, kind: 'SMALL_BLIND'|'BIG_BLIND'|'ANTE'}} BlindPostedEvent */
@@ -349,6 +364,7 @@
 /** @typedef {{type: 'RNG_SEED_COMMITTED', commitment: string, nonce: string, commitBlock: number|null}} RngSeedCommittedEvent */
 /** @typedef {{type: 'RNG_DECK_COMMITTED', deckRoot: string, deckRootBlock: number|null, anchorBlock: number|null}} RngDeckCommittedEvent */
 /** @typedef {{type: 'CARD_REVEALED', reveal: CardReveal}} CardRevealedEvent */
+/** @typedef {{type: 'CHAT', message: ChatMessage}} ChatEvent */
 /** @typedef {{type: 'RNG_AUDITED', proof: RngProof}} RngAuditedEvent */
 /** @typedef {{type: 'RNG_VOIDED', reason: RngVoidReason}} RngVoidedEvent */
 /** @typedef {{type: 'SEAT_CHANGED', seat: number, status: SeatStatus, stack: ChipsJson}} SeatChangedEvent */
@@ -358,7 +374,7 @@
  * The frozen table-event union. The two FR-6 event names of the *old* scheme
  * (`RNG_COMMITTED`, `RNG_REVEALED`) no longer exist.
  *
- * @typedef {HandStartedEvent|BlindPostedEvent|HoleCardsDealtEvent|ActionRequiredEvent|ActionTakenEvent|StreetAdvancedEvent|ShowdownEvent|PotAwardedEvent|HandCompleteEvent|RngSeedCommittedEvent|RngDeckCommittedEvent|CardRevealedEvent|RngAuditedEvent|RngVoidedEvent|SeatChangedEvent|TableStateEvent} TableEvent
+ * @typedef {HandStartedEvent|BlindPostedEvent|HoleCardsDealtEvent|ActionRequiredEvent|ActionTakenEvent|StreetAdvancedEvent|ShowdownEvent|PotAwardedEvent|HandCompleteEvent|RngSeedCommittedEvent|RngDeckCommittedEvent|CardRevealedEvent|RngAuditedEvent|RngVoidedEvent|SeatChangedEvent|ChatEvent|TableStateEvent} TableEvent
  */
 
 /**

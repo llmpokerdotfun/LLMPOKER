@@ -14,7 +14,16 @@
  */
 
 import { formatBps, formatDateTime, formatInt, formatRelative, parseChips, shortHex, tableMoney } from '../format.js';
-import { getActionRequest, getRevealedPositions, getState, startLive, subscribe } from '../live.js';
+import { getTableChat as fetchTableChat } from '../api.js';
+import {
+  getActionRequest,
+  getRevealedPositions,
+  getState,
+  getTableChat,
+  seedTableChat,
+  startLive,
+  subscribe,
+} from '../live.js';
 import {
   badge,
   banner,
@@ -37,6 +46,7 @@ import {
 } from '../ui.js';
 
 /** @typedef {import('../types.js').ActionRequest} ActionRequest */
+/** @typedef {import('../types.js').ChatMessage} ChatMessage */
 /** @typedef {import('../types.js').SeatSnapshot} SeatSnapshot */
 /** @typedef {import('../types.js').TableSnapshot} TableSnapshot */
 
@@ -99,9 +109,41 @@ function render() {
     return String(a.name ?? '').localeCompare(String(b.name ?? ''));
   });
 
+  // Table talk is seeded once, from the REST log; after that every new line
+  // arrives over the live feed as a CHAT table event.
+  if (!chatSeeded && state.tables.length > 0) {
+    chatSeeded = true;
+    void seedChat(state.tables);
+  }
+
   renderFeedWarning(state.connection, state.lastError, state.tables.length);
   renderSummary(state.tables);
   renderTables(tables, state.snapshotLoaded);
+}
+
+/** Guards the one-off chat fetch; `render` runs on every delta. */
+let chatSeeded = false;
+
+/**
+ * Reads each table's existing talk once, so a page loaded mid-conversation shows
+ * what was already said instead of starting blank.
+ *
+ * @param {TableSnapshot[]} tables
+ * @returns {Promise<void>}
+ */
+async function seedChat(tables) {
+  await Promise.all(
+    tables.map(async (table) => {
+      try {
+        const body = await fetchTableChat(table.id);
+        seedTableChat(table.id, body?.messages ?? []);
+      } catch {
+        // A table nobody has spoken at, or a feed hiccup. The strip stays empty
+        // and the next live line still lands, so there is nothing to report.
+      }
+    }),
+  );
+  render();
 }
 
 /**
@@ -342,6 +384,7 @@ function tableCard(table) {
             })
           : null,
       ),
+      chatBlock(table),
       potsBlock(table, money),
       configBlock(table, money),
     ),
@@ -470,6 +513,44 @@ function seatCard(seat, table) {
       seat.agentId ? ' ' : null,
       seat.agentId ? freshnessBadge(seat.agentLastSeenAt) : null,
     ),
+  );
+}
+
+/**
+ * Table talk for one table, oldest first.
+ *
+ * It sits with the table rather than in a side panel because it is the context a
+ * decision was made in: reading the board without reading what was said next to
+ * it loses half of what happened. Rendered only while a hand is in flight, since
+ * that is the only time the server accepts talk.
+ *
+ * @param {TableSnapshot} table
+ * @returns {HTMLElement|null}
+ */
+function chatBlock(table) {
+  if (!table.handId) return null;
+  // Only this hand's lines. The browser keeps a rolling tail of the table log so
+  // a reconnect is not blank, but next to the board a reader wants what was said
+  // *this* hand — which is also exactly what the agent's own prompt is given.
+  const lines = getTableChat(table.id).filter((line) => line.handId === table.handId);
+  return h(
+    'div',
+    { class: 'table-chat' },
+    h('span', { class: 'clock-label', text: 'table talk' }),
+    lines.length === 0
+      ? h('p', { class: 'chat-empty muted', text: 'Nothing said yet this table.' })
+      : h(
+          'ul',
+          { class: 'chat-log' },
+          lines.map((line) =>
+            h(
+              'li',
+              { class: 'chat-line' },
+              h('span', { class: 'chat-who', text: `${line.agentName} · seat ${line.seat}` }),
+              h('span', { class: 'chat-text', text: line.text }),
+            ),
+          ),
+        ),
   );
 }
 

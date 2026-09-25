@@ -22,6 +22,7 @@ import { setChromeInfo, setConnectionIndicator } from './ui.js';
 /**
  * @typedef {import('./types.js').ActionRequest} ActionRequest
  * @typedef {import('./types.js').AgentSnapshot} AgentSnapshot
+ * @typedef {import('./types.js').ChatMessage} ChatMessage
  * @typedef {import('./types.js').HandResult} HandResult
  * @typedef {import('./types.js').HandSummary} HandSummary
  * @typedef {import('./types.js').Mode} Mode
@@ -82,6 +83,39 @@ const actionRequests = new Map();
  * @type {Map<string, Set<number>>}
  */
 const revealedPositions = new Map();
+
+/**
+ * Table talk per table, oldest first.
+ *
+ * Bounded on purpose: this backs a strip on the page, not an archive. The server
+ * keeps the authoritative log for a table and each hand history keeps its own
+ * talk forever, so the browser only needs the recent tail.
+ */
+/** @type {Map<string, ChatMessage[]>} */
+const tableChat = new Map();
+
+/** Lines kept per table in the browser. */
+const CHAT_KEEP = 12;
+
+/**
+ * @param {string} tableId
+ * @returns {ChatMessage[]}
+ */
+export function getTableChat(tableId) {
+  return tableChat.get(tableId) ?? [];
+}
+
+/**
+ * Seeds a table's strip from `GET /tables/:id/chat`. Live lines then arrive as
+ * `CHAT` table events, so this is only needed once per page load.
+ *
+ * @param {string} tableId
+ * @param {ChatMessage[]} messages
+ * @returns {void}
+ */
+export function seedTableChat(tableId, messages) {
+  tableChat.set(tableId, Array.isArray(messages) ? messages.slice(-CHAT_KEEP) : []);
+}
 
 /** @type {WebSocket|null} */
 let socket = null;
@@ -366,6 +400,17 @@ function applyTableEventPayload(tableId, table, payload) {
     case 'TABLE_STATE':
       upsertTable(payload.table);
       return;
+    case 'CHAT': {
+      const message = payload.message;
+      if (!message || typeof message.text !== 'string') break;
+      /** @type {ChatMessage[]} */
+      const log = tableChat.get(tableId) ?? [];
+      // A reconnect re-seeds, and a replayed frame must not double a line.
+      if (!log.some((m) => m.seq === message.seq)) log.push(message);
+      if (log.length > CHAT_KEEP) log.splice(0, log.length - CHAT_KEEP);
+      tableChat.set(tableId, log);
+      break;
+    }
     case 'RNG_SEED_COMMITTED':
       // FR-6.1 phase 1: the commitment is public, the seed is not — and nothing
       // on the wire carries it, so no page can leak it.

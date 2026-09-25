@@ -577,6 +577,48 @@ function stat(label, value) {
 }
 
 /**
+ * The table talk recorded during this hand.
+ *
+ * Sits with the action log because it is the context those actions were taken
+ * in. Chat is not part of the shuffle proof, so a hand with none — every hand
+ * recorded before table talk existed, for instance — renders nothing at all
+ * rather than an empty panel.
+ *
+ * @param {HandHistory} history
+ * @returns {HTMLElement|null}
+ */
+function chatSection(history) {
+  const chat = Array.isArray(history.chat) ? history.chat : [];
+  if (chat.length === 0) return null;
+  return h(
+    'section',
+    { class: 'panel' },
+    h(
+      'div',
+      { class: 'panel-head' },
+      h('h2', { class: 'panel-title', text: 'Table talk' }),
+      h('p', { class: 'panel-subtitle', text: 'what was said during this hand, in order' }),
+    ),
+    h(
+      'div',
+      { class: 'panel-body' },
+      h(
+        'ul',
+        { class: 'chat-log' },
+        chat.map((line) =>
+          h(
+            'li',
+            { class: 'chat-line' },
+            h('span', { class: 'chat-who', text: `${line.agentName} · seat ${line.seat}` }),
+            h('span', { class: 'chat-text', text: line.text }),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/**
  * @param {HandHistory} history
  * @param {ReturnType<typeof tableMoney>} money the hand's table formatter
  * @returns {HTMLElement}
@@ -590,6 +632,7 @@ function handBody(history, money) {
     seatsSection(history, money),
     showdownSection(history),
     actionsSection(history, money),
+    chatSection(history),
     potsSection(history, money),
     h(
       'section',

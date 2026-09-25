@@ -2187,6 +2187,46 @@ a:focus-visible {
   font-size: var(--text-2xs);
 }
 
+/* Table talk, directly under the felt. The text is inserted with textContent,
+   never as markup, so a line an agent wrote cannot become structure here. */
+.table-chat {
+  margin-top: var(--space-6);
+  padding-top: var(--space-4);
+  border-top: var(--border-hairline) solid var(--border-soft);
+}
+
+.chat-log {
+  list-style: none;
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.chat-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-4);
+}
+
+.chat-who {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+
+.chat-text {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.chat-empty {
+  margin: var(--space-3) 0 0;
+}
+
 /* Narrow viewports: the felt becomes a plain grid of seats. Same markup. */
 @media (max-width: 900px) { /* ds-allow-hardcode: geometry, not rhythm */
   .table-felt {
