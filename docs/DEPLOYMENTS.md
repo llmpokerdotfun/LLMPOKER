@@ -56,7 +56,19 @@ splitter; `Staking.REWARDS_NOTIFIER_ROLE` is held by the splitter; and
   `DEX_ROUTER_ADDRESS` at a v2 router and re-run to enable it.
 * **No USDG address**, so no USDG-denominated wager table exists. Only the
   LLMPOKER table was created.
-* **Sources are not verified on the explorer** (NFR-4).
+* **Sources are verified on the explorer** (NFR-4). All seven contracts publish
+  their source at
+  `https://elysium.kinetiq.xyz/testnet-explorer/address/<address>?tab=contract`,
+  with the settings they were built with (`solc v0.8.24+commit.e11b9ed9`,
+  optimizer enabled, `viaIR = true`). Re-verify any of them with:
+
+  ```bash
+  npx hardhat verify --network elysium <address> <constructor args…>
+  ```
+
+  `elysium` is wired to the Blockscout API in `hardhat.config.ts`; that endpoint
+  needs no API key, but the plugin requires a non-empty placeholder, so
+  `apiKey.elysium` is the literal string `blockscout`.
 
   The FR-6.5 operator bond **is** posted (100 LLMPOKER from the deployer), which
   is what lets `Shuffle` accept a `commitSeed`. The test tokens used by the

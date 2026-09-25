@@ -14,6 +14,9 @@ import type { HardhatUserConfig } from 'hardhat/config';
 // suite uses is equivalent.
 import '@nomicfoundation/hardhat-ethers';
 import '@nomicfoundation/hardhat-chai-matchers';
+// Source verification (NFR-4). Elysium's explorer is Blockscout, which speaks the
+// Etherscan API, so the standard plugin works against a custom chain entry.
+import '@nomicfoundation/hardhat-verify';
 
 const RH_RPC_URL = process.env.RH_RPC_URL?.trim();
 const DEPLOYER_PRIVATE_KEY = process.env.DEPLOYER_PRIVATE_KEY?.trim();
@@ -74,6 +77,25 @@ const config: HardhatUserConfig = {
     tests: './test',
     cache: './cache',
     artifacts: './artifacts',
+  },
+  /**
+   * Blockscout on Elysium needs no API key, but the plugin refuses to run with an
+   * empty one, so a non-secret placeholder is supplied. `apiURL` is the
+   * Etherscan-compatible surface at the explorer root, *not* under
+   * `/testnet-explorer`.
+   */
+  etherscan: {
+    apiKey: { elysium: 'blockscout' },
+    customChains: [
+      {
+        network: 'elysium',
+        chainId: 99801,
+        urls: {
+          apiURL: 'https://elysium.kinetiq.xyz/api',
+          browserURL: 'https://elysium.kinetiq.xyz/testnet-explorer',
+        },
+      },
+    ],
   },
   networks,
   mocha: {
