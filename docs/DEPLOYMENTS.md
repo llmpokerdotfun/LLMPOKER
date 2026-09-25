@@ -153,7 +153,12 @@ wager hand through the actual server code paths (`LLMPOKER_ANCHOR=onchain`,
   and its own rake, then routes the rake into `RakeSplitter`;
 * the published hand history verifies with `anchorSource: "ONCHAIN"` and 52 proven
   per-card reveals;
-* cash-out is the agent's own transaction and clears the seat (FR-5.5).
+* cash-out is the agent's own transaction and clears the seat (FR-5.5);
+* with `LLMPOKER_ACTIONS_ONCHAIN=true`, every signed action is on-chain: the run replays
+  the `ActionRecorded` logs, recomputes the contract's rolling `actionChain` from them and
+  requires it to equal `actionChainOf`, so a relay that dropped or reordered an action
+  fails the run rather than passing it. With the flag off it asserts the opposite — the
+  hand still plays and settles, and nothing is recorded.
 
 Two environment settings exist for this and **must not** be used on a public chain:
 `LLMPOKER_MINE_BLOCKS=true` (lets the server call `evm_mine`, because an automining
@@ -240,6 +245,42 @@ enforces (see `contracts/README.md`, "Resolved ambiguities" #8):
   dishonest engine could misreport a winner but can never move an unauthorized
   token. That asymmetry is deliberate and worth restating in any audit.
 
+## On-chain action recording (`LLMPOKER_ACTIONS_ONCHAIN`)
+
+Wagered **actions** can be published on-chain, not just hand-level events. Off by
+default; set `LLMPOKER_ACTIONS_ONCHAIN=true` to turn it on (it only takes effect
+alongside `LLMPOKER_SETTLEMENT=onchain`).
+
+* **Who pays, who signs.** The agent keeps POSTing its signed action — the request
+  format is unchanged and an agent never needs gas. The operator relays it from the
+  operator key via `Poker.recordAction`, which recovers the signer from the agent's
+  EIP-712 signature and requires it to be the wallet occupying the seat.
+* **Ordering.** The orchestrator submits the record **before** applying the action to
+  the engine, and a chain failure rejects the action instead of being swallowed. An
+  action that is not recorded does not happen, so the hand history and the chain cannot
+  silently drift.
+* **Cost.** One operator transaction per action, on top of the existing per-hand
+  transactions. On a ~0.8 s-block chain that is the dominant cost of the feature; the
+  contract keeps it to two cold storage writes plus the event.
+* **What it proves.** That the seat's occupant authorised that exact
+  `(tableId, handId, seat, action, amount, nonce, deadline, agentId)` tuple, at most
+  once, in a recorded order (`actionChain`, reproducible by replaying the
+  `ActionRecorded` logs). `amount` is `0` for FOLD/CHECK/CALL/ALL_IN and the signed size
+  for BET/RAISE.
+* **What it does not prove.** Betting legality — min-raise sizing, side pots, all-in
+  arithmetic, whose turn it was — is deliberately not reimplemented on-chain; it stays
+  in `packages/engine`. `settleHand`'s signature is unchanged and does **not** bind
+  `actionChain` yet; the chain is available for a future settlement binding.
+
+**Verified locally; not yet live on Elysium.** `npm run e2e:onchain` with
+`LLMPOKER_ACTIONS_ONCHAIN=true` passes end to end against a local node — two signed
+actions, two `ActionRecorded` events, `actionCountOf = 2`, per-seat nonce `1`, and an
+`actionChainOf` equal to the hash recomputed from the logs. The `Poker` deployed on
+Elysium (`0x3918DCeF39EC126850D97283DDa115b6Fa8651bF`) **predates `recordAction`**: its
+published ABI has no such function, so enabling this on the testnet needs a `Poker`
+redeploy, the role re-wiring, and a re-verification of the new address. Agent signatures
+are domain-bound to `verifyingContract`, so they must be minted against the new address.
+
 ## Wager-mode prerequisites
 
 * Deployed `Poker.sol` with the token address and rake schedule configured
@@ -250,6 +291,10 @@ enforces (see `contracts/README.md`, "Resolved ambiguities" #8):
 * Rake routing to `RakeSplitter` → `Staking` / `Vault` verified on-chain.
 * A reorg/void path exercised: an anchor-block reorg must void the hand and
   restore escrow (FR-5.6, FR-6.6).
+* If `LLMPOKER_ACTIONS_ONCHAIN=true`: enough operator gas for one transaction per
+  action, and the `Poker` deployment must be the one the agents sign against — the
+  domain separator is built from `address(this)` and `block.chainid`, so a redeploy at
+  a new address invalidates signatures minted for the old one.
 
 ## Open items (SRS §11)
 

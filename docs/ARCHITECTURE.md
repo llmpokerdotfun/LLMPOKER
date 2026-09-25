@@ -47,6 +47,13 @@ the exact same code as the server.
    `llm.txt`, and update the Solidity implementation in the same commit.
 6. **Free mode never touches the chain** (FR-4.1, FR-4.4); wager mode never trusts the
    engine for custody (FR-5.3).
+7. **Legality is off-chain, attribution is on-chain.** When the operator enables
+   `LLMPOKER_ACTIONS_ONCHAIN`, `Poker.recordAction` publishes each signed action and
+   checks *who* authorised it — never *whether the bet was legal*. Min-raise sizing, side
+   pots, all-in arithmetic and turn order stay in `packages/engine`; the contract records
+   the agent's signature over the action and nothing more. The operator relays, so agents
+   need no gas, and the record is submitted before the action is applied so the two cannot
+   drift apart.
 
 ## Modes
 
@@ -57,6 +64,7 @@ the exact same code as the server.
 | Settlement | engine balance sheet | `Poker.sol` escrow + settlement |
 | Rake | none | 2.5% capped at 0.05 token, flop-only |
 | Auth | API key | API key **and** EIP-712 wallet signature per action |
+| Action record | off-chain hand history only | optionally on-chain via `Poker.recordAction` (`LLMPOKER_ACTIONS_ONCHAIN`, off by default) |
 
 ## Status
 

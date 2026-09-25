@@ -16,8 +16,18 @@ import { execSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { JsonRpcProvider, Contract, Wallet, parseEther, keccak256, toUtf8Bytes } from 'ethers';
-import type { HDNodeWallet } from 'ethers';
+import {
+  AbiCoder,
+  Contract,
+  Interface,
+  JsonRpcProvider,
+  Wallet,
+  ZeroHash,
+  keccak256,
+  parseEther,
+  toUtf8Bytes,
+} from 'ethers';
+import type { HDNodeWallet, InterfaceAbi } from 'ethers';
 import { AGENT_ACTION_TYPES, type HandHistory } from '@llmpoker/shared';
 import { verifyHandHistory } from '@llmpoker/verifier';
 import { buildApp } from '../packages/server/src/app.js';
@@ -59,6 +69,9 @@ interface PokerAbi {
   escrowBalanceOf(tableId: string, seat: number): Promise<bigint>;
   totalEscrowObserved(settlementToken: string): Promise<bigint>;
   pendingHandsOf(tableId: string): Promise<bigint>;
+  actionCountOf(handId: string): Promise<bigint>;
+  actionChainOf(handId: string): Promise<string>;
+  lastActionNonceOf(handId: string, seat: number): Promise<bigint>;
 }
 interface ShuffleAbi {
   requiredBond(): Promise<bigint>;
@@ -70,27 +83,32 @@ interface StakingAbi {
 }
 
 /** `ethers.Contract` is dynamically typed; this keeps one cast per call site. */
-function bind<T>(address: string, abi: string[], signer: Wallet | HDNodeWallet): T {
+function bind<T>(address: string, abi: InterfaceAbi, signer: Wallet | HDNodeWallet): T {
   return new Contract(address, abi, signer) as unknown as T;
 }
 
-const ERC20_ABI = [
-  'function transfer(address to, uint256 amount) returns (bool)',
-  'function approve(address spender, uint256 amount) returns (bool)',
-  'function balanceOf(address account) view returns (uint256)',
-];
-const POKER_ABI = [
-  'function deposit(bytes32 tableId, uint8 seat, uint256 amount)',
-  'function cashOut(bytes32 tableId, uint8 seat)',
-  'function escrowBalanceOf(bytes32 tableId, uint8 seat) view returns (uint256)',
-  'function totalEscrowObserved(address settlementToken) view returns (uint256)',
-  'function pendingHandsOf(bytes32 tableId) view returns (uint256)',
-];
-const SHUFFLE_ABI = [
-  'function requiredBond() view returns (uint256)',
-  'function postBond(uint256 amount)',
-  'function bondOf(address account) view returns (uint256)',
-];
+/**
+ * The compiled ABI, never a hand-written copy.
+ *
+ * A hand-written `ActionRecorded` signature that omitted `indexed` on `seat` cost real debugging
+ * time: `indexed` changes both the topic layout and the signature hash, so `parseLog` threw for
+ * every genuine event and the run reported "0 actions recorded" while the chain held 2. Reading
+ * the artifact makes that divergence impossible — these scripts and the contract cannot disagree
+ * about a name, an order or an `indexed` keyword.
+ */
+function loadAbi(contract: string): InterfaceAbi {
+  const file = join(process.cwd(), 'contracts', 'artifacts', 'src', `${contract}.sol`, `${contract}.json`);
+  try {
+    return (JSON.parse(readFileSync(file, 'utf8')) as { abi: InterfaceAbi }).abi;
+  } catch {
+    throw new Error(`missing or unreadable artifact ${file} — compile the contracts first`);
+  }
+}
+
+const ERC20_ABI = loadAbi('Token');
+const POKER_ABI = loadAbi('Poker');
+const SHUFFLE_ABI = loadAbi('Shuffle');
+const STAKING_ABI = loadAbi('Staking');
 
 async function rpcAlive(): Promise<boolean> {
   try {
@@ -156,7 +174,7 @@ async function main(): Promise<void> {
   const token = bind<Erc20Abi>(addresses.token, ERC20_ABI, owner);
   const poker = bind<PokerAbi>(addresses.poker, POKER_ABI, owner);
   const shuffle = bind<ShuffleAbi>(addresses.shuffle, SHUFFLE_ABI, owner);
-  const staking = bind<StakingAbi>(addresses.staking, ['function totalStaked() view returns (uint256)'], owner);
+  const staking = bind<StakingAbi>(addresses.staking, STAKING_ABI, owner);
   const tableId32 = keccak256(toUtf8Bytes(TABLE_ID));
 
   // FR-6.5: the operator must have bonded before it can commit a seed. Checked
@@ -198,6 +216,11 @@ async function main(): Promise<void> {
     LLMPOKER_FREE_TABLES: '1',
     LLMPOKER_TICK_MS: '150',
     LLMPOKER_LOG_LEVEL: 'warn',
+    // Forwarded rather than hard-coded because this run is the only place the
+    // server -> chain action relay is exercised end to end: the config below is a
+    // literal, so without this line `LLMPOKER_ACTIONS_ONCHAIN=true` in the shell
+    // would be ignored and the run would prove nothing about recording.
+    LLMPOKER_ACTIONS_ONCHAIN: process.env.LLMPOKER_ACTIONS_ONCHAIN ?? 'false',
   } as NodeJS.ProcessEnv);
 
   const store = new Store({ dataDir, persist: true });
@@ -217,6 +240,10 @@ async function main(): Promise<void> {
   const { app, close } = await buildApp({ config, store, orchestrator });
   orchestrator.start();
 
+  // Tracked explicitly rather than read back from `process.exitCode`: `process.exit(1)` only runs
+  // in the outer `.catch()`, i.e. *after* this `finally`, so during a thrown failure `exitCode` is
+  // still 0 and the check below would delete the directory it means to preserve.
+  let failed = false;
   try {
     // -- two agents, each funding its own seat with its own key (FR-5.3) -----
     const agents: { name: string; wallet: HDNodeWallet; apiKey: string; agentId: string; seat: number }[] = [];
@@ -273,6 +300,10 @@ async function main(): Promise<void> {
     // rejects a seat whose hand is still Open, so we need this hand to settle.
     let completed = false;
     let paused = false;
+    // Every action the agents actually signed, in the order they sent it. The
+    // on-chain record is checked against this list below, so a relay that silently
+    // dropped or reordered an action fails the run instead of passing it.
+    const sentActions: { seat: number; action: number; amount: bigint; nonce: bigint; signer: string }[] = [];
     for (let guard = 0; guard < 2400 && !completed; guard++) {
       const table = orchestrator.getTable(TABLE_ID);
       const hand = table.state.hand;
@@ -319,6 +350,13 @@ async function main(): Promise<void> {
         },
       });
       if (response.statusCode !== 200) throw new Error(`act failed: ${response.body}`);
+      sentActions.push({
+        seat: request.seat,
+        action: actionEnum.ALL_IN!,
+        amount: 0n,
+        nonce,
+        signer: (await agent.wallet.getAddress()).toLowerCase(),
+      });
       completed = (response.json() as { complete: boolean }).complete;
     }
     if (!completed) throw new Error('the hand never finished');
@@ -381,6 +419,93 @@ async function main(): Promise<void> {
     log(`  pending hands on-chain after settlement: ${pending}`);
     if (pending !== 0n) throw new Error('the contract still reports an open hand; settlement did not land');
 
+    // -- the on-chain action record (FR-10.4 attribution) ----------------------
+    // Recording is the one part of this run that fails *silently* when it is off: the
+    // hand plays out identically either way, so "no exception" proves nothing. This
+    // recomputes the contract's own rolling hash from the emitted events and compares
+    // it to the value the contract stored, so a relay that dropped or reordered an
+    // action fails the run instead of passing it.
+    if (config.actionsOnChain) {
+      const handId32 = keccak256(toUtf8Bytes(history.result.handId));
+      const iface = new Interface(POKER_ABI);
+      const logs = await provider.getLogs({ address: addresses.poker, fromBlock: 0, toBlock: 'latest' });
+      const recorded = logs
+        .map((entry) => {
+          try {
+            return iface.parseLog({ topics: [...entry.topics], data: entry.data });
+          } catch {
+            return null; // some other event on the same contract, not in this minimal ABI
+          }
+        })
+        .filter(
+          (parsed) =>
+            parsed?.name === 'ActionRecorded' &&
+            String(parsed.args['handId']).toLowerCase() === handId32,
+        );
+
+      log(`\nactions recorded on-chain: ${recorded.length} (agents signed ${sentActions.length})`);
+      if (recorded.length === 0) throw new Error('no ActionRecorded events: the relay never happened');
+      if (recorded.length !== sentActions.length) {
+        throw new Error(
+          `the chain recorded ${recorded.length} actions but the agents signed ${sentActions.length}`,
+        );
+      }
+
+      const coder = AbiCoder.defaultAbiCoder();
+      let chain = ZeroHash;
+      recorded.forEach((parsed, index) => {
+        const args = parsed!.args;
+        const expected = sentActions[index]!;
+        const seat = Number(args['seat']);
+        const action = Number(args['action']);
+        const amount = BigInt(args['amount'] as bigint);
+        const nonce = BigInt(args['nonce'] as bigint);
+        const signer = String(args['signer']).toLowerCase();
+        if (
+          seat !== expected.seat ||
+          action !== expected.action ||
+          amount !== expected.amount ||
+          nonce !== expected.nonce
+        ) {
+          throw new Error(
+            `action ${index} on-chain (seat ${seat}, action ${action}, amount ${amount}, nonce ${nonce}) ` +
+              `does not match what the agent signed (seat ${expected.seat}, action ${expected.action}, ` +
+              `amount ${expected.amount}, nonce ${expected.nonce})`,
+          );
+        }
+        // The attribution claim: the action was authorised by the wallet funding the seat.
+        if (signer !== expected.signer) {
+          throw new Error(
+            `action ${index} was recorded against ${signer}, not the signing wallet ${expected.signer}`,
+          );
+        }
+        chain = keccak256(
+          coder.encode(
+            ['bytes32', 'bytes32', 'bytes32', 'uint8', 'uint8', 'uint256', 'uint256'],
+            [chain, tableId32, handId32, seat, action, amount, nonce],
+          ),
+        );
+        log(`  #${index} seat ${seat} action ${action} amount ${amount} nonce ${nonce} signer ${signer}`);
+      });
+
+      const count = await poker.actionCountOf(handId32);
+      const storedChain = await poker.actionChainOf(handId32);
+      if (count !== BigInt(recorded.length)) {
+        throw new Error(`actionCountOf is ${count} but ${recorded.length} events were emitted`);
+      }
+      if (storedChain !== chain) {
+        throw new Error(
+          `actionChainOf ${storedChain} does not match the chain recomputed from the events ${chain}`,
+        );
+      }
+      log(`  actionChainOf matches the chain recomputed from the events: ${storedChain}`);
+      for (const seat of [0, 1]) {
+        log(`  lastActionNonceOf(seat ${seat}) = ${await poker.lastActionNonceOf(handId32, seat)}`);
+      }
+    } else {
+      log('\nLLMPOKER_ACTIONS_ONCHAIN is off: the hand played but nothing was recorded on-chain');
+    }
+
     // FR-5.5: cash-out is the agent's own transaction. The table was paused before
     // the hand was played out, so the seat is idle and the contract will accept it.
     const agentA = agents[0]!;
@@ -408,13 +533,16 @@ async function main(): Promise<void> {
       throw new Error(`rake did not reach the house path: expected at least ${rake}, found ${houseBalances}`);
     }
     log('\nON-CHAIN ACCEPTANCE RUN PASSED');
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
     await close();
     // Keep the directory when the run failed. Against a real network a failed run
     // can leave a hand open on-chain, and the engine state in here is the only
     // material that can settle or explain it. Deleting it on the way out turned a
     // recoverable failure into a permanent one.
-    if (process.exitCode) log(`run failed; kept the data directory for inspection: ${dataDir}`);
+    if (failed) log(`run failed; kept the data directory for inspection: ${dataDir}`);
     else rmSync(dataDir, { recursive: true, force: true });
   }
 }

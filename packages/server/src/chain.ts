@@ -357,6 +357,29 @@ export interface SeatContribution {
   amount: bigint;
 }
 
+/**
+ * One wagered action the operator relays to `Poker.recordAction`, already signed by the agent.
+ *
+ * `tableId`/`handId` are the server's strings (the adapter hashes them); `agentId` is the id the
+ * signature covers. Nothing here is trusted: the contract recovers the signer from `signature` over
+ * exactly these fields and requires it to be the seat's occupant, so the operator can relay an
+ * action but cannot author or alter one.
+ */
+export interface RecordActionParams {
+  tableId: string;
+  handId: string;
+  seat: number;
+  /** `ActionType` enum: `FOLD=0, CHECK=1, CALL=2, BET=3, RAISE=4, ALL_IN=5`. */
+  action: number;
+  /** `0` for FOLD/CHECK/CALL/ALL_IN; the signed size for BET/RAISE. */
+  amount: bigint;
+  nonce: bigint;
+  /** Unix seconds, matching what the agent signed. */
+  deadline: number;
+  agentId: string;
+  signature: string;
+}
+
 export interface SettleHandParams {
   tableId: string;
   handId: string;
@@ -392,6 +415,20 @@ export interface SettlementAdapter {
   openHand(tableId: string, handId: string, seats: number[]): Promise<SettlementReceipt | null>;
   /** FR-5.2: moves one seat's contribution out of escrow into the pot. */
   commitHand(tableId: string, handId: string, seat: number, amount: bigint): Promise<SettlementReceipt | null>;
+  /**
+   * FR-10.4 companion: publishes one agent action, authorised by the agent's own signature.
+   *
+   * The operator relays; the agent keeps the pen. The agent POSTs its signed action to the server
+   * exactly as before and never needs gas — the on-chain adapter submits this call from the
+   * operator key, and the contract checks the signature against the wallet occupying the seat. The
+   * local adapter only mirrors the record (see `LocalEscrow.recordAction`), so free mode and the
+   * agent-facing HTTP contract are unchanged either way; the flag in `config.actionsOnChain` decides
+   * whether the orchestrator calls this at all.
+   *
+   * Must **reject on failure**: an action that cannot be recorded must not be applied to the engine,
+   * otherwise the server's hand history and the on-chain record diverge silently.
+   */
+  recordAction(params: RecordActionParams): Promise<SettlementReceipt | null>;
   /** FR-5.2/5.4: verifies the pot, takes rake on-chain and credits the winners. */
   settleHand(params: SettleHandParams): Promise<SettlementReceipt>;
   /** FR-5.6/6.6: voids a hand and restores every contribution to escrow. */
@@ -425,6 +462,10 @@ export class LocalEscrow implements SettlementAdapter {
   private block = 0;
   /** Local mirrors accept an openHand/commitHand call without doing anything. */
   private readonly openHands = new Map<string, Set<number>>();
+  /** Highest action nonce seen per `handId:seat`, mirroring the contract's replay guard. */
+  private readonly lastActionNonces = new Map<string, bigint>();
+  /** Actions recorded per hand, in order. The chain's `actionChain` is a hash of exactly this. */
+  private readonly actionRecord = new Map<string, RecordActionParams[]>();
 
   private key(agentId: string, tableId: string): string {
     return `${tableId}:${agentId}`;
@@ -454,6 +495,38 @@ export class LocalEscrow implements SettlementAdapter {
 
   async commitHand(): Promise<SettlementReceipt | null> {
     return null;
+  }
+
+  /**
+   * Local mirror of `Poker.recordAction`.
+   *
+   * There is no chain here, so there is nothing to verify against and no gas to spend: the server
+   * has already checked the agent's signature (`verifySignature` in `app.ts`) and its per-hand nonce
+   * before the orchestrator is ever called. Keeping the action here — rather than returning `null`
+   * and forgetting it — means the mirror carries the same ordered record the contract would, so a
+   * reader of the local ledger sees the same shape as an on-chain one.
+   *
+   * Monotonic per `(handId, seat)`, matching the contract's replay rule, so a caller that replays a
+   * signature fails the same way in both modes.
+   */
+  async recordAction(params: RecordActionParams): Promise<SettlementReceipt> {
+    const key = `${params.handId}:${params.seat}`;
+    const previous = this.lastActionNonces.get(key);
+    if (previous !== undefined && params.nonce <= previous) {
+      throw new Error(
+        `action nonce ${params.nonce} for ${key} is not greater than the recorded ${previous} (replay)`,
+      );
+    }
+    this.lastActionNonces.set(key, params.nonce);
+    const recorded = this.actionRecord.get(params.handId) ?? [];
+    recorded.push({ ...params });
+    this.actionRecord.set(params.handId, recorded);
+    return this.receipt(`action:${params.tableId}:${params.handId}:${params.seat}:${params.action}:${params.nonce}`);
+  }
+
+  /** The ordered action record this mirror holds for a hand (local-mode equivalent of the chain). */
+  actionsFor(handId: string): RecordActionParams[] {
+    return [...(this.actionRecord.get(handId) ?? [])];
   }
 
   async voidHand(): Promise<SettlementReceipt | null> {
@@ -531,6 +604,17 @@ interface PokerContract {
   createTable(tableId: string, config: Record<string, unknown>, settlementToken: string): Promise<{ hash: string }>;
   openHand(tableId: string, handId: string, seats: number[]): Promise<{ hash: string }>;
   commitHand(tableId: string, handId: string, seat: number, amount: bigint): Promise<{ hash: string }>;
+  recordAction(
+    tableId: string,
+    handId: string,
+    seat: number,
+    action: number,
+    amount: bigint,
+    nonce: bigint,
+    deadline: bigint,
+    agentId: string,
+    signature: string,
+  ): Promise<{ hash: string }>;
   settleHand(
     tableId: string,
     handId: string,
@@ -604,6 +688,7 @@ export class OnChainSettlement implements SettlementAdapter {
         'function createTable(bytes32 tableId, (uint256 smallBlind,uint256 bigBlind,uint256 minBuyIn,uint256 maxBuyIn,uint16 rakeBps,uint256 rakeCap,uint8 maxSeats) config, address settlementToken)',
         'function openHand(bytes32 tableId, bytes32 handId, uint8[] seats)',
         'function commitHand(bytes32 tableId, bytes32 handId, uint8 seat, uint256 amount)',
+        'function recordAction(bytes32 tableId, bytes32 handId, uint8 seat, uint8 action, uint256 amount, uint256 nonce, uint256 deadline, string agentId, bytes signature)',
         'function settleHand(bytes32 tableId, bytes32 handId, uint256[] contributions, uint8[] winners, uint256[] awards, bool sawFlop)',
         'function voidHand(bytes32 tableId, bytes32 handId)',
         'function tableConfigOf(bytes32 tableId) view returns ((uint256 smallBlind,uint256 bigBlind,uint256 minBuyIn,uint256 maxBuyIn,uint16 rakeBps,uint256 rakeCap,uint8 maxSeats))',
@@ -708,6 +793,36 @@ export class OnChainSettlement implements SettlementAdapter {
     const poker = await this.getPoker();
     const tx = await poker.commitHand(await this.id32(tableId), await this.id32(handId), seat, amount);
     return { ...(await this.mined(tx.hash)), note: `commitHand:${handId}:${seat}` };
+  }
+
+  /**
+   * FR-10.4 companion: relays one signed agent action to `Poker.recordAction`.
+   *
+   * The transaction is sent from the operator key (this wallet is `Wallet(this.privateKey, provider)`
+   * in `getPoker`), which is the whole point of the design: the agent signs, the operator pays. The
+   * contract recovers the signer from `signature` over the very fields the server verified — the
+   * `AgentAction` typed data with `agentId` included — and requires it to be the seat's occupant, so
+   * a relay can never invent an action, and a failed relay is surfaced rather than applied.
+   *
+   * `deadline` is sent as the agent signed it. The contract compares it against `block.timestamp`,
+   * not against the server's clock, so this is the one place a long operator queue can turn a valid
+   * signature into an `ActionExpired` revert — which is the intended behaviour: a stale action is
+   * refused instead of silently landing.
+   */
+  async recordAction(params: RecordActionParams): Promise<SettlementReceipt> {
+    const poker = await this.getPoker();
+    const tx = await poker.recordAction(
+      await this.id32(params.tableId),
+      await this.id32(params.handId),
+      params.seat,
+      params.action,
+      params.amount,
+      params.nonce,
+      BigInt(params.deadline),
+      params.agentId,
+      params.signature,
+    );
+    return { ...(await this.mined(tx.hash)), note: `recordAction:${params.handId}:${params.seat}:${params.action}` };
   }
 
   /**

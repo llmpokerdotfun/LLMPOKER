@@ -97,8 +97,17 @@ export const USDG_TABLE_CONFIG = {
   maxSeats: 6,
 } as const;
 
-export const TABLE_ID = ethers.encodeBytes32String('low-1');
-export const USDG_TABLE_ID = ethers.encodeBytes32String('usdg-1');
+/**
+ * The on-chain id of the two wager tables the fixture creates.
+ *
+ * `keccak256(utf8(id))`, which is how the server derives them (`id32`/`handId32` in
+ * `packages/server/src/chain.ts` and the `agentActionDigest` message it signs), **not**
+ * `encodeBytes32String`: the latter left-aligns the ASCII bytes, producing a different word. The
+ * distinction is invisible to tests that only round-trip a local constant, and fatal to any test
+ * that checks a digest the server and the contract both derive from the id.
+ */
+export const TABLE_ID = ethers.id('low-1');
+export const USDG_TABLE_ID = ethers.id('usdg-1');
 
 /** `keccak256(abi.encodePacked(bytes32 tableId, uint8 seat))`, mirroring `Poker._seatKey`. */
 export function seatKey(tableId: TableId, seat: number): string {
@@ -478,6 +487,17 @@ export interface SnapshotFixture {
   reset(): Promise<void>;
 }
 
+/**
+ * Deploy the stack once and hand back a rewindable snapshot.
+ *
+ * A test suite that needs extra state to exist for *every* case should build it after the deployment
+ * and before `takeSnapshot()`, so `reset()` brings it back rather than the suite re-creating it each
+ * time. That also keeps a client-side signer's transaction nonce aligned with the restored chain: the
+ * node rewinds to the snapshot, and so does the nonce that signer has already spent.
+ *
+ * @param requiredConfirmations Shuffle finality threshold (FR-6.5); tests use small values to keep
+ *        block mining cheap while still exercising the ordering constraint.
+ */
 export async function snapshotFixture(requiredConfirmations: bigint = 2n): Promise<SnapshotFixture> {
   const stack = await deployStack(requiredConfirmations);
   const snapshot = await takeSnapshot();

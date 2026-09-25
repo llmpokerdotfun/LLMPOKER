@@ -25,6 +25,7 @@ import {
   type TableConfig,
   type TableEvent,
   type TableSnapshot,
+  actionToEnum,
   bytesToHex,
   bytesToHex32,
   CHAT_CONTEXT_MESSAGES,
@@ -120,6 +121,20 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 /** Play chips every new agent is granted at registration (see store.createAgent). */
 const FREE_CHIP_GRANT = 10_000n;
 
+/**
+ * The signed material the act handler verified, when on-chain action recording is enabled.
+ *
+ * Deliberately *not* part of the acting API: free play has no signatures and must keep working, so
+ * an action without this option is simply not relayed. The signature is passed through untouched —
+ * the orchestrator never re-derives or re-signs it, because the contract recovers the agent's wallet
+ * from it and a single altered byte would (correctly) be rejected.
+ */
+export interface ActOnChainOptions {
+  signature: string;
+  nonce: bigint;
+  deadline: number;
+}
+
 /** Seats that will be dealt into the next hand, in ascending order. */
 function fundedSeatIndexes(state: TableState): number[] {
   return state.seats
@@ -148,7 +163,12 @@ export class Orchestrator extends EventEmitter {
   readonly config: ServerConfig;
   readonly store: Store;
   readonly anchor: AnchorProvider;
-  readonly settlement: SettlementAdapter;
+  /**
+   * The settlement adapter. Deliberately **not** `readonly`: `actionsOnChain` is gated on the
+   * adapter's own `kind`, so a test can swap in an `ONCHAIN`-flagged recording stand-in without an
+   * RPC or an operator key and still exercise the real relay path (see `actions-onchain.test.ts`).
+   */
+  settlement: SettlementAdapter;
   readonly tables = new Map<string, ManagedTable>();
   private readonly now: () => number;
   private readonly log: NonNullable<OrchestratorOptions['log']>;
@@ -963,14 +983,34 @@ export class Orchestrator extends EventEmitter {
     return [...this.getTable(tableId).chat];
   }
 
-  /** Applies an agent action. The caller has already authenticated the agent. */
-  async act(agentId: string, tableId: string, action: PlayerAction, now = this.now()): Promise<TableStep> {
+  /**
+   * Applies an agent action. The caller has already authenticated the agent.
+   *
+   * @param action The engine-facing action; illegality is the engine's to reject.
+   * @param options The agent's signed material, present only for a wager-mode action when the
+   *        operator has enabled on-chain recording. See `recordActionOnChain`.
+   */
+  async act(
+    agentId: string,
+    tableId: string,
+    action: PlayerAction,
+    options: { onChain?: ActOnChainOptions } = {},
+    now = this.now(),
+  ): Promise<TableStep> {
     const table = this.getTable(tableId);
     const seat = table.state.seats.find((s) => s.agentId === agentId);
     if (!seat) throw new EngineError('SEAT_NOT_FOUND', `agent ${agentId} is not seated at ${tableId}`);
 
     const hand = table.state.hand;
     if (!hand || hand.complete) throw new EngineError('HAND_NOT_FOUND', `table ${tableId} has no live hand`);
+
+    // FR-10.4 companion: publish the signed action *before* it becomes real. An action the operator
+    // cannot record is rejected outright rather than applied and left unverifiable — the point of
+    // the record is that the hand history and the chain agree, and that only holds if the chain call
+    // precedes the engine call. Errors propagate to the act handler; they are never swallowed.
+    if (options.onChain) {
+      await this.recordActionOnChain(table, agentId, seat.seat, hand.handId, action, options.onChain);
+    }
 
     const step = actOnTable(table.state, seat.seat, action, now, 'AGENT');
     await this.applyStep(table, step, now);
@@ -986,6 +1026,44 @@ export class Orchestrator extends EventEmitter {
     }
 
     return step;
+  }
+
+  /**
+   * Relays one signed action to `Poker.recordAction`, or does nothing when recording is off.
+   *
+   * Recording needs **both** the operator's flag and a real chain to record into. With the local
+   * mirror there is no `Poker.sol`, so relaying would be theatre — and the flag being off means the
+   * mirror is never touched either, so an operator that has not opted in gets the old behaviour
+   * exactly.
+   *
+   * The amount is the engine's own reading of the action rather than anything the operator invents:
+   * `0` for FOLD/CHECK/CALL/ALL_IN and the signed size for BET/RAISE. It has to match the signed
+   * payload or the contract's signature check fails, which is what makes the record trustworthy —
+   * an operator can drop an action, but it cannot alter one.
+   */
+  private async recordActionOnChain(
+    table: ManagedTable,
+    agentId: string,
+    seat: number,
+    handId: string,
+    action: PlayerAction,
+    signed: ActOnChainOptions,
+  ): Promise<void> {
+    if (!this.config.actionsOnChain || this.settlement.kind !== 'ONCHAIN') return;
+    const receipt = await this.settlement.recordAction({
+      tableId: table.state.config.id,
+      handId,
+      seat,
+      action: actionToEnum(action.action),
+      amount: action.amount ?? 0n,
+      nonce: signed.nonce,
+      deadline: signed.deadline,
+      agentId,
+      // Passed through untouched: the contract recovers the agent's wallet from these bytes, so a
+      // re-encrypted or re-derived signature would (correctly) be rejected.
+      signature: signed.signature,
+    });
+    if (receipt) this.log('debug', `action ${action.action} on ${handId}#${seat} recorded on-chain in ${receipt.txHash}`);
   }
 
   /** The private turn notification for the seat on the clock, if any. */

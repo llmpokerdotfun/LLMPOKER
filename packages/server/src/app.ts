@@ -555,6 +555,7 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
     const hand = table.state.hand;
 
     // FR-1.3 / FR-10.4: wager-mode actions are signed and nonce-protected.
+    let signedAction: { signature: string; nonce: bigint; deadline: number } | null = null;
     if (table.state.config.mode === 'WAGER') {
       if (!body?.signature || !body.nonce || !body.deadline || !hand) {
         return reply.code(401).send({
@@ -596,6 +597,12 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
         return reply.code(409).send({ error: { code: 'REPLAY', message: 'nonce already used for this hand' } });
       }
       void actionDigest; // digest helper is exported for agents/tests
+
+      // The same bytes the server just verified are handed to the orchestrator, which relays them to
+      // `Poker.recordAction` when the operator has turned recording on. Nothing is re-signed or
+      // re-derived: the contract recovers the agent's wallet from exactly this signature, so a
+      // re-encoding would (correctly) be refused.
+      signedAction = { signature: body.signature, nonce, deadline };
     }
 
     // Table talk rides with the move, so an agent can say why it is doing what
@@ -611,7 +618,9 @@ export async function buildApp(deps: AppDeps): Promise<BuiltApp> {
     }
 
     try {
-      const step = await orchestrator.act(agent.id, id, shape.action);
+      // Wager mode passes the verified signature through (see above); free mode has none to pass.
+      const options = signedAction ? { onChain: signedAction } : {};
+      const step = await orchestrator.act(agent.id, id, shape.action, options);
       return {
         accepted: true,
         handId: step.table.hand?.handId ?? null,

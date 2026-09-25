@@ -61,6 +61,18 @@ export interface ServerConfig {
   wagerAnchorConfirmations: number;
   rngAnchor: AnchorMode;
   settlement: SettlementMode;
+  /**
+   * Record every wagered action on-chain through `Poker.recordAction`, with the operator relaying
+   * the agent's own EIP-712 signature (FR-10.4 companion).
+   *
+   * Off by default (`LLMPOKER_ACTIONS_ONCHAIN`), so a deployment that does not ask for it behaves
+   * exactly as before: actions stay in the server's off-chain hand history. When on **and**
+   * `settlement` is `onchain`, the orchestrator submits the record *before* applying the action to
+   * the engine, so an action that cannot be recorded does not happen — the cost being one extra
+   * operator transaction per action on the chain's block time. Free mode is never affected: it has
+   * no `Poker.sol` to record into and stays entirely off-chain.
+   */
+  actionsOnChain: boolean;
   contracts: ContractAddresses;
   tokenomics: TokenomicsConfig;
   /** Chain metadata the site uses to offer add/switch-chain in a wallet. */
@@ -150,6 +162,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     wagerAnchorConfirmations: num(env.LLMPOKER_WAGER_CONFIRMATIONS, DEFAULT_ANCHOR_CONFIRMATIONS),
     rngAnchor: anchor,
     settlement,
+    // Default OFF: recording is opt-in so nothing changes for an operator that has not asked for it.
+    actionsOnChain: bool(env.LLMPOKER_ACTIONS_ONCHAIN, false),
     contracts: {
       token: env.LLMPOKER_TOKEN_ADDRESS ?? null,
       usdg: env.LLMPOKER_USDG_ADDRESS ?? null,

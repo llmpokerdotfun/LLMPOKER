@@ -6,6 +6,8 @@ import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import { IShuffle } from "./interfaces/IShuffle.sol";
 import { IRakeSplitter } from "./interfaces/IRakeSplitter.sol";
 
@@ -38,6 +40,13 @@ import { IRakeSplitter } from "./interfaces/IRakeSplitter.sol";
  *      `LLMPOKER` has **18**; this contract deals exclusively in base units and never scales or
  *      converts, so it does not care which is which — only the off-chain engine and the deploy
  *      script are responsible for choosing per-denomination blind and buy-in amounts.
+ *
+ *      **Wagered actions are recorded, never re-adjudicated.** `recordAction` lets the operator
+ *      publish each agent action together with the agent's own EIP-712 signature, so the ordered
+ *      sequence of actions in a hand becomes public and attributable without this contract ever
+ *      learning the betting rules. Legality (min-raise, side pots, all-in caps, whose turn it is)
+ *      stays in the pure engine — see the NatSpec on `recordAction` for exactly what the record
+ *      does and does not prove.
  */
 contract Poker is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -50,6 +59,43 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Rake denominator shared with `packages/shared/src/config.ts`.
     uint256 public constant BPS_DENOMINATOR = 10_000;
+
+    /**
+     * @notice `keccak256` of the `AgentAction` EIP-712 type string the server signs.
+     * @dev This is *the* compatibility surface with the off-chain signer
+     *      (`AGENT_ACTION_TYPES` / `agentActionDigest` in `packages/shared/src/eip712.ts` and
+     *      the act handler in `packages/server/src/app.ts`). It is public so the test suite can
+     *      assert it against a value derived with `ethers` at run time: a hard-coded typehash
+     *      that silently diverged from the server's would still verify *a* signature, just never
+     *      a real agent's, and that failure would only surface in production.
+     *
+     *      `uint8` is deliberately NOT normalised to `uint256`: the server's type definition uses
+     *      `uint8` for `seat`/`action`, and EIP-712 hashes the type string verbatim, so
+     *      normalising either side would change the typehash and break every signature.
+     */
+    bytes32 public constant AGENT_ACTION_TYPEHASH = keccak256(
+        "AgentAction(string agentId,string tableId,string handId,uint8 seat,uint8 action,uint256 amount,uint256 nonce,uint256 deadline)"
+    );
+
+    /// @notice `keccak256` of the EIP-712 domain type string, exactly as `eip712Domain` builds it.
+    bytes32 private constant EIP712_DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    /// @notice EIP-712 domain name, matching `EIP712_DOMAIN_NAME` in `packages/shared/src/eip712.ts`.
+    bytes32 private constant DOMAIN_NAME_HASH = keccak256("LLM Poker Arena");
+
+    /// @notice EIP-712 domain version, matching `EIP712_DOMAIN_VERSION` in the shared package.
+    bytes32 private constant DOMAIN_VERSION_HASH = keccak256("1");
+
+    /// @notice Highest action enum value the record path accepts (`ALL_IN`).
+    uint8 private constant MAX_ACTION_ENUM = 5;
+
+    /// @notice Domain separator cached at deployment (standard OpenZeppelin fork protection).
+    bytes32 private immutable _cachedDomainSeparator;
+    /// @notice `block.chainid` the cached separator was built for.
+    uint256 private immutable _cachedChainId;
+    /// @notice `address(this)` the cached separator was built for.
+    address private immutable _cachedThis;
 
     /**
      * @notice Whether rake is charged only when a flop was dealt.
@@ -132,6 +178,18 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     /// @dev `tableId => handId => seat => chips moved into the pot for that hand` (FR-5.2).
     mapping(bytes32 => mapping(bytes32 => mapping(uint8 => uint256))) public contributionOf;
 
+    /// @dev `handId => seat => highest action nonce recorded`. Strictly increasing per seat, so a
+    ///      relayed signature can be submitted at most once even if the operator replays calldata.
+    mapping(bytes32 => mapping(uint8 => uint256)) public lastActionNonce;
+
+    /// @dev `handId => rolling commitment over the ordered action sequence` (see `_extendActionChain`).
+    ///      One slot per hand, so the whole record costs a bounded amount of storage however many
+    ///      actions the hand contains.
+    mapping(bytes32 => bytes32) public actionChain;
+
+    /// @dev `handId => number of actions recorded`. Exposed through `actionCountOf`.
+    mapping(bytes32 => uint256) private _actionCount;
+
     /// @notice Emitted when a wager table is created (FR-5.1).
     event TableCreated(bytes32 indexed tableId, address indexed settlementToken, TableConfig config, address operator);
     /// @notice Emitted when the operator is rotated (FR-10.3).
@@ -160,6 +218,22 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     );
     /// @notice Emitted when a hand is voided and escrow restored (FR-5.6, FR-6.6).
     event HandVoided(bytes32 indexed tableId, bytes32 indexed handId, uint256 restored, bytes32 reason);
+    /**
+     * @notice Emitted for every agent action the operator relays, with the wallet that signed it.
+     * @dev `signer` is the recovered address, which `recordAction` has already proved equal to the
+     *      seat's occupant — so a verifier can attribute the action from the log alone, without
+     *      re-deriving the seat owner at that historical block. `amount` is `0` for FOLD, CHECK,
+     *      CALL and ALL_IN, exactly as the agent signed it (see `recordAction`).
+     */
+    event ActionRecorded(
+        bytes32 indexed tableId,
+        bytes32 indexed handId,
+        uint8 indexed seat,
+        uint8 action,
+        uint256 amount,
+        uint256 nonce,
+        address signer
+    );
 
     /// @notice Caller lacks `OPERATOR` authority (FR-10.3).
     error NotOperator(address caller);
@@ -207,6 +281,14 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     error InvalidSettlementToken();
     /// @notice No table settles in this token, so a per-token aggregate is meaningless.
     error UnsupportedToken(address token);
+    /// @notice The action enum is outside `0..5` (see `AGENT_ACTION_TYPEHASH`).
+    error InvalidActionEnum(uint8 action);
+    /// @notice The action deadline passed before the record landed.
+    error ActionExpired(uint256 deadline, uint256 nowTs);
+    /// @notice The signature was not produced by the wallet occupying the acting seat.
+    error ActionSignerMismatch(uint8 seat, address expected, address recovered);
+    /// @notice The nonce is not strictly greater than the last one recorded for this seat and hand.
+    error ActionNonceReused(uint8 seat, uint256 nonce, uint256 lastNonce);
 
     /**
      * @param shuffle_ Verifiable-RNG contract (FR-6).
@@ -227,6 +309,16 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         shuffle = IShuffle(shuffle_);
         rakeSplitter = IRakeSplitter(rakeSplitter_);
         operator = initialOperator;
+
+        // Cache the domain separator the way OpenZeppelin's `EIP712` does. The values are
+        // immutable and known at construction, so every `recordAction` in this deployment's life
+        // reads them from code rather than storage (NFR-3: recording must stay cheap enough to
+        // run once per action on a ~0.8s-block chain). The chain id is cached *beside* the
+        // separator so a fork — where `block.chainid` changes but the address may not — rebuilds
+        // it instead of accepting signatures minted for the other chain.
+        _cachedChainId = block.chainid;
+        _cachedThis = address(this);
+        _cachedDomainSeparator = _buildDomainSeparator();
     }
 
     // ---------------------------------------------------------------------
@@ -437,6 +529,89 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
+     * @notice Record one agent action for an open hand, authorised by the agent's own signature.
+     * @dev **The operator relays; the agent keeps the pen.** The agent POSTs its signed action to
+     *      the server exactly as before (free mode and the agent-facing HTTP contract are
+     *      unchanged) and the operator submits this call, so an agent never needs gas — only a
+     *      wallet to sign with. The signature is verified here over the *same* EIP-712 payload the
+     *      server verifies (`AGENT_ACTION_TYPEHASH`, the `(name, version, chainId, address(this))`
+     *      domain, `uint8` seat/action), and the recovered address must be the wallet that funded
+     *      the seat — hence an action can only be attributed to the agent whose money is at risk
+     *      in that seat.
+     *
+     *      **What this proves.** That the seat's occupant authorised *this* `(tableId, handId,
+     *      seat, action, amount, nonce, deadline, agentId)` tuple, at most once, in a recorded
+     *      order (`actionChain` is a rolling hash, so any reordering or removal changes it), and
+     *      while the hand was open and the deadline had not passed.
+     *
+     *      **What this does NOT prove.** It does not prove the action was *legal*: min-raise
+     *      sizing, side-pot and all-in arithmetic, whose turn it was and how much the agent was
+     *      allowed to bet all live in the pure engine (`packages/engine`, FR-3.6) and are
+     *      deliberately not reimplemented here. The recorded `amount` is therefore exactly what
+     *      the agent signed, not a validated bet. Nor does it bind the action sequence into
+     *      `settleHand` — settlement still trusts the engine's winners and contributions (see the
+     *      note there); `actionChain` is published so a future settlement can bind to it.
+     *
+     *      **Amount convention.** `amount` is `0` for FOLD, CHECK, CALL and ALL_IN and non-zero
+     *      only for BET/RAISE, because that is what the agent signs (`shape.action.amount ?? 0n`
+     *      in `packages/server/src/app.ts`). The contract does not enforce it: the value is part
+     *      of the signed payload and of `actionChain`, so changing it invalidates the signature.
+     *
+     *      Not gated by `whenNotPaused` and not `nonReentrant`: it makes no external call and
+     *      moves no chips, so it cannot reenter anything. Keeping it live while settlement is
+     *      paused means the record of an interrupted hand survives the pause instead of losing
+     *      the actions that were already signed.
+     * @param tableId Table the hand belongs to. Hashed by the caller (`keccak256(utf8)`).
+     * @param handId Open hand. Hashed by the caller (`keccak256(utf8)`).
+     * @param seat Acting seat.
+     * @param action Action enum: `FOLD=0, CHECK=1, CALL=2, BET=3, RAISE=4, ALL_IN=5`.
+     * @param amount Chips the action names; `0` unless BET/RAISE.
+     * @param nonce Strictly increasing per `(handId, seat)` action nonce.
+     * @param deadline Unix seconds after which the signature is void.
+     * @param agentId Agent id string the signature covers (hashed like the server does).
+     * @param signature 65-byte `r ‖ s ‖ v` over the EIP-712 digest.
+     */
+    function recordAction(
+        bytes32 tableId,
+        bytes32 handId,
+        uint8 seat,
+        uint8 action,
+        uint256 amount,
+        uint256 nonce,
+        uint256 deadline,
+        string calldata agentId,
+        bytes calldata signature
+    ) external onlyOperator {
+        Table storage table = _tables[tableId];
+        if (!table.exists) revert UnknownTable(tableId);
+        if (seat >= table.config.maxSeats) revert InvalidSeat(seat, table.config.maxSeats);
+
+        Hand storage hand = _hands[tableId][handId];
+        if (hand.status == HandStatus.None) revert UnknownHand(tableId, handId);
+        if (hand.status != HandStatus.Open) revert HandNotOpen(handId, hand.status);
+
+        if (deadline < block.timestamp) revert ActionExpired(deadline, block.timestamp);
+        if (action > MAX_ACTION_ENUM) revert InvalidActionEnum(action);
+
+        uint256 lastNonce = lastActionNonce[handId][seat];
+        if (nonce <= lastNonce) revert ActionNonceReused(seat, nonce, lastNonce);
+
+        // `occupantOf` reads the seat registry, so "the wallet that funded the seat is the wallet
+        // that authorised the action" is enforced from on-chain state, not from anything the
+        // operator supplies. A seat with no occupant recovers against the zero address, which no
+        // signature can produce.
+        address expected = seatOwner[_seatKey(tableId, seat)];
+        address signer = _recoverActionSigner(tableId, handId, seat, action, amount, nonce, deadline, agentId, signature);
+        if (signer != expected) revert ActionSignerMismatch(seat, expected, signer);
+
+        lastActionNonce[handId][seat] = nonce;
+        actionChain[handId] = _extendActionChain(actionChain[handId], tableId, handId, seat, action, amount, nonce);
+        _actionCount[handId] += 1;
+
+        emit ActionRecorded(tableId, handId, seat, action, amount, nonce, signer);
+    }
+
+    /**
      * @notice Settle a hand: verify the pot, deduct the on-chain rake and credit the winners.
      * @dev FR-5.2, FR-5.4, FR-8.1, FR-8.2, FR-10.5.
      *
@@ -449,6 +624,11 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
      *      on-chain: who won the pot, and the hole-card/board mapping — the latter is
      *      recomputable from `Shuffle.sol` (FR-6.3). The pot, the awards and the rake are all in
      *      the table's settlement token, in base units.
+     *
+     *      This signature is deliberately unchanged by the action record: settlement does **not**
+     *      bind to `actionChain`, so it still trusts the engine for who won and for how much each
+     *      seat put in. `actionChainOf(handId)` is available for a future version of this call to
+     *      bind to, which is out of scope here.
      * @param tableId Table identifier.
      * @param handId Open hand.
      * @param contributions Seat-by-seat chips moved into the pot.
@@ -626,6 +806,29 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
         return seatOwner[_seatKey(tableId, seat)];
     }
 
+    /// @notice Highest action nonce recorded for one seat of one hand (0 when none yet).
+    function lastActionNonceOf(bytes32 handId, uint8 seat) external view returns (uint256) {
+        return lastActionNonce[handId][seat];
+    }
+
+    /**
+     * @notice Rolling commitment over the ordered action sequence of a hand.
+     * @dev `keccak256(abi.encode(prev, tableId, handId, seat, action, amount, nonce))`, folded in
+     *      as each action is recorded, starting from `bytes32(0)`. Two hands with the same
+     *      multiset of actions in a different order end with different chains, so the record is
+     *      tamper-evident for ordering and removal alike: a verifier replaying the emitted
+     *      `ActionRecorded` events in log order reproduces this value exactly.
+     * @param handId Hand to read.
+     */
+    function actionChainOf(bytes32 handId) external view returns (bytes32) {
+        return actionChain[handId];
+    }
+
+    /// @notice Number of actions recorded for a hand.
+    function actionCountOf(bytes32 handId) external view returns (uint256) {
+        return _actionCount[handId];
+    }
+
     /// @notice Everything a verifier needs about one hand (FR-6.3, NFR-4).
     function handInfoOf(bytes32 tableId, bytes32 handId)
         external
@@ -737,6 +940,83 @@ contract Poker is Ownable, Pausable, ReentrancyGuard {
 
     function _seatKey(bytes32 tableId, uint8 seat) private pure returns (bytes32) {
         return keccak256(abi.encodePacked(tableId, seat));
+    }
+
+    /**
+     * @dev The EIP-712 domain separator for `(name, version, block.chainid, address(this))`.
+     *      Rebuilt only when the cached values no longer describe this deployment — the standard
+     *      OpenZeppelin approach, and the reason the cache is worth having on the hot path.
+     */
+    function _domainSeparator() private view returns (bytes32) {
+        if (address(this) == _cachedThis && block.chainid == _cachedChainId) {
+            return _cachedDomainSeparator;
+        }
+        return _buildDomainSeparator();
+    }
+
+    /// @dev `keccak256(abi.encode(DOMAIN_TYPEHASH, name, version, chainId, address(this)))`.
+    function _buildDomainSeparator() private view returns (bytes32) {
+        return keccak256(
+            abi.encode(EIP712_DOMAIN_TYPEHASH, DOMAIN_NAME_HASH, DOMAIN_VERSION_HASH, block.chainid, address(this))
+        );
+    }
+
+    /**
+     * @dev Recovers the signer of one action, reproducing the server's digest byte for byte.
+     *
+     *      `abi.encode` pads `uint8` and `uint256` alike to a 32-byte word, so `seat` and `action`
+     *      encode exactly as the server's `uint256ToBytes(BigInt(value))` does for them
+     *      (`encodeField` in `packages/shared/src/eip712.ts`). `agentId` is hashed here as
+     *      `keccak256(bytes(agentId))` because the server declares it a `string` field, which
+     *      EIP-712 hashes as `keccak256(utf8)`; `tableId` and `handId` arrive already hashed that way
+     *      (the server's `id32`/`handId32` in `packages/server/src/chain.ts`). The digest is
+     *      `keccak256(0x1901 ‖ domainSeparator ‖ structHash)`.
+     */
+    function _recoverActionSigner(
+        bytes32 tableId,
+        bytes32 handId,
+        uint8 seat,
+        uint8 action,
+        uint256 amount,
+        uint256 nonce,
+        uint256 deadline,
+        string calldata agentId,
+        bytes calldata signature
+    ) private view returns (address) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                AGENT_ACTION_TYPEHASH,
+                keccak256(bytes(agentId)),
+                tableId,
+                handId,
+                seat,
+                action,
+                amount,
+                nonce,
+                deadline
+            )
+        );
+        return ECDSA.recover(MessageHashUtils.toTypedDataHash(_domainSeparator(), structHash), signature);
+    }
+
+    /**
+     * @dev Folds one action into the hand's rolling commitment.
+     *
+     *      `abi.encode` (not `encodePacked`) is deliberate: packed encoding lets a caller move
+     *      bytes between adjacent fields — `(seat, action)` as `(1, 2)` and `(0, 0x0102)` would
+     *      pack to the same bytes — and a commitment that can be reinterpreted is not
+     *      tamper-evident. The fixed-width encoding makes each field unambiguous.
+     */
+    function _extendActionChain(
+        bytes32 previous,
+        bytes32 tableId,
+        bytes32 handId,
+        uint8 seat,
+        uint8 action,
+        uint256 amount,
+        uint256 nonce
+    ) private pure returns (bytes32) {
+        return keccak256(abi.encode(previous, tableId, handId, seat, action, amount, nonce));
     }
 
     function _validateTableConfig(TableConfig calldata config) private pure {

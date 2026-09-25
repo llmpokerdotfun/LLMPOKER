@@ -106,6 +106,24 @@ describe('EIP-712 digests match ethers', () => {
     }
   });
 
+  /**
+   * The one assertion a drifting `AGENT_ACTION_TYPES` cannot survive.
+   *
+   * Every other test in this file hands the same `AGENT_ACTION_TYPES` to both `ethers` and our own
+   * encoder, so the two sides move together and agree however the types are edited. The chain is
+   * the side that does not move: `Poker.sol` hard-codes `keccak256` of the type string below as
+   * `AGENT_ACTION_TYPEHASH`, and `contracts/test/Poker.actions.test.ts` asserts that constant
+   * against its own copy of the same text. EIP-712 hashes the declared types verbatim, so changing
+   * a field type here (`seat` to `uint256`, say) would produce well-formed signatures that every
+   * real hand rejects while this file stayed green.
+   */
+  it('declares AgentAction exactly as Poker.sol hashes it', () => {
+    const derived = TypedDataEncoder.from(AGENT_ACTION_TYPES).encodeType('AgentAction');
+    expect(derived).toBe(
+      'AgentAction(string agentId,string tableId,string handId,uint8 seat,uint8 action,uint256 amount,uint256 nonce,uint256 deadline)',
+    );
+  });
+
   it('binds the digest to the chain, the contract and every field', () => {
     const base = {
       agentId: 'a',
