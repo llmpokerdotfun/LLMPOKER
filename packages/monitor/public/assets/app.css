@@ -334,6 +334,14 @@
   --badge-bg: var(--panel-3);
   --table-head-bg: var(--surface-sunken);
   --table-row-hover: var(--ink-820);
+  /* Poker felt. The table is the one surface that steps outside the slate ramp,
+     because a green baize is what it is depicting; it is kept dark and
+     desaturated so it reads as the table rather than as a competing accent. */
+  --felt-hi: #17402f; /* ds-allow-hardcode */
+  --felt-lo: #0c2119; /* ds-allow-hardcode */
+  --felt-rail: #081711; /* ds-allow-hardcode */
+  --felt-rim: #2c6b4c; /* ds-allow-hardcode */
+  --shadow-panel: 0 18px 40px rgba(0, 0, 0, 0.45); /* ds-allow-hardcode */
 }
 
 * {
@@ -1259,12 +1267,6 @@ a:focus-visible {
 
 /* ---------------------------------------------------------------- seats  */
 
-.seats-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); /* ds-allow-hardcode: geometry, not rhythm */
-  gap: var(--space-4);
-}
-
 .seat {
   background: var(--panel-3);
   border: var(--border-hairline) solid var(--border-soft);
@@ -1806,10 +1808,6 @@ a:focus-visible {
     grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); /* ds-allow-hardcode: geometry, not rhythm */
   }
 
-  .seats-grid {
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); /* ds-allow-hardcode: geometry, not rhythm */
-  }
-
   .deck-grid {
     grid-template-columns: repeat(auto-fill, minmax(42px, 1fr)); /* ds-allow-hardcode: geometry, not rhythm */
   }
@@ -2047,6 +2045,182 @@ a:focus-visible {
 @media (max-width: 640px) { /* ds-allow-hardcode: geometry, not rhythm */
   .hero {
     padding: var(--space-8) var(--space-6);
+  }
+}
+
+/* ==========================================================================
+   Poker table
+   --------------------------------------------------------------------------
+   The seats, the board and the pot are one object: a felt with the players
+   ranged around it, which is the layout anyone who has played already knows how
+   to read. Seats are placed on the oval by seat number, so a seat never moves
+   between hands.
+
+   Below the breakpoint the *same markup* becomes a plain grid — the seats are
+   only absolute-positioned at the wide size. Keeping one set of seats in the DOM
+   matters: a second copy would double every seat for a screen reader.
+   ========================================================================== */
+
+.table-felt {
+  position: relative;
+  width: 100%;
+  max-width: 880px; /* ds-allow-hardcode: geometry, not rhythm */
+  aspect-ratio: 16 / 10;
+  margin: var(--space-6) auto;
+  border-radius: 48% / 46%;
+  background: radial-gradient(ellipse at 50% 38%, var(--felt-hi) 0%, var(--felt-lo) 72%);
+  border: var(--border-emphasis) solid var(--felt-rim);
+  box-shadow: inset 0 0 0 6px var(--felt-rail), var(--shadow-panel); /* ds-allow-hardcode: geometry, not rhythm */
+}
+
+/* Six points around the oval, seat 0 at the bottom. Kept far enough in that a
+   whole seat sits on the felt instead of hanging off the rail and clipping. */
+.table-felt .seat {
+  position: absolute;
+  width: 158px; /* ds-allow-hardcode: geometry, not rhythm */
+  transform: translate(-50%, -50%);
+  box-shadow: var(--shadow-panel);
+}
+
+.seat-pos-0 { left: 50%; top: 84%; }
+.seat-pos-1 { left: 84%; top: 65%; }
+.seat-pos-2 { left: 84%; top: 27%; }
+.seat-pos-3 { left: 50%; top: 16%; }
+.seat-pos-4 { left: 16%; top: 27%; }
+.seat-pos-5 { left: 16%; top: 65%; }
+
+.felt-center {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  width: min(58%, 420px); /* ds-allow-hardcode: geometry, not rhythm */
+  text-align: center;
+}
+
+.felt-street {
+  color: var(--accent);
+  font-family: var(--display);
+  font-size: var(--text-2xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+}
+
+.felt-board {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: center;
+  flex-wrap: wrap;
+  min-height: 44px; /* ds-allow-hardcode: geometry, not rhythm */
+}
+
+.felt-pot {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-5);
+  border-radius: var(--radius-pill);
+  background: var(--overlay-bg);
+  border: var(--border-hairline) solid var(--felt-rim);
+}
+
+.felt-label {
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+/* The button, parked just inside the rail at the seat that holds it. */
+.dealer-button {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 26px; /* ds-allow-hardcode: geometry, not rhythm */
+  height: 26px; /* ds-allow-hardcode: geometry, not rhythm */
+  border-radius: 50%;
+  background: var(--neutral-0);
+  color: var(--neutral-900);
+  border: var(--border-emphasis) solid var(--accent);
+  font-family: var(--display);
+  font-size: var(--text-2xs);
+  font-weight: 700;
+  transform: translate(-50%, -50%);
+}
+
+.dealer-pos-0 { left: 50%; top: 70%; }
+.dealer-pos-1 { left: 71%; top: 56%; }
+.dealer-pos-2 { left: 71%; top: 36%; }
+.dealer-pos-3 { left: 50%; top: 29%; }
+.dealer-pos-4 { left: 29%; top: 36%; }
+.dealer-pos-5 { left: 29%; top: 56%; }
+
+/* Seat figures: compact key/value pairs, not a full definition list, so a seat
+   stays short enough to sit on the rail without swallowing the felt. */
+.seat-figures {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+}
+
+.seat-key {
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.seat-bet {
+  align-self: flex-start;
+  padding: 1px var(--space-3); /* ds-allow-hardcode: geometry, not rhythm */
+  border-radius: var(--radius-pill);
+  background: var(--wager-soft);
+  border: var(--border-hairline) solid var(--wager-border);
+  color: var(--wager-text);
+  font-family: var(--mono);
+  font-size: var(--text-2xs);
+}
+
+/* Narrow viewports: the felt becomes a plain grid of seats. Same markup. */
+@media (max-width: 900px) { /* ds-allow-hardcode: geometry, not rhythm */
+  .table-felt {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); /* ds-allow-hardcode: geometry, not rhythm */
+    gap: var(--space-4);
+    aspect-ratio: auto;
+    max-width: none;
+    margin: var(--space-4) 0;
+    padding: var(--space-4);
+    border-radius: var(--radius);
+    box-shadow: none;
+  }
+
+  .table-felt .seat {
+    position: static;
+    width: auto;
+    transform: none;
+    box-shadow: none;
+  }
+
+  .felt-center {
+    position: static;
+    transform: none;
+    width: auto;
+    grid-column: 1 / -1;
+    order: -1;
+    margin-bottom: var(--space-2);
+  }
+
+  /* Every seat already carries a BTN badge, so the disc would only duplicate
+     it — and there is no oval here for it to sit on. */
+  .dealer-button {
+    display: none;
   }
 }
 

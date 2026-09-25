@@ -304,20 +304,43 @@ function tableCard(table) {
             ? h('code', { class: 'hash', text: shortHex(table.rngCommitment, 18, 12), title: table.rngCommitment })
             : h('span', { class: 'muted', text: table.handId ? 'awaiting commit (free mode may use a local PRNG, FR-4.4)' : 'no hand in flight' }),
           table.handId ? revealCount(table) : null,
-          h(
-            'span',
-            { class: 'clock-label', text: 'board' },
-            ' ',
-            cardRow(table.board),
-          ),
           table.handId ? h('span', null, handLink(table.handId, { tableId: table.id }, 'open hand proof →')) : null,
         ),
       ),
       request ? actionRequestStrip(request, money) : null,
+      // The seats, the community cards and the pot are one object: a felt with
+      // the players ranged around it, which is the layout a poker player already
+      // knows how to read at a glance. Below the breakpoint the CSS turns the
+      // same markup back into a plain grid, so there is only ever one set of
+      // seats in the DOM.
       h(
         'div',
-        { class: 'seats-grid' },
+        { class: 'table-felt' },
+        h(
+          'div',
+          { class: 'felt-center' },
+          h('span', {
+            class: 'felt-street',
+            text: table.handId ? (table.street ?? 'hand running') : 'waiting for players',
+          }),
+          h('div', { class: 'felt-board' }, cardRow(table.board)),
+          table.handId
+            ? h(
+                'div',
+                { class: 'felt-pot' },
+                h('span', { class: 'felt-label', text: 'pot' }),
+                money.el(table.totalPot, { maxFractionDigits: 6 }),
+              )
+            : null,
+        ),
         table.seats.map((seat) => seatCard(seat, table)),
+        table.buttonSeat !== null && table.buttonSeat !== undefined
+          ? h('span', {
+              class: `dealer-button dealer-pos-${table.buttonSeat}`,
+              title: `dealer button: seat ${table.buttonSeat}`,
+              text: 'D',
+            })
+          : null,
       ),
       potsBlock(table, money),
       configBlock(table, money),
@@ -388,10 +411,14 @@ function actionRequestStrip(request, money) {
 function seatCard(seat, table) {
   const isButton = table.buttonSeat === seat.seat;
   const toAct = table.toActSeat === seat.seat;
-  const classes = ['seat', `seat-${String(seat.status).toLowerCase()}`];
+  // `seat-pos-N` is the seat's place around the felt. It only does anything on a
+  // wide viewport; below the breakpoint the seats fall back to a plain grid, and
+  // `seat-no` still says which seat each one is.
+  const classes = ['seat', `seat-pos-${seat.seat}`, `seat-${String(seat.status).toLowerCase()}`];
   if (toAct) classes.push('seat-toact');
   if (seat.agentId === null) classes.push('seat-empty');
   const money = tableMoney(table);
+  const bet = BigInt(seat.committed ?? '0');
 
   // FR-6: `holeCards` is `null` while a card is hidden, and the snapshot never
   // carries a value the hand has not made public. An un-revealed seat renders
@@ -418,6 +445,22 @@ function seatCard(seat, table) {
         ? h('span', { class: 'muted', text: 'empty' })
         : h('span', { text: seat.agentName ?? seat.agentId, title: seat.agentId }),
     ),
+    h('div', { class: 'seat-cards' }, cards),
+    h(
+      'div',
+      { class: 'seat-figures' },
+      h('span', { class: 'seat-key', text: 'stack' }),
+      money.el(seat.stack, { maxFractionDigits: 6 }),
+      h('span', { class: 'seat-key', text: 'hand' }),
+      money.el(seat.totalCommitted, { maxFractionDigits: 6 }),
+      seat.escrow !== null && seat.escrow !== undefined ? h('span', { class: 'seat-key', text: 'escrow' }) : null,
+      seat.escrow !== null && seat.escrow !== undefined
+        ? money.el(seat.escrow, { maxFractionDigits: 6 })
+        : null,
+    ),
+    // A street bet belongs between the seat and the pot, where a dealer would
+    // have pushed it, rather than buried in the figures.
+    bet > 0n ? h('div', { class: 'seat-bet', title: 'committed this street', text: money.format(seat.committed) }) : null,
     // A seated agent that has gone quiet is a ghost the engine still deals in,
     // so say so on the seat itself rather than only on /agents.
     h(
@@ -426,23 +469,6 @@ function seatCard(seat, table) {
       statusBadge(seat.status),
       seat.agentId ? ' ' : null,
       seat.agentId ? freshnessBadge(seat.agentLastSeenAt) : null,
-    ),
-    h('div', { class: 'seat-cards' }, cards),
-    h(
-      'dl',
-      { class: 'kv-inline' },
-      h('dt', { text: 'stack' }),
-      h('dd', null, money.el(seat.stack, { maxFractionDigits: 6 })),
-      h('dt', { text: 'committed' }),
-      h('dd', null, money.el(seat.committed, { maxFractionDigits: 6 })),
-      h('dt', { text: 'hand total' }),
-      h('dd', null, money.el(seat.totalCommitted, { maxFractionDigits: 6 })),
-      seat.escrow !== null && seat.escrow !== undefined
-        ? h('dt', { text: 'escrow' })
-        : null,
-      seat.escrow !== null && seat.escrow !== undefined
-        ? h('dd', null, money.el(seat.escrow, { maxFractionDigits: 6 }))
-        : null,
     ),
   );
 }
